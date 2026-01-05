@@ -181,7 +181,8 @@ fn file_context_from_event(event: &Event) -> FileContext {
         .unwrap_or_else(|| "000000000000".to_string());
     let region = event
         .payload
-        .get("aws_region")
+        .get("awsRegion")
+        .or_else(|| event.payload.get("aws_region"))
         .and_then(|value| value.as_str())
         .unwrap_or("global")
         .to_string();

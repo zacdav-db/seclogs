@@ -2,23 +2,26 @@ use crate::catalog::{resolve_event_weights, CatalogError, EventSelector, Weighte
 use crate::templates::{
     build_cloudtrail_event, default_error_profile, ActorContext, ErrorProfile,
 };
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use seclog_core::actors::{ActorKind, ActorPopulation, ActorProfile, ActorRole};
-use seclog_core::config::{CloudTrailSourceConfig, EventErrorConfig, RegionWeight, RoleWeight};
+use seclog_core::actors::{ActorKind, ActorProfile, ActorRole, ServicePattern, ServiceProfile};
+use seclog_core::config::{
+    CloudTrailSourceConfig, EventErrorConfig, RegionWeight,
+};
 use seclog_core::event::{Actor, Event, EventEnvelope, Outcome};
 use seclog_core::traits::EventSource;
 use seclog_actors_parquet as actor_store;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 /// CloudTrail event source with weighted event selection and actor sessions.
 pub struct CloudTrailGenerator {
     selector: EventSelector,
     rng: StdRng,
     actors: Vec<ActorProfile>,
-    actor_selector: WeightedIndex<f64>,
+    schedule: BinaryHeap<Reverse<(DateTime<Utc>, usize)>>,
     event_weights: HashMap<String, f64>,
     allowed_events: HashSet<String>,
     error_profiles: HashMap<String, ErrorProfile>,
@@ -30,10 +33,11 @@ impl CloudTrailGenerator {
     pub fn from_config(
         config: &CloudTrailSourceConfig,
         seed: Option<u64>,
+        start_time: DateTime<Utc>,
     ) -> Result<Self, CatalogError> {
         let events = resolve_event_weights(config)?;
         let selector = EventSelector::new(events.clone())?;
-        Self::new(selector, events, config, seed)
+        Self::new(selector, events, config, seed, start_time)
     }
 
     /// Builds a generator from a prepared selector and event list.
@@ -42,6 +46,7 @@ impl CloudTrailGenerator {
         events: Vec<WeightedEvent>,
         config: &CloudTrailSourceConfig,
         seed: Option<u64>,
+        start_time: DateTime<Utc>,
     ) -> Result<Self, CatalogError> {
         let mut rng = match seed {
             Some(seed) => StdRng::seed_from_u64(seed),
@@ -54,33 +59,18 @@ impl CloudTrailGenerator {
             allowed_events.insert(event.name);
         }
 
-        let actor_count = config.actor_count.unwrap_or(500).max(1);
-        let service_ratio = config.service_ratio.unwrap_or(0.2).clamp(0.0, 1.0);
-        let roles = build_role_weights(config.role_distribution.as_ref());
         let region_selector =
             build_region_selector(config.regions.as_ref(), config.region_distribution.as_ref());
-        let account_ids = build_account_pool(config);
-        let mut actors = load_actor_profiles(
-            &mut rng,
-            config,
-            actor_count,
-            service_ratio,
-            &roles,
-            &account_ids,
-        )?;
+        let mut actors = load_actor_profiles(config)?;
         shuffle_actors(&mut actors, &mut rng);
-        let actor_selector = build_actor_selector(
-            actors.len(),
-            config.hot_actor_ratio.unwrap_or(0.1),
-            config.hot_actor_share.unwrap_or(0.6),
-        );
+        let schedule = build_schedule(&actors, start_time, &mut rng);
         let error_profiles = build_error_profiles(config.error_rates.as_ref());
 
         Ok(Self {
             selector,
             rng,
             actors,
-            actor_selector,
+            schedule,
             event_weights,
             allowed_events,
             error_profiles,
@@ -91,119 +81,96 @@ impl CloudTrailGenerator {
 
 impl EventSource for CloudTrailGenerator {
     fn next_event(&mut self) -> Option<Event> {
-        let now = Utc::now();
-        let actor_index = self.next_active_actor_index(now)?;
-        let event_name = self.pick_event_for_actor(actor_index, now);
-        let event_time = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+        loop {
+            let Reverse((now, actor_index)) = self.schedule.pop()?;
+            if !self.actors[actor_index].is_available(now, &mut self.rng) {
+                let next_at = self.actors[actor_index].next_available_at(now);
+                self.schedule.push(Reverse((next_at, actor_index)));
+                continue;
+            }
 
-        let region = self.region_selector.pick(&mut self.rng);
-        let actor_context = actor_context(&mut self.actors[actor_index], region, &mut self.rng);
-        let error_profile = self
-            .error_profiles
-            .get(&event_name)
-            .cloned()
-            .or_else(|| default_error_profile(&event_name));
-        let cloudtrail =
-            build_cloudtrail_event(
-                &event_name,
-                &actor_context,
-                &mut self.rng,
-                &event_time,
-                error_profile,
-            )
-            .ok()?;
+            let event_name = self.pick_event_for_actor(actor_index, now);
+            let event_time = now.to_rfc3339_opts(SecondsFormat::Millis, true);
 
-        let envelope = EventEnvelope {
-            schema_version: "v1".to_string(),
-            timestamp: cloudtrail.event_time.clone(),
-            source: "cloudtrail".to_string(),
-            event_type: cloudtrail.event_name.clone(),
-            actor: Actor {
-                id: cloudtrail.user_identity.principal_id.clone(),
-                kind: cloudtrail.user_identity.identity_type.clone(),
-                name: cloudtrail.user_identity.user_name.clone(),
-            },
-            target: None,
-            outcome: if cloudtrail.error_code.is_some() {
-                Outcome::Failure
-            } else {
-                Outcome::Success
-            },
-            geo: None,
-            ip: Some(cloudtrail.source_ip_address.clone()),
-            user_agent: Some(cloudtrail.user_agent.clone()),
-            session_id: None,
-            tenant_id: Some(cloudtrail.recipient_account_id.clone()),
-        };
+            let region = self.region_selector.pick(&mut self.rng);
+            let actor_context = {
+                let actor = &mut self.actors[actor_index];
+                actor_context(actor, region, &mut self.rng)
+            };
+            let error_profile = self
+                .error_profiles
+                .get(&event_name)
+                .cloned()
+                .or_else(|| default_error_profile(&event_name));
+            let cloudtrail =
+                build_cloudtrail_event(
+                    &event_name,
+                    &actor_context,
+                    &mut self.rng,
+                    &event_time,
+                    error_profile,
+                )
+                .ok()?;
 
-        Some(Event {
-            envelope,
-            payload: cloudtrail.to_value(),
-        })
+            {
+                let actor = &mut self.actors[actor_index];
+                actor.consume_session(&mut self.rng);
+                let next_at = schedule_after(actor, now, &mut self.rng);
+                self.schedule.push(Reverse((next_at, actor_index)));
+            }
+
+            let envelope = EventEnvelope {
+                schema_version: "v1".to_string(),
+                timestamp: cloudtrail.event_time.clone(),
+                source: "cloudtrail".to_string(),
+                event_type: cloudtrail.event_name.clone(),
+                actor: Actor {
+                    id: cloudtrail.user_identity.principal_id.clone(),
+                    kind: cloudtrail.user_identity.identity_type.clone(),
+                    name: cloudtrail.user_identity.user_name.clone(),
+                },
+                target: None,
+                outcome: if cloudtrail.error_code.is_some() {
+                    Outcome::Failure
+                } else {
+                    Outcome::Success
+                },
+                geo: None,
+                ip: Some(cloudtrail.source_ip_address.clone()),
+                user_agent: Some(cloudtrail.user_agent.clone()),
+                session_id: None,
+                tenant_id: Some(cloudtrail.recipient_account_id.clone()),
+            };
+
+            return Some(Event {
+                envelope,
+                payload: cloudtrail.to_value(),
+            });
+        }
     }
 }
 
 fn load_actor_profiles(
-    rng: &mut StdRng,
     config: &CloudTrailSourceConfig,
-    total: usize,
-    service_ratio: f64,
-    role_weights: &[(ActorRole, f64)],
-    account_ids: &[String],
 ) -> Result<Vec<ActorProfile>, CatalogError> {
-    let population = if let Some(path) = &config.actor_population_path {
-        actor_store::read_population(path)
-            .map_err(|err| CatalogError::Population(err.to_string()))?
-    } else {
-        ActorPopulation::generate(rng, total, service_ratio, role_weights, account_ids)
-    };
+    let path = config.actor_population_path.as_ref().ok_or_else(|| {
+        CatalogError::Population("actor_population_path is required".to_string())
+    })?;
+    let population = actor_store::read_population(path)
+        .map_err(|err| CatalogError::Population(err.to_string()))?;
     Ok(population.profiles())
 }
 
-/// Generates a reusable actor population based on CloudTrail config.
-pub fn generate_actor_population(
-    config: &CloudTrailSourceConfig,
-    seed: Option<u64>,
-) -> ActorPopulation {
-    let mut rng = match seed {
-        Some(seed) => StdRng::seed_from_u64(seed),
-        None => StdRng::from_entropy(),
-    };
-    let actor_count = config.actor_count.unwrap_or(500).max(1);
-    let service_ratio = config.service_ratio.unwrap_or(0.2).clamp(0.0, 1.0);
-    let roles = build_role_weights(config.role_distribution.as_ref());
-    let account_ids = build_account_pool(config);
-    ActorPopulation::generate(&mut rng, actor_count, service_ratio, &roles, &account_ids)
-}
-
 impl CloudTrailGenerator {
-    fn next_actor_index(&mut self) -> usize {
-        self.actor_selector.sample(&mut self.rng)
-    }
-
-    fn next_active_actor_index(&mut self, now: DateTime<Utc>) -> Option<usize> {
-        let attempts = self.actors.len().min(64).max(1);
-        for _ in 0..attempts {
-            let idx = self.next_actor_index();
-            if self.actors[idx].is_available(now, &mut self.rng) {
-                return Some(idx);
-            }
-        }
-
-        for idx in 0..self.actors.len() {
-            if self.actors[idx].is_available(now, &mut self.rng) {
-                return Some(idx);
-            }
-        }
-
-        None
-    }
-
     fn pick_event_for_actor(&mut self, actor_index: usize, now: DateTime<Utc>) -> String {
-        let (kind, last_event) = {
+        let (kind, last_event, service_profile) = {
             let actor = &mut self.actors[actor_index];
             actor.ensure_session(now, &mut self.rng);
-            (actor.seed.kind.clone(), actor.last_event.clone())
+            (
+                actor.seed.kind.clone(),
+                actor.last_event.clone(),
+                actor.seed.service_profile.clone(),
+            )
         };
 
         let candidates = match kind {
@@ -211,13 +178,14 @@ impl CloudTrailGenerator {
                 let role = actor_role_or_default(&self.actors[actor_index]);
                 human_candidates(role, last_event.as_deref())
             }
-            ActorKind::Service => service_candidates(last_event.as_deref()),
+            ActorKind::Service => {
+                service_profile_candidates(service_profile.as_ref(), last_event.as_deref())
+            }
         };
 
         let event = self.pick_weighted_event(&candidates);
         let actor = &mut self.actors[actor_index];
         actor.last_event = Some(event.clone());
-        actor.consume_session(&mut self.rng);
         event
     }
 
@@ -288,20 +256,139 @@ fn service_candidates(last: Option<&str>) -> Vec<(String, f64)> {
     }
 }
 
+fn service_profile_candidates(
+    profile: Option<&ServiceProfile>,
+    last: Option<&str>,
+) -> Vec<(String, f64)> {
+    match profile.unwrap_or(&ServiceProfile::Generic) {
+        ServiceProfile::Generic => service_candidates(last),
+        ServiceProfile::Ec2Reaper => ec2_reaper_candidates(last),
+        ServiceProfile::DataLakeBot => datalake_bot_candidates(last),
+        ServiceProfile::LogsShipper => logs_shipper_candidates(last),
+        ServiceProfile::MetricsCollector => metrics_collector_candidates(last),
+    }
+}
+
+fn ec2_reaper_candidates(last: Option<&str>) -> Vec<(String, f64)> {
+    match last {
+        None => vec![
+            ("AssumeRole".to_string(), 1.2),
+            ("GetCallerIdentity".to_string(), 0.8),
+            ("DescribeInstances".to_string(), 1.6),
+        ],
+        Some("AssumeRole") | Some("GetCallerIdentity") => vec![
+            ("DescribeInstances".to_string(), 2.0),
+            ("StopInstances".to_string(), 0.9),
+            ("TerminateInstances".to_string(), 1.4),
+            ("StartInstances".to_string(), 0.5),
+        ],
+        _ => vec![
+            ("DescribeInstances".to_string(), 2.1),
+            ("TerminateInstances".to_string(), 1.6),
+            ("StopInstances".to_string(), 0.9),
+            ("StartInstances".to_string(), 0.4),
+        ],
+    }
+}
+
+fn datalake_bot_candidates(last: Option<&str>) -> Vec<(String, f64)> {
+    match last {
+        None => vec![
+            ("AssumeRole".to_string(), 1.1),
+            ("GetCallerIdentity".to_string(), 0.7),
+            ("CreateBucket".to_string(), 0.6),
+            ("PutObject".to_string(), 1.2),
+        ],
+        Some("AssumeRole") | Some("GetCallerIdentity") => vec![
+            ("PutObject".to_string(), 2.2),
+            ("GetObject".to_string(), 1.6),
+            ("DeleteObject".to_string(), 0.6),
+            ("Encrypt".to_string(), 1.2),
+            ("Decrypt".to_string(), 1.0),
+            ("GenerateDataKey".to_string(), 0.9),
+            ("PutLogEvents".to_string(), 0.8),
+        ],
+        _ => vec![
+            ("PutObject".to_string(), 2.1),
+            ("GetObject".to_string(), 1.5),
+            ("DeleteObject".to_string(), 0.6),
+            ("Encrypt".to_string(), 1.1),
+            ("Decrypt".to_string(), 0.9),
+            ("GenerateDataKey".to_string(), 0.9),
+            ("PutLogEvents".to_string(), 0.7),
+        ],
+    }
+}
+
+fn logs_shipper_candidates(last: Option<&str>) -> Vec<(String, f64)> {
+    match last {
+        None => vec![
+            ("AssumeRole".to_string(), 1.2),
+            ("GetCallerIdentity".to_string(), 0.7),
+            ("CreateLogGroup".to_string(), 0.6),
+            ("CreateLogStream".to_string(), 1.0),
+        ],
+        Some("AssumeRole") | Some("GetCallerIdentity") => vec![
+            ("CreateLogStream".to_string(), 1.3),
+            ("DescribeLogStreams".to_string(), 1.1),
+            ("PutLogEvents".to_string(), 2.2),
+        ],
+        _ => vec![
+            ("PutLogEvents".to_string(), 2.4),
+            ("CreateLogStream".to_string(), 1.1),
+            ("DescribeLogStreams".to_string(), 1.0),
+            ("CreateLogGroup".to_string(), 0.4),
+        ],
+    }
+}
+
+fn metrics_collector_candidates(last: Option<&str>) -> Vec<(String, f64)> {
+    match last {
+        None => vec![
+            ("AssumeRole".to_string(), 1.0),
+            ("GetCallerIdentity".to_string(), 0.8),
+            ("ListMetrics".to_string(), 0.9),
+            ("PutMetricData".to_string(), 1.1),
+        ],
+        Some("AssumeRole") | Some("GetCallerIdentity") => vec![
+            ("GetMetricData".to_string(), 1.5),
+            ("PutMetricData".to_string(), 1.2),
+            ("ListMetrics".to_string(), 0.8),
+        ],
+        _ => vec![
+            ("GetMetricData".to_string(), 1.6),
+            ("PutMetricData".to_string(), 1.1),
+            ("ListMetrics".to_string(), 0.8),
+        ],
+    }
+}
+
 fn actor_context(
     actor: &mut ActorProfile,
     region: String,
     rng: &mut impl Rng,
 ) -> ActorContext {
+    let user_agent = actor.current_user_agent(rng);
+    let session_credential_from_console = user_agent.contains("CloudShell")
+        || user_agent.starts_with("Mozilla/")
+        || user_agent.contains("Safari/")
+        || user_agent.contains("Chrome/");
+    let mfa_authenticated = match actor.seed.kind {
+        ActorKind::Human => rng.gen_bool(0.7),
+        ActorKind::Service => false,
+    };
     ActorContext {
         identity_type: actor.seed.identity_type.clone(),
         principal_id: actor.seed.principal_id.clone(),
         arn: actor.seed.arn.clone(),
         account_id: actor.seed.account_id.clone(),
+        access_key_id: Some(actor.seed.access_key_id.clone()),
         user_name: actor.seed.user_name.clone(),
-        user_agent: actor.current_user_agent(rng),
+        user_agent,
         source_ip: actor.current_source_ip(rng),
         region,
+        mfa_authenticated,
+        session_credential_from_console,
     }
 }
 
@@ -420,10 +507,6 @@ fn auditor_candidates(last: Option<&str>) -> Vec<(String, f64)> {
     }
 }
 
-fn random_account_id(rng: &mut impl Rng) -> String {
-    (0..12).map(|_| rng.gen_range(0..10).to_string()).collect()
-}
-
 fn build_error_profiles(config: Option<&Vec<EventErrorConfig>>) -> HashMap<String, ErrorProfile> {
     let mut map = HashMap::new();
     if let Some(entries) = config {
@@ -455,70 +538,90 @@ fn build_error_profiles(config: Option<&Vec<EventErrorConfig>>) -> HashMap<Strin
     map
 }
 
-fn build_actor_selector(count: usize, hot_ratio: f64, hot_share: f64) -> WeightedIndex<f64> {
-    if count == 0 {
-        return WeightedIndex::new(vec![1.0]).expect("non-empty weights");
+fn build_schedule(
+    actors: &[ActorProfile],
+    start_time: DateTime<Utc>,
+    rng: &mut impl Rng,
+) -> BinaryHeap<Reverse<(DateTime<Utc>, usize)>> {
+    let mut heap = BinaryHeap::with_capacity(actors.len());
+    for (idx, actor) in actors.iter().enumerate() {
+        let base = actor.next_available_at(start_time);
+        let next_at = schedule_from(actor, base, rng);
+        heap.push(Reverse((next_at, idx)));
     }
-
-    let ratio = hot_ratio.clamp(0.0, 1.0);
-    let share = hot_share.clamp(0.0, 1.0);
-    let hot_count = ((count as f64) * ratio).round() as usize;
-    let hot_count = hot_count.clamp(1, count);
-    let cold_count = count.saturating_sub(hot_count);
-
-    if cold_count == 0 || share == 0.0 || share == 1.0 {
-        return WeightedIndex::new(vec![1.0; count]).expect("non-empty weights");
-    }
-
-    let hot_weight = share / hot_count as f64;
-    let cold_weight = (1.0 - share) / cold_count as f64;
-
-    let mut weights = Vec::with_capacity(count);
-    for _ in 0..hot_count {
-        weights.push(hot_weight);
-    }
-    for _ in 0..cold_count {
-        weights.push(cold_weight);
-    }
-
-    WeightedIndex::new(weights).unwrap_or_else(|_| WeightedIndex::new(vec![1.0; count]).unwrap())
+    heap
 }
 
-fn build_role_weights(config: Option<&Vec<RoleWeight>>) -> Vec<(ActorRole, f64)> {
-    let defaults = vec![
-        (ActorRole::Admin, 0.15),
-        (ActorRole::Developer, 0.55),
-        (ActorRole::ReadOnly, 0.25),
-        (ActorRole::Auditor, 0.05),
-    ];
-
-    let entries = match config {
-        Some(list) if !list.is_empty() => list,
-        _ => return defaults,
-    };
-
-    let mut parsed = Vec::new();
-    for entry in entries {
-        if !entry.weight.is_finite() || entry.weight <= 0.0 {
-            continue;
+fn schedule_after(
+    actor: &ActorProfile,
+    now: DateTime<Utc>,
+    rng: &mut impl Rng,
+) -> DateTime<Utc> {
+    let rate = effective_rate(actor, now, rng);
+    let mut next = now + sample_interval(rate, rng);
+    if let Some(end) = actor.session_end_at {
+        if next > end {
+            next = end;
         }
-        let role = match entry.name.as_str() {
-            "admin" => ActorRole::Admin,
-            "developer" => ActorRole::Developer,
-            "readonly" | "read_only" => ActorRole::ReadOnly,
-            "auditor" => ActorRole::Auditor,
-            _ => continue,
-        };
-        parsed.push((role, entry.weight));
+    }
+    actor.next_available_at(next)
+}
+
+fn schedule_from(
+    actor: &ActorProfile,
+    base: DateTime<Utc>,
+    rng: &mut impl Rng,
+) -> DateTime<Utc> {
+    let rate = effective_rate(actor, base, rng);
+    let next = base + sample_interval(rate, rng);
+    actor.next_available_at(next)
+}
+
+fn sample_interval(rate_per_hour: f64, rng: &mut impl Rng) -> Duration {
+    let rate = rate_per_hour.max(0.001);
+    let lambda = rate / 3600.0;
+    let u: f64 = rng.gen_range(0.0..1.0);
+    let secs = -u.ln() / lambda;
+    Duration::milliseconds((secs * 1000.0).max(1.0) as i64)
+}
+
+fn effective_rate(actor: &ActorProfile, now: DateTime<Utc>, rng: &mut impl Rng) -> f64 {
+    let base = actor.seed.rate_per_hour.max(0.1);
+    if matches!(actor.seed.kind, ActorKind::Human) {
+        return base;
     }
 
-    if parsed.is_empty() {
-        defaults
-    } else {
-        parsed
+    let pattern = actor
+        .seed
+        .service_pattern
+        .as_ref()
+        .unwrap_or(&ServicePattern::Constant);
+    match pattern {
+        ServicePattern::Constant => base,
+        ServicePattern::Diurnal => base * diurnal_multiplier(actor, now),
+        ServicePattern::Bursty => base * burst_multiplier(rng),
     }
 }
 
+fn diurnal_multiplier(actor: &ActorProfile, now: DateTime<Utc>) -> f64 {
+    let offset = Duration::hours(actor.seed.timezone_offset as i64);
+    let local = now + offset;
+    let hour = local.hour();
+    match hour {
+        7..=9 => 0.7,
+        10..=17 => 1.1,
+        18..=21 => 0.8,
+        _ => 0.35,
+    }
+}
+
+fn burst_multiplier(rng: &mut impl Rng) -> f64 {
+    if rng.gen_bool(0.12) {
+        rng.gen_range(2.0..5.0)
+    } else {
+        rng.gen_range(0.4..1.0)
+    }
+}
 struct RegionSelector {
     regions: Vec<String>,
     weights: WeightedIndex<f64>,
@@ -605,19 +708,6 @@ fn build_region_selector(
         regions: base_regions,
         weights: index,
     }
-}
-
-fn build_account_pool(config: &CloudTrailSourceConfig) -> Vec<String> {
-    if let Some(ids) = &config.account_ids {
-        let filtered: Vec<String> = ids.iter().cloned().filter(|id| id.len() == 12).collect();
-        if !filtered.is_empty() {
-            return filtered;
-        }
-    }
-
-    let count = config.account_count.unwrap_or(1).max(1);
-    let mut rng = rand::thread_rng();
-    (0..count).map(|_| random_account_id(&mut rng)).collect()
 }
 
 fn shuffle_actors(actors: &mut [ActorProfile], rng: &mut impl Rng) {

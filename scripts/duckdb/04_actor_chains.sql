@@ -6,7 +6,7 @@ SELECT
   envelope.event_type AS event_name,
   coalesce(
     try_cast(envelope.timestamp AS TIMESTAMP),
-    try_cast(cloudtrail.event_time AS TIMESTAMP)
+    try_cast(cloudtrail.eventTime AS TIMESTAMP)
   ) AS ts_parsed
 FROM read_parquet('out-test/*.parquet');
 

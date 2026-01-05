@@ -1,7 +1,15 @@
-use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
+use chrono::{offset::Offset, DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use chrono_tz::Tz;
 use rand::distributions::{Distribution, WeightedIndex};
+use rand::rngs::StdRng;
 use rand::Rng;
+use rand::SeedableRng;
+use crate::config::{
+    PopulationActorsConfig, PopulationConfig, RoleRate, RoleWeight, ServicePatternConfig,
+    ServiceProfileConfig, TimezoneWeight,
+};
 use std::collections::HashSet;
+use std::str::FromStr;
 
 /// High-level actor type used for session behavior and weighting.
 #[derive(Debug, Clone)]
@@ -19,6 +27,22 @@ pub enum ActorRole {
     Auditor,
 }
 
+#[derive(Debug, Clone)]
+pub enum ServiceProfile {
+    Generic,
+    Ec2Reaper,
+    DataLakeBot,
+    LogsShipper,
+    MetricsCollector,
+}
+
+#[derive(Debug, Clone)]
+pub enum ServicePattern {
+    Constant,
+    Diurnal,
+    Bursty,
+}
+
 /// Stable actor attributes used to create runtime profiles.
 #[derive(Debug, Clone)]
 pub struct ActorSeed {
@@ -28,6 +52,10 @@ pub struct ActorSeed {
     pub principal_id: String,
     pub arn: String,
     pub account_id: String,
+    pub access_key_id: String,
+    pub rate_per_hour: f64,
+    pub service_profile: Option<ServiceProfile>,
+    pub service_pattern: Option<ServicePattern>,
     pub user_name: Option<String>,
     pub user_agents: Vec<String>,
     pub source_ips: Vec<String>,
@@ -150,6 +178,22 @@ impl ActorProfile {
             .unwrap_or_else(|| "0.0.0.0".to_string())
     }
 
+    /// Returns the next time this actor can emit an event.
+    pub fn next_available_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        let mut candidate = now;
+        if let Some(next) = self.next_session_at {
+            if next > candidate {
+                candidate = next;
+            }
+        }
+
+        if within_active_window(&self.seed, candidate) {
+            return candidate;
+        }
+
+        next_active_window_start(&self.seed, candidate)
+    }
+
     fn pick_user_agent(&self, rng: &mut impl Rng) -> String {
         let primary_weight = match self.seed.kind {
             ActorKind::Human => 0.65,
@@ -173,29 +217,84 @@ pub struct ActorPopulation {
     pub actors: Vec<ActorSeed>,
 }
 
+pub struct RoleRates {
+    pub admin: f64,
+    pub developer: f64,
+    pub readonly: f64,
+    pub auditor: f64,
+}
+
+impl RoleRates {
+    pub fn default() -> Self {
+        Self {
+            admin: 24.0,
+            developer: 18.0,
+            readonly: 8.0,
+            auditor: 6.0,
+        }
+    }
+
+    pub fn for_role(&self, role: &ActorRole) -> f64 {
+        match role {
+            ActorRole::Admin => self.admin,
+            ActorRole::Developer => self.developer,
+            ActorRole::ReadOnly => self.readonly,
+            ActorRole::Auditor => self.auditor,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceProfileSpec {
+    pub profile: ServiceProfile,
+    pub weight: f64,
+    pub rate_per_hour: f64,
+    pub pattern: ServicePattern,
+}
+
+pub struct PopulationSpec<'a> {
+    pub total: usize,
+    pub service_ratio: f64,
+    pub role_weights: &'a [(ActorRole, f64)],
+    pub role_rates: &'a RoleRates,
+    pub service_rate_per_hour: f64,
+    pub service_profiles: &'a [ServiceProfileSpec],
+    pub hot_actor_ratio: f64,
+    pub hot_actor_multiplier: f64,
+    pub account_ids: &'a [String],
+}
+
 impl ActorPopulation {
     /// Generates a mixed population of human and service actors.
-    pub fn generate(
-        rng: &mut impl Rng,
-        total: usize,
-        service_ratio: f64,
-        role_weights: &[(ActorRole, f64)],
-        account_ids: &[String],
-    ) -> Self {
-        let total = total.max(1);
-        let service_count = ((total as f64) * service_ratio.clamp(0.0, 1.0)).round() as usize;
+    pub fn generate(rng: &mut impl Rng, spec: &PopulationSpec<'_>) -> Self {
+        let total = spec.total.max(1);
+        let service_count =
+            ((total as f64) * spec.service_ratio.clamp(0.0, 1.0)).round() as usize;
         let human_count = total.saturating_sub(service_count);
         let mut actors = Vec::with_capacity(total);
 
         for _ in 0..human_count {
-            let account_id = pick_account_id(rng, account_ids);
-            actors.push(ActorSeed::new_human(rng, role_weights, &account_id));
+            let account_id = pick_account_id(rng, spec.account_ids);
+            actors.push(ActorSeed::new_human(
+                rng,
+                spec.role_weights,
+                spec.role_rates,
+                &account_id,
+            ));
         }
         for _ in 0..service_count {
-            let account_id = pick_account_id(rng, account_ids);
-            actors.push(ActorSeed::new_service(rng, &account_id));
+            let account_id = pick_account_id(rng, spec.account_ids);
+            let profile = pick_service_profile(rng, spec.service_profiles, spec.service_rate_per_hour);
+            actors.push(ActorSeed::new_service(
+                rng,
+                &account_id,
+                profile.profile,
+                profile.pattern,
+                profile.rate_per_hour,
+            ));
         }
 
+        apply_hot_actor_rates(rng, &mut actors, spec.hot_actor_ratio, spec.hot_actor_multiplier);
         Self { actors }
     }
 
@@ -209,17 +308,61 @@ impl ActorPopulation {
     }
 }
 
+/// Builds an actor population from the dedicated population config.
+pub fn generate_population(config: &PopulationConfig) -> ActorPopulation {
+    let mut rng = match config.seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_entropy(),
+    };
+    let population = &config.population;
+    let total = population.actor_count.unwrap_or(500).max(1);
+    let service_ratio = population.service_ratio.unwrap_or(0.2).clamp(0.0, 1.0);
+    let hot_actor_ratio = population.hot_actor_ratio.unwrap_or(0.1).clamp(0.0, 1.0);
+    let hot_actor_multiplier = population.hot_actor_multiplier.unwrap_or(6.0).max(1.0);
+    let role_weights = build_role_weights(population.role_distribution.as_ref());
+    let role_rates = build_role_rates(population.role_rates_per_hour.as_ref());
+    let account_ids = build_account_pool(population);
+    let service_rate = population.service_rate_per_hour.unwrap_or(6.0).max(0.1);
+    let service_profiles =
+        build_service_profiles(population.service_profiles.as_ref(), service_rate);
+
+    let spec = PopulationSpec {
+        total,
+        service_ratio,
+        role_weights: &role_weights,
+        role_rates: &role_rates,
+        service_rate_per_hour: service_rate,
+        service_profiles: &service_profiles,
+        hot_actor_ratio,
+        hot_actor_multiplier,
+        account_ids: &account_ids,
+    };
+
+    let mut population = ActorPopulation::generate(&mut rng, &spec);
+    let start_time = Utc::now();
+    apply_timezone_distribution(
+        &mut population,
+        config.timezone_distribution.as_ref(),
+        start_time,
+        &mut rng,
+    );
+    population
+}
+
 impl ActorSeed {
     fn new_human(
         rng: &mut impl Rng,
         role_weights: &[(ActorRole, f64)],
+        role_rates: &RoleRates,
         account_id: &str,
     ) -> Self {
         let user_name = format!("user-{}", random_alpha(rng, 6).to_lowercase());
         let principal_id = format!("AIDA{}", random_alpha(rng, 16));
         let arn = format!("arn:aws:iam::{}:user/{}", account_id, user_name);
+        let access_key_id = random_access_key(rng, "AKIA");
         let user_agents = human_user_agents(rng);
         let role = pick_human_role(rng, role_weights);
+        let rate_per_hour = role_rates.for_role(&role);
         let active_hours = rng.gen_range(7..11);
         let active_start_hour = rng.gen_range(6..12);
         let timezone_offset = pick_timezone_offset(rng);
@@ -231,6 +374,10 @@ impl ActorSeed {
             principal_id,
             arn,
             account_id: account_id.to_string(),
+            access_key_id,
+            rate_per_hour,
+            service_profile: None,
+            service_pattern: None,
             user_name: Some(user_name),
             user_agents,
             source_ips: human_source_ips(rng),
@@ -241,7 +388,13 @@ impl ActorSeed {
         }
     }
 
-    fn new_service(rng: &mut impl Rng, account_id: &str) -> Self {
+    fn new_service(
+        rng: &mut impl Rng,
+        account_id: &str,
+        profile: ServiceProfile,
+        pattern: ServicePattern,
+        rate_per_hour: f64,
+    ) -> Self {
         let role_name = format!("svc-role-{}", random_alpha(rng, 4).to_lowercase());
         let session_name = format!("svc-{}", random_alpha(rng, 8));
         let principal_id = format!("AROA{}", random_alpha(rng, 16));
@@ -249,6 +402,7 @@ impl ActorSeed {
             "arn:aws:sts::{}:assumed-role/{}/{}",
             account_id, role_name, session_name
         );
+        let access_key_id = random_access_key(rng, "ASIA");
         let user_agents = service_user_agents(rng);
         let active_hours = rng.gen_range(16..24);
         let active_start_hour = rng.gen_range(0..24);
@@ -259,6 +413,10 @@ impl ActorSeed {
             principal_id,
             arn,
             account_id: account_id.to_string(),
+            access_key_id,
+            rate_per_hour,
+            service_profile: Some(profile),
+            service_pattern: Some(pattern),
             user_name: None,
             user_agents,
             source_ips: service_source_ips(rng),
@@ -283,12 +441,181 @@ fn pick_human_role(rng: &mut impl Rng, role_weights: &[(ActorRole, f64)]) -> Act
     ActorRole::Developer
 }
 
+fn pick_service_profile<'a>(
+    rng: &mut impl Rng,
+    profiles: &'a [ServiceProfileSpec],
+    fallback_rate: f64,
+) -> ServiceProfileSpec {
+    if profiles.is_empty() {
+        return ServiceProfileSpec {
+            profile: ServiceProfile::Generic,
+            weight: 1.0,
+            rate_per_hour: fallback_rate.max(0.1),
+            pattern: ServicePattern::Constant,
+        };
+    }
+
+    let weights: Vec<f64> = profiles.iter().map(|profile| profile.weight).collect();
+    let index = WeightedIndex::new(weights).ok();
+    if let Some(index) = index {
+        return profiles[index.sample(rng)].clone();
+    }
+
+    profiles[0].clone()
+}
+
+fn apply_hot_actor_rates(
+    rng: &mut impl Rng,
+    actors: &mut [ActorSeed],
+    hot_ratio: f64,
+    hot_multiplier: f64,
+) {
+    let ratio = hot_ratio.clamp(0.0, 1.0);
+    let hot_count = ((actors.len() as f64) * ratio).round() as usize;
+    if hot_count == 0 || actors.is_empty() {
+        return;
+    }
+    let mut indices: Vec<usize> = (0..actors.len()).collect();
+    for i in 0..hot_count.min(actors.len()) {
+        let swap_idx = rng.gen_range(i..actors.len());
+        indices.swap(i, swap_idx);
+        let idx = indices[i];
+        actors[idx].rate_per_hour *= hot_multiplier.max(1.0);
+    }
+}
+
 fn pick_account_id(rng: &mut impl Rng, account_ids: &[String]) -> String {
     if account_ids.is_empty() {
         return "000000000000".to_string();
     }
     let idx = rng.gen_range(0..account_ids.len());
     account_ids[idx].clone()
+}
+
+fn build_account_pool(config: &PopulationActorsConfig) -> Vec<String> {
+    if let Some(ids) = &config.account_ids {
+        let filtered: Vec<String> = ids.iter().cloned().filter(|id| id.len() == 12).collect();
+        if !filtered.is_empty() {
+            return filtered;
+        }
+    }
+
+    let count = config.account_count.unwrap_or(1).max(1);
+    let mut rng = rand::thread_rng();
+    (0..count).map(|_| random_account_id(&mut rng)).collect()
+}
+
+fn build_role_weights(config: Option<&Vec<RoleWeight>>) -> Vec<(ActorRole, f64)> {
+    let defaults = vec![
+        (ActorRole::Admin, 0.15),
+        (ActorRole::Developer, 0.55),
+        (ActorRole::ReadOnly, 0.25),
+        (ActorRole::Auditor, 0.05),
+    ];
+
+    let entries = match config {
+        Some(list) if !list.is_empty() => list,
+        _ => return defaults,
+    };
+
+    let mut parsed = Vec::new();
+    for entry in entries {
+        if !entry.weight.is_finite() || entry.weight <= 0.0 {
+            continue;
+        }
+        let role = match entry.name.as_str() {
+            "admin" => ActorRole::Admin,
+            "developer" => ActorRole::Developer,
+            "readonly" | "read_only" => ActorRole::ReadOnly,
+            "auditor" => ActorRole::Auditor,
+            _ => continue,
+        };
+        parsed.push((role, entry.weight));
+    }
+
+    if parsed.is_empty() {
+        defaults
+    } else {
+        parsed
+    }
+}
+
+fn build_role_rates(config: Option<&Vec<RoleRate>>) -> RoleRates {
+    let mut rates = RoleRates::default();
+
+    let entries = match config {
+        Some(list) if !list.is_empty() => list,
+        _ => return rates,
+    };
+
+    for entry in entries {
+        if !entry.rate_per_hour.is_finite() || entry.rate_per_hour <= 0.0 {
+            continue;
+        }
+        match entry.name.as_str() {
+            "admin" => rates.admin = entry.rate_per_hour,
+            "developer" => rates.developer = entry.rate_per_hour,
+            "readonly" | "read_only" => rates.readonly = entry.rate_per_hour,
+            "auditor" => rates.auditor = entry.rate_per_hour,
+            _ => {}
+        }
+    }
+
+    rates
+}
+
+fn build_service_profiles(
+    config: Option<&Vec<ServiceProfileConfig>>,
+    fallback_rate: f64,
+) -> Vec<ServiceProfileSpec> {
+    let entries = match config {
+        Some(list) if !list.is_empty() => list,
+        _ => return Vec::new(),
+    };
+
+    let mut profiles = Vec::new();
+    for entry in entries {
+        if !entry.weight.is_finite() || entry.weight <= 0.0 {
+            continue;
+        }
+        let profile = match normalize_profile_name(&entry.name) {
+            Some(profile) => profile,
+            None => continue,
+        };
+        let rate = entry.rate_per_hour.unwrap_or(fallback_rate).max(0.1);
+        let pattern = entry
+            .pattern
+            .as_ref()
+            .map(service_pattern_from_config)
+            .unwrap_or(ServicePattern::Constant);
+        profiles.push(ServiceProfileSpec {
+            profile,
+            weight: entry.weight,
+            rate_per_hour: rate,
+            pattern,
+        });
+    }
+
+    profiles
+}
+
+fn normalize_profile_name(name: &str) -> Option<ServiceProfile> {
+    match name.trim().to_lowercase().replace('-', "_").as_str() {
+        "generic" => Some(ServiceProfile::Generic),
+        "ec2_reaper" => Some(ServiceProfile::Ec2Reaper),
+        "datalake_bot" => Some(ServiceProfile::DataLakeBot),
+        "logs_shipper" => Some(ServiceProfile::LogsShipper),
+        "metrics_collector" => Some(ServiceProfile::MetricsCollector),
+        _ => None,
+    }
+}
+
+fn service_pattern_from_config(value: &ServicePatternConfig) -> ServicePattern {
+    match value {
+        ServicePatternConfig::Constant => ServicePattern::Constant,
+        ServicePatternConfig::Diurnal => ServicePattern::Diurnal,
+        ServicePatternConfig::Bursty => ServicePattern::Bursty,
+    }
 }
 
 fn pick_timezone_offset(rng: &mut impl Rng) -> i8 {
@@ -303,21 +630,67 @@ fn pick_timezone_offset(rng: &mut impl Rng) -> i8 {
 }
 
 fn within_active_window(seed: &ActorSeed, now: DateTime<Utc>) -> bool {
-    if !seed.weekend_active && is_weekend(now) {
+    let offset = Duration::hours(seed.timezone_offset as i64);
+    let local = now + offset;
+    if !seed.weekend_active && is_weekend_date(local.date_naive()) {
         return false;
     }
-
     if seed.active_hours >= 24 {
         return true;
     }
 
-    let local_hour = local_hour(now, seed.timezone_offset);
+    let local_hour = local.hour() as u8;
     let start = seed.active_start_hour;
     let end = (start + seed.active_hours) % 24;
     if start < end {
         local_hour >= start && local_hour < end
     } else {
         local_hour >= start || local_hour < end
+    }
+}
+
+fn apply_timezone_distribution(
+    population: &mut ActorPopulation,
+    distribution: Option<&Vec<TimezoneWeight>>,
+    start_time: DateTime<Utc>,
+    rng: &mut impl Rng,
+) {
+    let entries = match distribution {
+        Some(list) if !list.is_empty() => list,
+        _ => return,
+    };
+
+    let mut offsets = Vec::new();
+    let mut weights = Vec::new();
+    for entry in entries {
+        if !entry.weight.is_finite() || entry.weight <= 0.0 {
+            continue;
+        }
+        let tz = match Tz::from_str(&entry.name) {
+            Ok(tz) => tz,
+            Err(_) => continue,
+        };
+        let offset_seconds = tz
+            .offset_from_utc_datetime(&start_time.naive_utc())
+            .fix()
+            .local_minus_utc();
+        let offset_hours = (offset_seconds as f64 / 3600.0).round() as i8;
+        offsets.push(offset_hours);
+        weights.push(entry.weight);
+    }
+
+    if offsets.is_empty() {
+        return;
+    }
+
+    let index = match WeightedIndex::new(&weights) {
+        Ok(index) => index,
+        Err(_) => return,
+    };
+
+    for actor in &mut population.actors {
+        let choice = index.sample(rng);
+        actor.timezone_offset = offsets[choice];
     }
 }
 
@@ -356,14 +729,37 @@ fn cooldown_minutes(kind: &ActorKind, rng: &mut impl Rng) -> i64 {
     }
 }
 
-fn local_hour(now: DateTime<Utc>, offset: i8) -> u8 {
-    let hour = now.hour() as i32 + offset as i32;
-    hour.rem_euclid(24) as u8
+fn is_weekend_date(date: chrono::NaiveDate) -> bool {
+    let day = date.weekday().number_from_monday();
+    day >= 6
 }
 
-fn is_weekend(now: DateTime<Utc>) -> bool {
-    let day = now.weekday().number_from_monday();
-    day >= 6
+fn next_active_window_start(seed: &ActorSeed, now: DateTime<Utc>) -> DateTime<Utc> {
+    let offset = Duration::hours(seed.timezone_offset as i64);
+    let local = now + offset;
+    let mut date = local.date_naive();
+
+    loop {
+        if !seed.weekend_active && is_weekend_date(date) {
+            date = date + Duration::days(1);
+            continue;
+        }
+
+        let start = match date.and_hms_opt(seed.active_start_hour as u32, 0, 0) {
+            Some(value) => value,
+            None => {
+                date = date + Duration::days(1);
+                continue;
+            }
+        };
+
+        if date > local.date_naive() || local.time() < start.time() {
+            let start_utc = start - offset;
+            return Utc.from_utc_datetime(&start_utc);
+        }
+
+        date = date + Duration::days(1);
+    }
 }
 
 fn random_alpha(rng: &mut impl Rng, len: usize) -> String {
@@ -374,6 +770,14 @@ fn random_alpha(rng: &mut impl Rng, len: usize) -> String {
             ALPHANUM[idx] as char
         })
         .collect()
+}
+
+fn random_access_key(rng: &mut impl Rng, prefix: &str) -> String {
+    format!("{}{}", prefix, random_alpha(rng, 16))
+}
+
+fn random_account_id(rng: &mut impl Rng) -> String {
+    (0..12).map(|_| rng.gen_range(0..10).to_string()).collect()
 }
 
 fn random_ip(rng: &mut impl Rng) -> String {

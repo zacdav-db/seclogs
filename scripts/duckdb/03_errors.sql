@@ -4,8 +4,8 @@ CREATE OR REPLACE VIEW events AS
 SELECT
   envelope.event_type AS event_name,
   envelope.outcome AS outcome,
-  cloudtrail.error_code AS error_code,
-  cloudtrail.error_message AS error_message
+  cloudtrail.errorCode AS error_code,
+  cloudtrail.errorMessage AS error_message
 FROM read_parquet('out-test/*.parquet');
 
 SELECT

@@ -267,33 +267,40 @@ fn build_schema() -> SchemaRef {
     ]);
 
     let cloudtrail_identity_fields = Fields::from(vec![
-        Field::new("identity_type", DataType::Utf8, true),
-        Field::new("principal_id", DataType::Utf8, true),
+        Field::new("type", DataType::Utf8, true),
+        Field::new("principalId", DataType::Utf8, true),
         Field::new("arn", DataType::Utf8, true),
-        Field::new("account_id", DataType::Utf8, true),
-        Field::new("user_name", DataType::Utf8, true),
+        Field::new("accountId", DataType::Utf8, true),
+        Field::new("accessKeyId", DataType::Utf8, true),
+        Field::new("userName", DataType::Utf8, true),
     ]);
 
     let cloudtrail_fields = Fields::from(vec![
-        Field::new("event_version", DataType::Utf8, true),
-        Field::new("event_time", DataType::Utf8, true),
-        Field::new("event_source", DataType::Utf8, true),
-        Field::new("event_name", DataType::Utf8, true),
-        Field::new("aws_region", DataType::Utf8, true),
-        Field::new("source_ip_address", DataType::Utf8, true),
-        Field::new("user_agent", DataType::Utf8, true),
+        Field::new("eventVersion", DataType::Utf8, true),
+        Field::new("eventTime", DataType::Utf8, true),
+        Field::new("eventSource", DataType::Utf8, true),
+        Field::new("eventName", DataType::Utf8, true),
+        Field::new("awsRegion", DataType::Utf8, true),
+        Field::new("sourceIPAddress", DataType::Utf8, true),
+        Field::new("userAgent", DataType::Utf8, true),
         Field::new(
-            "user_identity",
+            "userIdentity",
             DataType::Struct(cloudtrail_identity_fields),
             true,
         ),
-        Field::new("request_parameters_json", DataType::Utf8, true),
-        Field::new("response_elements_json", DataType::Utf8, true),
-        Field::new("error_code", DataType::Utf8, true),
-        Field::new("error_message", DataType::Utf8, true),
-        Field::new("event_id", DataType::Utf8, true),
-        Field::new("recipient_account_id", DataType::Utf8, true),
-        Field::new("read_only", DataType::Boolean, true),
+        Field::new("requestParametersJson", DataType::Utf8, true),
+        Field::new("responseElementsJson", DataType::Utf8, true),
+        Field::new("errorCode", DataType::Utf8, true),
+        Field::new("errorMessage", DataType::Utf8, true),
+        Field::new("requestID", DataType::Utf8, true),
+        Field::new("eventID", DataType::Utf8, true),
+        Field::new("readOnly", DataType::Boolean, true),
+        Field::new("eventType", DataType::Utf8, true),
+        Field::new("managementEvent", DataType::Boolean, true),
+        Field::new("recipientAccountId", DataType::Utf8, true),
+        Field::new("eventCategory", DataType::Utf8, true),
+        Field::new("tlsDetailsJson", DataType::Utf8, true),
+        Field::new("sessionCredentialFromConsole", DataType::Boolean, true),
     ]);
 
     let fields = vec![
@@ -434,40 +441,59 @@ fn append_cloudtrail(builder: &mut StructBuilder, event: &Event) {
         }
     };
 
+    let get_str = |primary: &str, fallback: &str| -> Option<&str> {
+        payload
+            .get(primary)
+            .and_then(Value::as_str)
+            .or_else(|| payload.get(fallback).and_then(Value::as_str))
+    };
+    let get_bool = |primary: &str, fallback: &str| -> Option<bool> {
+        payload
+            .get(primary)
+            .and_then(Value::as_bool)
+            .or_else(|| payload.get(fallback).and_then(Value::as_bool))
+    };
+
     append_string(
         builder.field_builder::<StringBuilder>(0).unwrap(),
-        payload.get("event_version").and_then(Value::as_str),
+        get_str("eventVersion", "event_version"),
     );
     append_string(
         builder.field_builder::<StringBuilder>(1).unwrap(),
-        payload.get("event_time").and_then(Value::as_str),
+        get_str("eventTime", "event_time"),
     );
     append_string(
         builder.field_builder::<StringBuilder>(2).unwrap(),
-        payload.get("event_source").and_then(Value::as_str),
+        get_str("eventSource", "event_source"),
     );
     append_string(
         builder.field_builder::<StringBuilder>(3).unwrap(),
-        payload.get("event_name").and_then(Value::as_str),
+        get_str("eventName", "event_name"),
     );
     append_string(
         builder.field_builder::<StringBuilder>(4).unwrap(),
-        payload.get("aws_region").and_then(Value::as_str),
+        get_str("awsRegion", "aws_region"),
     );
     append_string(
         builder.field_builder::<StringBuilder>(5).unwrap(),
-        payload.get("source_ip_address").and_then(Value::as_str),
+        get_str("sourceIPAddress", "source_ip_address"),
     );
     append_string(
         builder.field_builder::<StringBuilder>(6).unwrap(),
-        payload.get("user_agent").and_then(Value::as_str),
+        get_str("userAgent", "user_agent"),
     );
 
     let identity_builder = builder.field_builder::<StructBuilder>(7).unwrap();
-    append_cloudtrail_identity(identity_builder, payload.get("user_identity"));
+    append_cloudtrail_identity(
+        identity_builder,
+        payload
+            .get("userIdentity")
+            .or_else(|| payload.get("user_identity")),
+    );
 
     let request_json = payload
-        .get("request_parameters")
+        .get("requestParameters")
+        .or_else(|| payload.get("request_parameters"))
         .and_then(|value| serde_json::to_string(value).ok());
     append_string(
         builder.field_builder::<StringBuilder>(8).unwrap(),
@@ -475,7 +501,8 @@ fn append_cloudtrail(builder: &mut StructBuilder, event: &Event) {
     );
 
     let response_json = payload
-        .get("response_elements")
+        .get("responseElements")
+        .or_else(|| payload.get("response_elements"))
         .and_then(|value| serde_json::to_string(value).ok());
     append_string(
         builder.field_builder::<StringBuilder>(9).unwrap(),
@@ -484,23 +511,54 @@ fn append_cloudtrail(builder: &mut StructBuilder, event: &Event) {
 
     append_string(
         builder.field_builder::<StringBuilder>(10).unwrap(),
-        payload.get("error_code").and_then(Value::as_str),
+        get_str("errorCode", "error_code"),
     );
     append_string(
         builder.field_builder::<StringBuilder>(11).unwrap(),
-        payload.get("error_message").and_then(Value::as_str),
+        get_str("errorMessage", "error_message"),
     );
     append_string(
         builder.field_builder::<StringBuilder>(12).unwrap(),
-        payload.get("event_id").and_then(Value::as_str),
+        get_str("requestID", "request_id"),
     );
     append_string(
         builder.field_builder::<StringBuilder>(13).unwrap(),
-        payload.get("recipient_account_id").and_then(Value::as_str),
+        get_str("eventID", "event_id"),
     );
     append_bool(
         builder.field_builder::<BooleanBuilder>(14).unwrap(),
-        payload.get("read_only").and_then(Value::as_bool),
+        get_bool("readOnly", "read_only"),
+    );
+    append_string(
+        builder.field_builder::<StringBuilder>(15).unwrap(),
+        get_str("eventType", "event_type"),
+    );
+    append_bool(
+        builder.field_builder::<BooleanBuilder>(16).unwrap(),
+        get_bool("managementEvent", "management_event"),
+    );
+    append_string(
+        builder.field_builder::<StringBuilder>(17).unwrap(),
+        get_str("recipientAccountId", "recipient_account_id"),
+    );
+    append_string(
+        builder.field_builder::<StringBuilder>(18).unwrap(),
+        get_str("eventCategory", "event_category"),
+    );
+    let tls_json = payload
+        .get("tlsDetails")
+        .or_else(|| payload.get("tls_details"))
+        .and_then(|value| serde_json::to_string(value).ok());
+    append_string(
+        builder.field_builder::<StringBuilder>(19).unwrap(),
+        tls_json.as_deref(),
+    );
+    append_bool(
+        builder.field_builder::<BooleanBuilder>(20).unwrap(),
+        get_bool(
+            "sessionCredentialFromConsole",
+            "session_credential_from_console",
+        ),
     );
 
     builder.append(true);
@@ -508,25 +566,34 @@ fn append_cloudtrail(builder: &mut StructBuilder, event: &Event) {
 
 fn append_cloudtrail_identity(builder: &mut StructBuilder, value: Option<&Value>) {
     if let Some(map) = value.and_then(Value::as_object) {
+        let get_str = |primary: &str, fallback: &str| -> Option<&str> {
+            map.get(primary)
+                .and_then(Value::as_str)
+                .or_else(|| map.get(fallback).and_then(Value::as_str))
+        };
         append_string(
             builder.field_builder::<StringBuilder>(0).unwrap(),
-            map.get("identity_type").and_then(Value::as_str),
+            get_str("type", "identity_type"),
         );
         append_string(
             builder.field_builder::<StringBuilder>(1).unwrap(),
-            map.get("principal_id").and_then(Value::as_str),
+            get_str("principalId", "principal_id"),
         );
         append_string(
             builder.field_builder::<StringBuilder>(2).unwrap(),
-            map.get("arn").and_then(Value::as_str),
+            get_str("arn", "arn"),
         );
         append_string(
             builder.field_builder::<StringBuilder>(3).unwrap(),
-            map.get("account_id").and_then(Value::as_str),
+            get_str("accountId", "account_id"),
         );
         append_string(
             builder.field_builder::<StringBuilder>(4).unwrap(),
-            map.get("user_name").and_then(Value::as_str),
+            get_str("accessKeyId", "access_key_id"),
+        );
+        append_string(
+            builder.field_builder::<StringBuilder>(5).unwrap(),
+            get_str("userName", "user_name"),
         );
         builder.append(true);
     } else {
@@ -553,6 +620,12 @@ fn append_cloudtrail_null(builder: &mut StructBuilder) {
     append_string(builder.field_builder::<StringBuilder>(12).unwrap(), None);
     append_string(builder.field_builder::<StringBuilder>(13).unwrap(), None);
     append_bool(builder.field_builder::<BooleanBuilder>(14).unwrap(), None);
+    append_string(builder.field_builder::<StringBuilder>(15).unwrap(), None);
+    append_bool(builder.field_builder::<BooleanBuilder>(16).unwrap(), None);
+    append_string(builder.field_builder::<StringBuilder>(17).unwrap(), None);
+    append_string(builder.field_builder::<StringBuilder>(18).unwrap(), None);
+    append_string(builder.field_builder::<StringBuilder>(19).unwrap(), None);
+    append_bool(builder.field_builder::<BooleanBuilder>(20).unwrap(), None);
 
     builder.append(false);
 }
@@ -563,6 +636,7 @@ fn append_cloudtrail_identity_null(builder: &mut StructBuilder) {
     append_string(builder.field_builder::<StringBuilder>(2).unwrap(), None);
     append_string(builder.field_builder::<StringBuilder>(3).unwrap(), None);
     append_string(builder.field_builder::<StringBuilder>(4).unwrap(), None);
+    append_string(builder.field_builder::<StringBuilder>(5).unwrap(), None);
     builder.append(false);
 }
 
@@ -649,7 +723,8 @@ fn file_context_from_event(event: &Event) -> FileContext {
         .unwrap_or_else(|| "000000000000".to_string());
     let region = event
         .payload
-        .get("aws_region")
+        .get("awsRegion")
+        .or_else(|| event.payload.get("aws_region"))
         .and_then(|value| value.as_str())
         .unwrap_or("global")
         .to_string();

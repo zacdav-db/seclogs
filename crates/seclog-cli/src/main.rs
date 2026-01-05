@@ -1,19 +1,18 @@
 use clap::{Parser, Subcommand};
-use chrono::Utc;
-use seclog_core::config::{Config, FormatConfig, SourceConfig};
+use chrono::{DateTime, Utc};
+use seclog_core::actors::generate_population;
+use seclog_core::config::{Config, FormatConfig, PopulationConfig, SourceConfig};
 use seclog_core::event::Event;
-use seclog_core::rate::RateController;
-use seclog_core::traffic::TrafficModel;
 use seclog_core::traits::{EventSource, EventWriter};
 use seclog_actors_parquet::write_population;
 use seclog_formats_jsonl::JsonlWriter;
 use seclog_formats_parquet::ParquetWriter;
-use seclog_sources_cloudtrail::{generate_actor_population, CloudTrailGenerator};
+use seclog_sources_cloudtrail::CloudTrailGenerator;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -86,45 +85,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            let traffic_model = TrafficModel::from_config(&loaded.traffic)?;
-            let mut rate_controller = RateController::new(
-                loaded.traffic.events_per_second,
-                loaded.traffic.bytes_per_second,
-            )?;
-
             let gen_workers = normalize_workers(gen_workers);
             let writer_shards = normalize_writer_shards(writer_shards);
-            let queue_depth = gen_workers.saturating_mul(2048).max(1024);
-
-            let running = Arc::new(AtomicBool::new(true));
-            let (gen_tx, gen_rx) = sync_channel(queue_depth);
-            let source_config = loaded.source.clone();
-            let mut gen_handles = Vec::new();
-            for worker_id in 0..gen_workers {
-                let tx = gen_tx.clone();
-                let source = source_config.clone();
-                let running = Arc::clone(&running);
-                let seed = loaded.seed.map(|value| value.wrapping_add(worker_id as u64));
-                let handle = thread::spawn(move || -> WorkerResult {
-                    let mut generator = match source {
-                        SourceConfig::CloudTrail(config) => {
-                            CloudTrailGenerator::from_config(&config, seed)?
-                        }
-                    };
-                    while running.load(Ordering::Relaxed) {
-                        if let Some(event) = generator.next_event() {
-                            if tx.send(event).is_err() {
-                                break;
-                            }
-                        } else {
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                    }
-                    Ok(())
-                });
-                gen_handles.push(handle);
+            if gen_workers != 1 {
+                eprintln!(
+                    "warning: actor-driven mode uses a single generator for ordered output; forcing gen-workers=1"
+                );
             }
-            drop(gen_tx);
+            let queue_depth = 1024;
 
             let counters = WriterCounters::new();
             let (writer_txs, writer_handles) = spawn_writer_shards(
@@ -136,9 +104,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 queue_depth,
                 &counters,
             );
-            let tick = Duration::from_millis(100);
-            let mut last_tick = Instant::now();
-            let mut avg_event_size: f64 = 1024.0;
             let mut total_dispatched = 0_u64;
             let mut last_written_events = 0_u64;
             let mut last_written_bytes = 0_u64;
@@ -154,7 +119,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut metrics = Metrics::new(Duration::from_millis(metrics_interval_ms));
             let start_time = Instant::now();
             let max_duration = max_seconds.map(Duration::from_secs);
-            let mut disconnected = false;
+            let start_sim_time = parse_start_time(loaded.traffic.start_time.as_deref())?;
+            let time_scale = loaded.traffic.time_scale.unwrap_or(1.0);
+            let time_scale = if time_scale <= 0.0 { None } else { Some(time_scale) };
+            let mut last_sim_time = start_sim_time;
+            let mut last_wall = Instant::now();
+
+            let mut generator = match &loaded.source {
+                SourceConfig::CloudTrail(config) => {
+                    CloudTrailGenerator::from_config(config, loaded.seed, start_sim_time)?
+                }
+            };
 
             loop {
                 let loop_start = Instant::now();
@@ -163,52 +138,25 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
                 }
-                let elapsed = loop_start.saturating_duration_since(last_tick);
-                if elapsed < tick {
-                    std::thread::sleep(tick - elapsed);
-                    continue;
-                }
-                last_tick = loop_start;
-
-                let multiplier = traffic_model.multiplier(Utc::now());
-                let effective_elapsed = elapsed.min(tick);
-                let mut budget =
-                    rate_controller.quota(effective_elapsed, multiplier, avg_event_size.round() as u64);
-
                 if let Some(max) = max_events {
                     if total_dispatched >= max {
                         break;
                     }
-                    let remaining = max - total_dispatched;
-                    if budget > remaining {
-                        budget = remaining;
-                    }
                 }
 
-                if budget == 0 {
-                    continue;
-                }
-
-                let mut loop_dispatched = 0_u64;
-
-                for _ in 0..budget {
-                    let event = match gen_rx.try_recv() {
-                        Ok(event) => event,
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            disconnected = true;
-                            break;
-                        }
-                    };
-
-                    dispatch_event(event, &writer_txs, writer_shards)?;
-                    total_dispatched += 1;
-                    loop_dispatched += 1;
-                }
-
-                if disconnected {
+                let Some(event) = generator.next_event() else {
                     break;
+                };
+
+                if let Some(event_time) = parse_event_time(&event) {
+                    if let Some(scale) = time_scale {
+                        throttle_to_sim_time(event_time, last_sim_time, scale, &mut last_wall);
+                    }
+                    last_sim_time = event_time;
                 }
+
+                dispatch_event(event, &writer_txs, writer_shards)?;
+                total_dispatched += 1;
 
                 let current_events = counters.events.load(Ordering::Relaxed);
                 let current_bytes = counters.bytes.load(Ordering::Relaxed);
@@ -216,12 +164,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let loop_bytes = current_bytes.saturating_sub(last_written_bytes);
                 last_written_events = current_events;
                 last_written_bytes = current_bytes;
-
-                if loop_events > 0 {
-                    let alpha = 0.1;
-                    let per_event = loop_bytes as f64 / loop_events as f64;
-                    avg_event_size = (1.0 - alpha) * avg_event_size + alpha * per_event;
-                }
 
                 if let (Some(interval), Some(next)) = (flush_interval, next_flush) {
                     if loop_start >= next {
@@ -232,25 +174,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                let overrun = loop_start.elapsed().saturating_sub(tick);
-                let indicate_missed = budget.saturating_sub(loop_dispatched);
-                metrics.record(loop_events, loop_bytes, overrun, indicate_missed);
+                metrics.record(loop_events, loop_bytes, Duration::ZERO, 0);
             }
-
-            running.store(false, Ordering::Relaxed);
-            drop(gen_rx);
             for tx in &writer_txs {
                 let _ = tx.send(WriterCommand::Close);
             }
             drop(writer_txs);
 
-            for handle in gen_handles {
-                match handle.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => return Err("generator thread panicked".into()),
-                }
-            }
             for handle in writer_handles {
                 match handle.join() {
                     Ok(Ok(())) => {}
@@ -260,12 +190,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Actors { config, output } => {
-            let loaded = Config::from_path(&config)?;
-            let population = match &loaded.source {
-                SourceConfig::CloudTrail(config) => {
-                    generate_actor_population(config, loaded.seed)
-                }
-            };
+            let loaded = PopulationConfig::from_path(&config)?;
+            let population = generate_population(&loaded);
             write_population(&output, &population)?;
             println!("actor population written to {}", output.display());
         }
@@ -316,6 +242,44 @@ fn normalize_writer_shards(requested: usize) -> usize {
     } else {
         requested.max(1)
     }
+}
+
+fn parse_start_time(value: Option<&str>) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
+    match value {
+        Some(raw) => {
+            let parsed = DateTime::parse_from_rfc3339(raw)?;
+            Ok(parsed.with_timezone(&Utc))
+        }
+        None => Ok(Utc::now()),
+    }
+}
+
+fn parse_event_time(event: &Event) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&event.envelope.timestamp)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn throttle_to_sim_time(
+    current: DateTime<Utc>,
+    previous: DateTime<Utc>,
+    scale: f64,
+    last_wall: &mut Instant,
+) {
+    if scale <= 0.0 {
+        return;
+    }
+    if current <= previous {
+        return;
+    }
+    let sim_delta = current - previous;
+    let sim_secs = sim_delta.num_milliseconds().max(0) as f64 / 1000.0;
+    let target = Duration::from_secs_f64(sim_secs / scale);
+    let elapsed = last_wall.elapsed();
+    if target > elapsed {
+        std::thread::sleep(target - elapsed);
+    }
+    *last_wall = Instant::now();
 }
 
 fn spawn_writer_shards(
@@ -400,7 +364,8 @@ fn writer_index_for_event(event: &Event, shards: usize) -> usize {
         .unwrap_or("000000000000");
     let region = event
         .payload
-        .get("aws_region")
+        .get("awsRegion")
+        .or_else(|| event.payload.get("aws_region"))
         .and_then(|value| value.as_str())
         .unwrap_or("global");
 

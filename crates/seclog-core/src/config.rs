@@ -53,46 +53,16 @@ impl Config {
     }
 }
 
-/// Controls the global traffic profile for generation.
+/// Controls the global simulation clock for generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficConfig {
-    /// Constant or realistic traffic mode.
-    pub mode: TrafficMode,
-    /// Target events per second (optional).
-    pub events_per_second: Option<f64>,
-    /// Target bytes per second (optional).
-    pub bytes_per_second: Option<u64>,
-    /// Optional curve definition for realistic mode.
-    pub curve: Option<CurveConfig>,
-    /// Optional timezone weighting for realistic mode.
-    pub timezone_distribution: Option<Vec<TimezoneWeight>>,
+    /// Optional start time for the simulated clock (RFC3339).
+    pub start_time: Option<String>,
+    /// Time scale multiplier (1.0 = real time, 60.0 = 1 minute per second).
+    pub time_scale: Option<f64>,
 }
 
-/// Traffic generation mode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TrafficMode {
-    Constant,
-    Realistic,
-}
-
-/// Curve configuration for realistic traffic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum CurveConfig {
-    WeekdayPeak(WeekdayPeakCurve),
-}
-
-/// Weekday/weekend curve with local-hour peaks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WeekdayPeakCurve {
-    pub weekday_multiplier: f64,
-    pub weekend_multiplier: f64,
-    pub peak_hours_local: Vec<u8>,
-    pub peak_multiplier: f64,
-}
-
-/// Weight for a timezone used in realistic traffic shaping.
+/// Weight for a timezone used in actor population generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimezoneWeight {
     pub name: String,
@@ -150,24 +120,10 @@ pub struct CloudTrailSourceConfig {
     pub curated: bool,
     /// Optional custom event weights.
     pub custom_events: Option<Vec<EventWeight>>,
-    /// Total actor count to generate.
-    pub actor_count: Option<usize>,
-    /// Fraction of actors that are services.
-    pub service_ratio: Option<f64>,
-    /// Fraction of actors treated as "hot".
-    pub hot_actor_ratio: Option<f64>,
-    /// Share of events assigned to hot actors.
-    pub hot_actor_share: Option<f64>,
-    /// Explicit account IDs to sample from.
-    pub account_ids: Option<Vec<String>>,
-    /// Number of accounts to synthesize when `account_ids` is empty.
-    pub account_count: Option<usize>,
     /// Optional path to an actor population Parquet file.
     pub actor_population_path: Option<String>,
     /// Per-event error injection settings.
     pub error_rates: Option<Vec<EventErrorConfig>>,
-    /// Role distribution weights for human actors.
-    pub role_distribution: Option<Vec<RoleWeight>>,
     /// Allowed regions.
     pub regions: Option<Vec<String>>,
     /// Optional region weighting for selection.
@@ -202,4 +158,62 @@ pub struct RoleWeight {
 pub struct RegionWeight {
     pub name: String,
     pub weight: f64,
+}
+
+/// Actor population configuration (used for `seclog-cli actors`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PopulationConfig {
+    /// Optional RNG seed for deterministic output.
+    pub seed: Option<u64>,
+    /// Optional timezone weighting for actor activity windows.
+    pub timezone_distribution: Option<Vec<TimezoneWeight>>,
+    /// Actor population parameters.
+    pub population: PopulationActorsConfig,
+}
+
+impl PopulationConfig {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let contents = fs::read_to_string(path)?;
+        Ok(toml::from_str(&contents)?)
+    }
+}
+
+/// Actor population parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PopulationActorsConfig {
+    pub actor_count: Option<usize>,
+    pub service_ratio: Option<f64>,
+    pub hot_actor_ratio: Option<f64>,
+    pub hot_actor_multiplier: Option<f64>,
+    pub account_ids: Option<Vec<String>>,
+    pub account_count: Option<usize>,
+    pub role_distribution: Option<Vec<RoleWeight>>,
+    pub role_rates_per_hour: Option<Vec<RoleRate>>,
+    pub service_rate_per_hour: Option<f64>,
+    pub service_profiles: Option<Vec<ServiceProfileConfig>>,
+}
+
+/// Per-role event rate in events/hour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleRate {
+    pub name: String,
+    pub rate_per_hour: f64,
+}
+
+/// Service actor profile distribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceProfileConfig {
+    pub name: String,
+    pub weight: f64,
+    pub rate_per_hour: Option<f64>,
+    pub pattern: Option<ServicePatternConfig>,
+}
+
+/// Service activity pattern for scheduling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServicePatternConfig {
+    Constant,
+    Diurnal,
+    Bursty,
 }

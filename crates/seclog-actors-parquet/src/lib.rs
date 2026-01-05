@@ -2,16 +2,23 @@
 //!
 //! Stores `ActorSeed` data so sources can reuse a shared population.
 
-use arrow_array::builder::{BooleanBuilder, Int16Builder, Int8Builder, StringBuilder};
-use arrow_array::{Array, BooleanArray, Int16Array, Int8Array, RecordBatch, StringArray};
+use arrow_array::builder::{
+    BooleanBuilder, Float64Builder, Int16Builder, Int8Builder, StringBuilder,
+};
+use arrow_array::{
+    Array, BooleanArray, Float64Array, Int16Array, Int8Array, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
-use seclog_core::actors::{ActorKind, ActorPopulation, ActorRole, ActorSeed};
+use seclog_core::actors::{
+    ActorKind, ActorPopulation, ActorRole, ActorSeed, RoleRates, ServicePattern, ServiceProfile,
+};
 use serde_json::Value;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,6 +39,10 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
     let mut active_hours_builder = Int16Builder::new();
     let mut timezone_offset_builder = Int8Builder::new();
     let mut weekend_active_builder = BooleanBuilder::new();
+    let mut access_key_id_builder = StringBuilder::new();
+    let mut rate_per_hour_builder = Float64Builder::new();
+    let mut service_profile_builder = StringBuilder::new();
+    let mut service_pattern_builder = StringBuilder::new();
 
     for actor in &population.actors {
         kind_builder.append_value(kind_to_str(&actor.kind));
@@ -44,6 +55,7 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
         principal_id_builder.append_value(&actor.principal_id);
         arn_builder.append_value(&actor.arn);
         account_id_builder.append_value(&actor.account_id);
+        access_key_id_builder.append_value(&actor.access_key_id);
         if let Some(name) = &actor.user_name {
             user_name_builder.append_value(name);
         } else {
@@ -55,6 +67,17 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
         active_hours_builder.append_value(actor.active_hours as i16);
         timezone_offset_builder.append_value(actor.timezone_offset);
         weekend_active_builder.append_value(actor.weekend_active);
+        rate_per_hour_builder.append_value(actor.rate_per_hour);
+        if let Some(profile) = &actor.service_profile {
+            service_profile_builder.append_value(service_profile_to_str(profile));
+        } else {
+            service_profile_builder.append_null();
+        }
+        if let Some(pattern) = &actor.service_pattern {
+            service_pattern_builder.append_value(service_pattern_to_str(pattern));
+        } else {
+            service_pattern_builder.append_null();
+        }
     }
 
     let batch = RecordBatch::try_new(
@@ -73,6 +96,10 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
             Arc::new(active_hours_builder.finish()),
             Arc::new(timezone_offset_builder.finish()),
             Arc::new(weekend_active_builder.finish()),
+            Arc::new(access_key_id_builder.finish()),
+            Arc::new(rate_per_hour_builder.finish()),
+            Arc::new(service_profile_builder.finish()),
+            Arc::new(service_pattern_builder.finish()),
         ],
     )
     .map_err(map_arrow_err)?;
@@ -115,6 +142,10 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
     let active_hours = column_as_i16(batch, 10)?;
     let timezone_offset = column_as_i8(batch, 11)?;
     let weekend_active = column_as_bool(batch, 12)?;
+    let access_key_id = column_as_string_optional_fallback(batch, 13)?;
+    let rate_per_hour = column_as_f64_optional_fallback(batch, 14)?;
+    let service_profile = column_as_string_optional_fallback(batch, 15)?;
+    let service_pattern = column_as_string_optional_fallback(batch, 16)?;
 
     let mut actors = Vec::with_capacity(batch.num_rows());
     for idx in 0..batch.num_rows() {
@@ -124,6 +155,30 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
             None => None,
         };
 
+        let parsed_profile = service_profile
+            .get(idx)
+            .and_then(|value| value.as_deref())
+            .and_then(parse_service_profile);
+        let parsed_pattern = service_pattern
+            .get(idx)
+            .and_then(|value| value.as_deref())
+            .and_then(parse_service_pattern);
+        let resolved_profile = match kind {
+            ActorKind::Service => parsed_profile.or(Some(ServiceProfile::Generic)),
+            ActorKind::Human => None,
+        };
+        let resolved_pattern = match kind {
+            ActorKind::Service => parsed_pattern.or(Some(ServicePattern::Constant)),
+            ActorKind::Human => None,
+        };
+        let mut resolved_rate = rate_per_hour
+            .get(idx)
+            .and_then(|value| *value)
+            .unwrap_or_else(|| fallback_rate_per_hour(&kind, role.as_ref()));
+        if !resolved_rate.is_finite() || resolved_rate <= 0.0 {
+            resolved_rate = fallback_rate_per_hour(&kind, role.as_ref());
+        }
+
         let seed = ActorSeed {
             kind,
             role,
@@ -131,6 +186,13 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
             principal_id: principal_id[idx].clone(),
             arn: arn[idx].clone(),
             account_id: account_id[idx].clone(),
+            access_key_id: access_key_id
+                .get(idx)
+                .and_then(|value| value.clone())
+                .unwrap_or_else(|| fallback_access_key_id(&identity_type[idx], &principal_id[idx])),
+            rate_per_hour: resolved_rate,
+            service_profile: resolved_profile,
+            service_pattern: resolved_pattern,
             user_name: user_name.get(idx).cloned().flatten(),
             user_agents: parse_string_list(&user_agent[idx], "user_agent")?,
             source_ips: parse_string_list(&source_ip[idx], "source_ip")?,
@@ -160,6 +222,10 @@ fn build_schema() -> SchemaRef {
         Field::new("active_hours", DataType::Int16, false),
         Field::new("timezone_offset", DataType::Int8, false),
         Field::new("weekend_active", DataType::Boolean, false),
+        Field::new("access_key_id", DataType::Utf8, false),
+        Field::new("rate_per_hour", DataType::Float64, false),
+        Field::new("service_profile", DataType::Utf8, true),
+        Field::new("service_pattern", DataType::Utf8, true),
     ];
 
     Arc::new(Schema::new(fields))
@@ -199,6 +265,44 @@ fn parse_role(value: &str) -> io::Result<ActorRole> {
     }
 }
 
+fn service_profile_to_str(profile: &ServiceProfile) -> &'static str {
+    match profile {
+        ServiceProfile::Generic => "generic",
+        ServiceProfile::Ec2Reaper => "ec2_reaper",
+        ServiceProfile::DataLakeBot => "datalake_bot",
+        ServiceProfile::LogsShipper => "logs_shipper",
+        ServiceProfile::MetricsCollector => "metrics_collector",
+    }
+}
+
+fn service_pattern_to_str(pattern: &ServicePattern) -> &'static str {
+    match pattern {
+        ServicePattern::Constant => "constant",
+        ServicePattern::Diurnal => "diurnal",
+        ServicePattern::Bursty => "bursty",
+    }
+}
+
+fn parse_service_profile(value: &str) -> Option<ServiceProfile> {
+    match value.trim().to_lowercase().replace('-', "_").as_str() {
+        "generic" => Some(ServiceProfile::Generic),
+        "ec2_reaper" => Some(ServiceProfile::Ec2Reaper),
+        "datalake_bot" => Some(ServiceProfile::DataLakeBot),
+        "logs_shipper" => Some(ServiceProfile::LogsShipper),
+        "metrics_collector" => Some(ServiceProfile::MetricsCollector),
+        _ => None,
+    }
+}
+
+fn parse_service_pattern(value: &str) -> Option<ServicePattern> {
+    match value.trim().to_lowercase().as_str() {
+        "constant" => Some(ServicePattern::Constant),
+        "diurnal" => Some(ServicePattern::Diurnal),
+        "bursty" => Some(ServicePattern::Bursty),
+        _ => None,
+    }
+}
+
 fn encode_string_list(values: &[String]) -> String {
     serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
 }
@@ -230,6 +334,61 @@ fn parse_string_list(value: &str, field: &str) -> io::Result<Vec<String>> {
     }
 
     Ok(vec![trimmed.to_string()])
+}
+
+fn column_as_string_optional_fallback(
+    batch: &RecordBatch,
+    index: usize,
+) -> io::Result<Vec<Option<String>>> {
+    if index >= batch.num_columns() {
+        return Ok(vec![None; batch.num_rows()]);
+    }
+    column_as_string_optional(batch, index)
+}
+
+fn fallback_access_key_id(identity_type: &str, seed: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    let prefix = if identity_type == "AssumedRole" { "ASIA" } else { "AKIA" };
+    format!("{prefix}{:016X}", hasher.finish())
+}
+
+fn fallback_rate_per_hour(kind: &ActorKind, role: Option<&ActorRole>) -> f64 {
+    match kind {
+        ActorKind::Human => {
+            let rates = RoleRates::default();
+            let role = role.unwrap_or(&ActorRole::Developer);
+            rates.for_role(role)
+        }
+        ActorKind::Service => 6.0,
+    }
+}
+
+fn column_as_f64_optional_fallback(
+    batch: &RecordBatch,
+    index: usize,
+) -> io::Result<Vec<Option<f64>>> {
+    if index >= batch.num_columns() {
+        return Ok(vec![None; batch.num_rows()]);
+    }
+    column_as_f64_optional(batch, index)
+}
+
+fn column_as_f64_optional(batch: &RecordBatch, index: usize) -> io::Result<Vec<Option<f64>>> {
+    let array = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| invalid_data(format!("column {index} is not Float64")))?;
+    let mut values = Vec::with_capacity(array.len());
+    for idx in 0..array.len() {
+        if array.is_null(idx) {
+            values.push(None);
+        } else {
+            values.push(Some(array.value(idx)));
+        }
+    }
+    Ok(values)
 }
 
 fn column_as_string_required(batch: &RecordBatch, index: usize) -> io::Result<Vec<String>> {
