@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+/// Error while configuring a rate controller.
 #[derive(Debug)]
 pub enum RateError {
     MissingRate,
@@ -19,6 +20,7 @@ impl std::fmt::Display for RateError {
 
 impl std::error::Error for RateError {}
 
+/// Computes how many events should be emitted for a time slice.
 pub struct RateController {
     events_per_second: Option<f64>,
     bytes_per_second: Option<f64>,
@@ -27,6 +29,7 @@ pub struct RateController {
 }
 
 impl RateController {
+    /// Creates a new controller from events/sec or bytes/sec targets.
     pub fn new(
         events_per_second: Option<f64>,
         bytes_per_second: Option<u64>,
@@ -66,6 +69,7 @@ impl RateController {
         })
     }
 
+    /// Returns the event quota for the elapsed time window.
     pub fn quota(
         &mut self,
         elapsed: Duration,

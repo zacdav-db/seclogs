@@ -3,12 +3,14 @@ use rand::distributions::{Distribution, WeightedIndex};
 use rand::Rng;
 use std::collections::HashSet;
 
+/// High-level actor type used for session behavior and weighting.
 #[derive(Debug, Clone)]
 pub enum ActorKind {
     Human,
     Service,
 }
 
+/// Role label applied to human actors.
 #[derive(Debug, Clone)]
 pub enum ActorRole {
     Admin,
@@ -17,6 +19,7 @@ pub enum ActorRole {
     Auditor,
 }
 
+/// Stable actor attributes used to create runtime profiles.
 #[derive(Debug, Clone)]
 pub struct ActorSeed {
     pub kind: ActorKind,
@@ -34,18 +37,27 @@ pub struct ActorSeed {
     pub weekend_active: bool,
 }
 
+/// Mutable runtime state for an actor across event generation.
 #[derive(Debug, Clone)]
 pub struct ActorProfile {
+    /// Stable actor attributes.
     pub seed: ActorSeed,
+    /// Previous event name for sequence-aware selection.
     pub last_event: Option<String>,
+    /// Remaining events in the current session.
     pub session_remaining: u8,
+    /// Session end time in UTC.
     pub session_end_at: Option<DateTime<Utc>>,
+    /// Next session start time in UTC.
     pub next_session_at: Option<DateTime<Utc>>,
+    /// Sticky user agent for the current session.
     pub session_user_agent: Option<String>,
+    /// Sticky source IP for the current session.
     pub session_source_ip: Option<String>,
 }
 
 impl ActorProfile {
+    /// Builds a fresh profile from a seed with no active session.
     pub fn from_seed(seed: ActorSeed) -> Self {
         Self {
             seed,
@@ -58,6 +70,9 @@ impl ActorProfile {
         }
     }
 
+    /// Returns whether the actor can emit events at the given time.
+    ///
+    /// This updates session boundaries and cooldowns when a session ends.
     pub fn is_available(&mut self, now: DateTime<Utc>, rng: &mut impl Rng) -> bool {
         if let Some(end) = self.session_end_at {
             if now >= end {
@@ -84,6 +99,7 @@ impl ActorProfile {
         true
     }
 
+    /// Starts or resumes a session if needed and chooses session-level UA/IP.
     pub fn ensure_session(&mut self, now: DateTime<Utc>, rng: &mut impl Rng) {
         if let Some(next) = self.next_session_at {
             if now >= next {
@@ -104,6 +120,7 @@ impl ActorProfile {
         }
     }
 
+    /// Consumes one event in the current session.
     pub fn consume_session(&mut self, rng: &mut impl Rng) {
         if self.session_remaining > 0 {
             self.session_remaining -= 1;
@@ -113,6 +130,7 @@ impl ActorProfile {
         }
     }
 
+    /// Returns the session user agent, sampling a new one if needed.
     pub fn current_user_agent(&mut self, rng: &mut impl Rng) -> String {
         if self.session_user_agent.is_none() {
             self.session_user_agent = Some(self.pick_user_agent(rng));
@@ -122,6 +140,7 @@ impl ActorProfile {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    /// Returns the session source IP, sampling a new one if needed.
     pub fn current_source_ip(&mut self, rng: &mut impl Rng) -> String {
         if self.session_source_ip.is_none() {
             self.session_source_ip = Some(self.pick_source_ip(rng));
@@ -148,12 +167,14 @@ impl ActorProfile {
     }
 }
 
+/// Collection of actor seeds that can be reused across sources.
 #[derive(Debug, Clone)]
 pub struct ActorPopulation {
     pub actors: Vec<ActorSeed>,
 }
 
 impl ActorPopulation {
+    /// Generates a mixed population of human and service actors.
     pub fn generate(
         rng: &mut impl Rng,
         total: usize,
@@ -178,6 +199,7 @@ impl ActorPopulation {
         Self { actors }
     }
 
+    /// Creates runtime profiles with session state for each actor.
     pub fn profiles(&self) -> Vec<ActorProfile> {
         self.actors
             .iter()

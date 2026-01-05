@@ -1,3 +1,7 @@
+//! Parquet sink for seclog events.
+//!
+//! Buffers Arrow batches per account/region and rotates by size or age.
+
 use arrow_array::builder::{BooleanBuilder, Float64Builder, StringBuilder, StructBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
@@ -19,6 +23,7 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_BATCH_SIZE: usize = 1024;
 
+/// Parquet writer that buffers events per account/region.
 pub struct ParquetWriter {
     dir: PathBuf,
     target_size_bytes: u64,
@@ -29,6 +34,7 @@ pub struct ParquetWriter {
 }
 
 impl ParquetWriter {
+    /// Creates a Parquet writer with the default batch size.
     pub fn new(
         dir: impl Into<PathBuf>,
         target_size_mb: u64,
@@ -37,6 +43,7 @@ impl ParquetWriter {
         Self::with_batch_size(dir, target_size_mb, max_age_seconds, DEFAULT_BATCH_SIZE)
     }
 
+    /// Creates a Parquet writer with a custom batch size.
     pub fn with_batch_size(
         dir: impl Into<PathBuf>,
         target_size_mb: u64,

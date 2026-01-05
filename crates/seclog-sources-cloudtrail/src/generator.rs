@@ -13,6 +13,7 @@ use seclog_core::traits::EventSource;
 use seclog_actors_parquet as actor_store;
 use std::collections::{HashMap, HashSet};
 
+/// CloudTrail event source with weighted event selection and actor sessions.
 pub struct CloudTrailGenerator {
     selector: EventSelector,
     rng: StdRng,
@@ -25,6 +26,7 @@ pub struct CloudTrailGenerator {
 }
 
 impl CloudTrailGenerator {
+    /// Builds a generator from the CloudTrail config and optional seed.
     pub fn from_config(
         config: &CloudTrailSourceConfig,
         seed: Option<u64>,
@@ -34,6 +36,7 @@ impl CloudTrailGenerator {
         Self::new(selector, events, config, seed)
     }
 
+    /// Builds a generator from a prepared selector and event list.
     pub fn new(
         selector: EventSelector,
         events: Vec<WeightedEvent>,
@@ -157,6 +160,7 @@ fn load_actor_profiles(
     Ok(population.profiles())
 }
 
+/// Generates a reusable actor population based on CloudTrail config.
 pub fn generate_actor_population(
     config: &CloudTrailSourceConfig,
     seed: Option<u64>,

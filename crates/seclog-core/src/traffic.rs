@@ -3,6 +3,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
 use std::str::FromStr;
 
+/// Errors while building a traffic model.
 #[derive(Debug)]
 pub enum TrafficError {
     EmptyTimezones,
@@ -24,6 +25,7 @@ impl std::fmt::Display for TrafficError {
 
 impl std::error::Error for TrafficError {}
 
+/// Computes traffic multipliers based on time and timezone mix.
 pub struct TrafficModel {
     mode: TrafficMode,
     curve: Option<CurveConfig>,
@@ -31,6 +33,7 @@ pub struct TrafficModel {
 }
 
 impl TrafficModel {
+    /// Creates a traffic model from config.
     pub fn from_config(config: &TrafficConfig) -> Result<Self, TrafficError> {
         let timezones = match &config.timezone_distribution {
             Some(list) if list.is_empty() => return Err(TrafficError::EmptyTimezones),
@@ -60,6 +63,7 @@ impl TrafficModel {
         })
     }
 
+    /// Returns a multiplier to apply to the base rate at a given time.
     pub fn multiplier(&self, time_utc: DateTime<Utc>) -> f64 {
         match self.mode {
             TrafficMode::Constant => 1.0,

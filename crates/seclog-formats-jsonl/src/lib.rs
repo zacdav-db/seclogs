@@ -1,3 +1,7 @@
+//! JSONL sink for seclog events.
+//!
+//! Writes CloudTrail-style files per account/region and rotates by size or age.
+
 use chrono::Utc;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
@@ -9,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// JSONL writer that buffers events per account/region.
 pub struct JsonlWriter {
     dir: PathBuf,
     target_size_bytes: u64,
@@ -17,6 +22,7 @@ pub struct JsonlWriter {
 }
 
 impl JsonlWriter {
+    /// Creates a JSONL writer with size-based rotation and optional max age.
     pub fn new(
         dir: impl Into<PathBuf>,
         target_size_mb: u64,
@@ -33,7 +39,6 @@ impl JsonlWriter {
             files: HashMap::new(),
         })
     }
-
 }
 
 impl EventWriter for JsonlWriter {

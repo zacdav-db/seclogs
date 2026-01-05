@@ -1,3 +1,7 @@
+//! Parquet persistence for actor populations.
+//!
+//! Stores `ActorSeed` data so sources can reuse a shared population.
+
 use arrow_array::builder::{BooleanBuilder, Int16Builder, Int8Builder, StringBuilder};
 use arrow_array::{Array, BooleanArray, Int16Array, Int8Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -12,6 +16,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Writes an actor population to a Parquet file.
 pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) -> io::Result<()> {
     let schema = build_schema();
     let mut kind_builder = StringBuilder::new();
@@ -81,6 +86,7 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
     Ok(())
 }
 
+/// Reads an actor population from a Parquet file.
 pub fn read_population(path: impl AsRef<Path>) -> io::Result<ActorPopulation> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(map_parquet_err)?;

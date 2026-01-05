@@ -1,3 +1,7 @@
+//! CloudTrail-style event generator.
+//!
+//! Provides catalog-driven event selection and a `CloudTrailGenerator` source.
+
 pub mod catalog;
 pub mod generator;
 pub mod model;
