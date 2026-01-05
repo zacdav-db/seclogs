@@ -30,14 +30,16 @@ jobs:
         run: |
           if [ ! -f target/doc/index.html ]; then
             {
-              echo "<!doctype html><meta charset=\"utf-8\"><title>Seclog Docs</title><h1>Seclog Docs</h1><ul>";
+              cat <<'HTML'
+<!doctype html><meta charset="utf-8"><title>Seclog Docs</title><h1>Seclog Docs</h1><ul>
+HTML
               for dir in target/doc/seclog_*; do
-                if [ -d \"$dir\" ]; then
-                  name=$(basename \"$dir\");
-                  echo \"<li><a href=\\\"$name/index.html\\\">$name</a></li>\";
+                if [ -d "$dir" ]; then
+                  name=$(basename "$dir");
+                  echo "<li><a href=\"$name/index.html\">$name</a></li>";
                 fi;
               done;
-              echo \"</ul>\";
+              echo "</ul>";
             } > target/doc/index.html
           fi
           touch target/doc/.nojekyll
