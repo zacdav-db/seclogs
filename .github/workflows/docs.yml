@@ -29,18 +29,14 @@ jobs:
       - name: Add root index
         run: |
           if [ ! -f target/doc/index.html ]; then
-            {
-              cat <<'HTML'
-<!doctype html><meta charset="utf-8"><title>Seclog Docs</title><h1>Seclog Docs</h1><ul>
-HTML
-              for dir in target/doc/seclog_*; do
-                if [ -d "$dir" ]; then
-                  name=$(basename "$dir");
-                  echo "<li><a href=\"$name/index.html\">$name</a></li>";
-                fi;
-              done;
-              echo "</ul>";
-            } > target/doc/index.html
+            printf '%s\n' '<!doctype html><meta charset="utf-8"><title>Seclog Docs</title><h1>Seclog Docs</h1><ul>' > target/doc/index.html
+            for dir in target/doc/seclog_*; do
+              if [ -d "$dir" ]; then
+                name=$(basename "$dir");
+                printf '%s\n' "<li><a href=\"$name/index.html\">$name</a></li>" >> target/doc/index.html
+              fi;
+            done;
+            printf '%s\n' '</ul>' >> target/doc/index.html
           fi
           touch target/doc/.nojekyll
       - name: Upload artifact
