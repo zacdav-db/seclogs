@@ -1,0 +1,77 @@
+seed = 42
+
+[traffic]
+mode = "realistic"
+events_per_second = 50000.0
+
+[traffic.curve]
+type = "weekday_peak"
+weekday_multiplier = 1.0
+weekend_multiplier = 0.6
+peak_hours_local = [9, 10, 11, 12, 13, 14, 15, 16]
+peak_multiplier = 1.4
+
+[[traffic.timezone_distribution]]
+name = "America/Los_Angeles"
+weight = 0.4
+
+[[traffic.timezone_distribution]]
+name = "Europe/London"
+weight = 0.35
+
+[[traffic.timezone_distribution]]
+name = "Asia/Singapore"
+weight = 0.25
+
+[output]
+dir = "./out"
+
+[output.rotation]
+target_size_mb = 50
+flush_interval_ms = 1000
+
+[[output.formats]]
+type = "parquet"
+compression = "zstd"
+
+[[sources]]
+type = "cloudtrail"
+curated = true
+actor_count = 800
+service_ratio = 0.25
+
+[[sources.error_rates]]
+name = "ConsoleLogin"
+rate = 0.06
+code = "SigninFailure"
+message = "Failed authentication"
+
+[[sources.error_rates]]
+name = "PutObject"
+rate = 0.03
+code = "AccessDenied"
+message = "Access denied"
+
+[[sources.role_distribution]]
+name = "admin"
+weight = 0.15
+
+[[sources.role_distribution]]
+name = "developer"
+weight = 0.55
+
+[[sources.role_distribution]]
+name = "readonly"
+weight = 0.25
+
+[[sources.role_distribution]]
+name = "auditor"
+weight = 0.05
+
+[[sources.custom_events]]
+name = "ConsoleLogin"
+weight = 1.0
+
+[[sources.custom_events]]
+name = "AssumeRole"
+weight = 0.8

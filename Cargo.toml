@@ -1,0 +1,10 @@
+[workspace]
+members = [
+  "crates/seclog-core",
+  "crates/seclog-cli",
+  "crates/seclog-sources-cloudtrail",
+  "crates/seclog-formats-jsonl",
+  "crates/seclog-formats-parquet",
+]
+resolver = "2"
+
