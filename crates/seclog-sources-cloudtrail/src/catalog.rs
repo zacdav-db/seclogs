@@ -14,6 +14,7 @@ pub enum CatalogError {
     EmptyEventSet,
     InvalidWeight { name: String, weight: f64 },
     WeightedIndex(rand::distributions::WeightedError),
+    Population(String),
 }
 
 impl std::fmt::Display for CatalogError {
@@ -24,6 +25,7 @@ impl std::fmt::Display for CatalogError {
                 write!(f, "invalid weight for {name}: {weight}")
             }
             CatalogError::WeightedIndex(err) => write!(f, "invalid event weights: {err}"),
+            CatalogError::Population(err) => write!(f, "actor population error: {err}"),
         }
     }
 }
@@ -143,8 +145,15 @@ mod tests {
             custom_events: None,
             actor_count: None,
             service_ratio: None,
+            hot_actor_ratio: None,
+            hot_actor_share: None,
+            account_ids: None,
+            account_count: None,
+            actor_population_path: None,
             error_rates: None,
             role_distribution: None,
+            regions: None,
+            region_distribution: None,
         };
 
         let resolved = resolve_event_weights(&config).expect("curated events");
@@ -161,8 +170,15 @@ mod tests {
             }]),
             actor_count: None,
             service_ratio: None,
+            hot_actor_ratio: None,
+            hot_actor_share: None,
+            account_ids: None,
+            account_count: None,
+            actor_population_path: None,
             error_rates: None,
             role_distribution: None,
+            regions: None,
+            region_distribution: None,
         };
 
         let resolved = resolve_event_weights(&config).expect("resolved");
@@ -183,8 +199,15 @@ mod tests {
             }]),
             actor_count: None,
             service_ratio: None,
+            hot_actor_ratio: None,
+            hot_actor_share: None,
+            account_ids: None,
+            account_count: None,
+            actor_population_path: None,
             error_rates: None,
             role_distribution: None,
+            regions: None,
+            region_distribution: None,
         };
 
         let resolved = resolve_event_weights(&config).expect("resolved");

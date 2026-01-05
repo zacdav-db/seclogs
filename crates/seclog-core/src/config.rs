@@ -36,7 +36,7 @@ pub struct Config {
     pub seed: Option<u64>,
     pub traffic: TrafficConfig,
     pub output: OutputConfig,
-    pub sources: Vec<SourceConfig>,
+    pub source: SourceConfig,
 }
 
 impl Config {
@@ -86,13 +86,14 @@ pub struct TimezoneWeight {
 pub struct OutputConfig {
     pub dir: String,
     pub rotation: RotationConfig,
-    pub formats: Vec<FormatConfig>,
+    pub format: FormatConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotationConfig {
     pub target_size_mb: u64,
     pub flush_interval_ms: Option<u64>,
+    pub max_age_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,8 +121,15 @@ pub struct CloudTrailSourceConfig {
     pub custom_events: Option<Vec<EventWeight>>,
     pub actor_count: Option<usize>,
     pub service_ratio: Option<f64>,
+    pub hot_actor_ratio: Option<f64>,
+    pub hot_actor_share: Option<f64>,
+    pub account_ids: Option<Vec<String>>,
+    pub account_count: Option<usize>,
+    pub actor_population_path: Option<String>,
     pub error_rates: Option<Vec<EventErrorConfig>>,
     pub role_distribution: Option<Vec<RoleWeight>>,
+    pub regions: Option<Vec<String>>,
+    pub region_distribution: Option<Vec<RegionWeight>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +148,12 @@ pub struct EventErrorConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleWeight {
+    pub name: String,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegionWeight {
     pub name: String,
     pub weight: f64,
 }

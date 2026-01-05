@@ -4,8 +4,11 @@ CREATE OR REPLACE VIEW events AS
 SELECT
   envelope.actor.id AS actor_id,
   envelope.event_type AS event_name,
-  try_cast(envelope.timestamp AS TIMESTAMP) AS ts_parsed
-FROM read_parquet('out-test-5/events-*.parquet');
+  coalesce(
+    try_cast(envelope.timestamp AS TIMESTAMP),
+    try_cast(cloudtrail.event_time AS TIMESTAMP)
+  ) AS ts_parsed
+FROM read_parquet('out-test/*.parquet');
 
 -- Allowed transitions (extend as needed).
 WITH allowed AS (
@@ -40,6 +43,7 @@ ordered AS (
       ORDER BY ts_parsed
     ) AS prev_event
   FROM events
+  WHERE ts_parsed IS NOT NULL
 ),
 checked AS (
   SELECT
@@ -111,6 +115,7 @@ WITH checked AS (
         ORDER BY ts_parsed
       ) AS prev_event
     FROM events
+    WHERE ts_parsed IS NOT NULL
   ) ordered
 )
 SELECT
@@ -127,6 +132,7 @@ LIMIT 20;
 WITH picked AS (
   SELECT actor_id
   FROM events
+  WHERE ts_parsed IS NOT NULL
   GROUP BY 1
   ORDER BY random()
   LIMIT 1
@@ -135,6 +141,15 @@ SELECT
   actor_id,
   event_name,
   ts_parsed,
+  lag(ts_parsed) OVER (
+    PARTITION BY actor_id
+    ORDER BY ts_parsed
+  ) AS prev_ts,
+  date_diff(
+    'minute',
+    lag(ts_parsed) OVER (PARTITION BY actor_id ORDER BY ts_parsed),
+    ts_parsed
+  ) AS gap_minutes,
   lag(event_name) OVER (
     PARTITION BY actor_id
     ORDER BY ts_parsed

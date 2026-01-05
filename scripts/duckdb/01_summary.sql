@@ -3,17 +3,23 @@
 CREATE OR REPLACE VIEW events AS
 SELECT
   envelope.actor.id AS actor_id,
-  envelope.actor.name AS actor_name,
+  coalesce(envelope.actor.name, cloudtrail.user_identity.user_name) AS actor_name,
+  envelope.actor.kind AS actor_kind,
   envelope.event_type AS event_name,
-  envelope.timestamp AS ts,
-  try_cast(envelope.timestamp AS TIMESTAMP) AS ts_parsed,
+  envelope.source AS source,
+  envelope.timestamp AS ts_raw,
+  coalesce(
+    try_cast(envelope.timestamp AS TIMESTAMP),
+    try_cast(cloudtrail.event_time AS TIMESTAMP)
+  ) AS ts_parsed,
   envelope.outcome AS outcome,
-  envelope.user_agent AS user_agent,
+  coalesce(envelope.user_agent, cloudtrail.user_agent) AS user_agent,
   cloudtrail.event_source AS event_source,
   cloudtrail.aws_region AS aws_region,
+  cloudtrail.recipient_account_id AS account_id,
   cloudtrail.error_code AS error_code,
   cloudtrail.error_message AS error_message
-FROM read_parquet('out-test-5/events-*.parquet');
+FROM read_parquet('out-test/*.parquet');
 
 SELECT count(*) AS total_events FROM events;
 

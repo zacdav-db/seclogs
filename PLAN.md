@@ -15,6 +15,7 @@
 - Language: Rust.
 - Sources (v1): CloudTrail curated event catalog with custom override list.
 - Formats (v1): JSONL and Parquet.
+- Config (v1): single source and single output format per run.
 - Rotation: size-based with configurable target size.
 - Volume control:
   - Constant flow: fixed events/sec or bytes/sec.
@@ -81,6 +82,12 @@
 - Schema validation for JSONL and Parquet.
 - Statistical sanity checks (event mix ratios, volume curves).
 - Benchmarks for throughput (events/sec and bytes/sec).
+
+## Backlog Notes
+- Allow marking actors as malicious and emit behavior aligned to malicious sessions.
+- Allow flagging specific events as suspicious (not necessarily malicious) with controllable rates.
+- Generate a shared actor population with stable characteristics that can be reused across sources.
+- Incorporate detailed CloudTrail log examples from AWS docs for higher fidelity.
 
 ## Milestones
 1) Project scaffolding + config + CLI skeleton.

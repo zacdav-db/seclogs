@@ -12,6 +12,7 @@ pub struct ActorContext {
     pub user_name: Option<String>,
     pub user_agent: String,
     pub source_ip: String,
+    pub region: String,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +48,7 @@ pub fn build_cloudtrail_event(
         return Err(TemplateError::EmptyEventName);
     }
 
-    let base = BaseFields::new(actor, rng, event_time);
+    let base = BaseFields::new(actor, event_time);
     let event = match event_name {
         "ConsoleLogin" => console_login(base, rng),
         "AssumeRole" => assume_role(base, rng),
@@ -71,7 +72,7 @@ struct BaseFields {
 }
 
 impl BaseFields {
-    fn new(actor: &ActorContext, rng: &mut impl Rng, event_time: &str) -> Self {
+    fn new(actor: &ActorContext, event_time: &str) -> Self {
         let account_id = actor.account_id.clone();
         let user_name = actor.user_name.clone();
         let user_identity = UserIdentity {
@@ -84,7 +85,7 @@ impl BaseFields {
 
         Self {
             event_time: event_time.to_string(),
-            aws_region: random_region(rng),
+            aws_region: actor.region.clone(),
             source_ip_address: actor.source_ip.clone(),
             user_agent: actor.user_agent.clone(),
             account_id,
@@ -279,11 +280,6 @@ fn generic_event(base: BaseFields, rng: &mut impl Rng, event_name: &str) -> Clou
     }
 }
 
-fn random_region(rng: &mut impl Rng) -> String {
-    let regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"];
-    regions[rng.gen_range(0..regions.len())].to_string()
-}
-
 fn random_event_id(rng: &mut impl Rng) -> String {
     random_alpha(rng, 24)
 }
@@ -380,6 +376,7 @@ mod tests {
             user_name: Some("test".to_string()),
             user_agent: "aws-cli/2.15.0".to_string(),
             source_ip: "10.0.0.1".to_string(),
+            region: "us-east-1".to_string(),
         };
         let event = build_cloudtrail_event(
             "ConsoleLogin",

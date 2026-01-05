@@ -1,0 +1,306 @@
+use arrow_array::builder::{BooleanBuilder, Int16Builder, Int8Builder, StringBuilder};
+use arrow_array::{Array, BooleanArray, Int16Array, Int8Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::errors::ParquetError;
+use parquet::file::properties::WriterProperties;
+use seclog_core::actors::{ActorKind, ActorPopulation, ActorRole, ActorSeed};
+use serde_json::Value;
+use std::fs::File;
+use std::io;
+use std::path::Path;
+use std::sync::Arc;
+
+pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) -> io::Result<()> {
+    let schema = build_schema();
+    let mut kind_builder = StringBuilder::new();
+    let mut role_builder = StringBuilder::new();
+    let mut identity_type_builder = StringBuilder::new();
+    let mut principal_id_builder = StringBuilder::new();
+    let mut arn_builder = StringBuilder::new();
+    let mut account_id_builder = StringBuilder::new();
+    let mut user_name_builder = StringBuilder::new();
+    let mut user_agent_builder = StringBuilder::new();
+    let mut source_ip_builder = StringBuilder::new();
+    let mut active_start_builder = Int16Builder::new();
+    let mut active_hours_builder = Int16Builder::new();
+    let mut timezone_offset_builder = Int8Builder::new();
+    let mut weekend_active_builder = BooleanBuilder::new();
+
+    for actor in &population.actors {
+        kind_builder.append_value(kind_to_str(&actor.kind));
+        if let Some(role) = &actor.role {
+            role_builder.append_value(role_to_str(role));
+        } else {
+            role_builder.append_null();
+        }
+        identity_type_builder.append_value(&actor.identity_type);
+        principal_id_builder.append_value(&actor.principal_id);
+        arn_builder.append_value(&actor.arn);
+        account_id_builder.append_value(&actor.account_id);
+        if let Some(name) = &actor.user_name {
+            user_name_builder.append_value(name);
+        } else {
+            user_name_builder.append_null();
+        }
+        user_agent_builder.append_value(encode_string_list(&actor.user_agents));
+        source_ip_builder.append_value(encode_string_list(&actor.source_ips));
+        active_start_builder.append_value(actor.active_start_hour as i16);
+        active_hours_builder.append_value(actor.active_hours as i16);
+        timezone_offset_builder.append_value(actor.timezone_offset);
+        weekend_active_builder.append_value(actor.weekend_active);
+    }
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(kind_builder.finish()),
+            Arc::new(role_builder.finish()),
+            Arc::new(identity_type_builder.finish()),
+            Arc::new(principal_id_builder.finish()),
+            Arc::new(arn_builder.finish()),
+            Arc::new(account_id_builder.finish()),
+            Arc::new(user_name_builder.finish()),
+            Arc::new(user_agent_builder.finish()),
+            Arc::new(source_ip_builder.finish()),
+            Arc::new(active_start_builder.finish()),
+            Arc::new(active_hours_builder.finish()),
+            Arc::new(timezone_offset_builder.finish()),
+            Arc::new(weekend_active_builder.finish()),
+        ],
+    )
+    .map_err(map_arrow_err)?;
+
+    let file = File::create(path)?;
+    let props = WriterProperties::builder().build();
+    let mut writer =
+        ArrowWriter::try_new(file, schema, Some(props)).map_err(map_parquet_err)?;
+    writer.write(&batch).map_err(map_parquet_err)?;
+    writer.close().map_err(map_parquet_err)?;
+    Ok(())
+}
+
+pub fn read_population(path: impl AsRef<Path>) -> io::Result<ActorPopulation> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(map_parquet_err)?;
+    let mut reader = builder.build().map_err(map_parquet_err)?;
+    let mut actors = Vec::new();
+
+    while let Some(batch) = reader.next() {
+        let batch = batch.map_err(map_arrow_err)?;
+        actors.extend(read_batch(&batch)?);
+    }
+
+    Ok(ActorPopulation { actors })
+}
+
+fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
+    let kind = column_as_string_required(batch, 0)?;
+    let role = column_as_string_optional(batch, 1)?;
+    let identity_type = column_as_string_required(batch, 2)?;
+    let principal_id = column_as_string_required(batch, 3)?;
+    let arn = column_as_string_required(batch, 4)?;
+    let account_id = column_as_string_required(batch, 5)?;
+    let user_name = column_as_string_optional(batch, 6)?;
+    let user_agent = column_as_string_required(batch, 7)?;
+    let source_ip = column_as_string_required(batch, 8)?;
+    let active_start = column_as_i16(batch, 9)?;
+    let active_hours = column_as_i16(batch, 10)?;
+    let timezone_offset = column_as_i8(batch, 11)?;
+    let weekend_active = column_as_bool(batch, 12)?;
+
+    let mut actors = Vec::with_capacity(batch.num_rows());
+    for idx in 0..batch.num_rows() {
+        let kind = parse_kind(&kind[idx])?;
+        let role = match role.get(idx).and_then(|value| value.as_deref()) {
+            Some(value) => Some(parse_role(value)?),
+            None => None,
+        };
+
+        let seed = ActorSeed {
+            kind,
+            role,
+            identity_type: identity_type[idx].clone(),
+            principal_id: principal_id[idx].clone(),
+            arn: arn[idx].clone(),
+            account_id: account_id[idx].clone(),
+            user_name: user_name.get(idx).cloned().flatten(),
+            user_agents: parse_string_list(&user_agent[idx], "user_agent")?,
+            source_ips: parse_string_list(&source_ip[idx], "source_ip")?,
+            active_start_hour: i16_to_u8(active_start[idx], "active_start_hour")?,
+            active_hours: i16_to_u8(active_hours[idx], "active_hours")?,
+            timezone_offset: timezone_offset[idx],
+            weekend_active: weekend_active[idx],
+        };
+        actors.push(seed);
+    }
+
+    Ok(actors)
+}
+
+fn build_schema() -> SchemaRef {
+    let fields = vec![
+        Field::new("actor_kind", DataType::Utf8, false),
+        Field::new("role", DataType::Utf8, true),
+        Field::new("identity_type", DataType::Utf8, false),
+        Field::new("principal_id", DataType::Utf8, false),
+        Field::new("arn", DataType::Utf8, false),
+        Field::new("account_id", DataType::Utf8, false),
+        Field::new("user_name", DataType::Utf8, true),
+        Field::new("user_agent", DataType::Utf8, false),
+        Field::new("source_ip", DataType::Utf8, false),
+        Field::new("active_start_hour", DataType::Int16, false),
+        Field::new("active_hours", DataType::Int16, false),
+        Field::new("timezone_offset", DataType::Int8, false),
+        Field::new("weekend_active", DataType::Boolean, false),
+    ];
+
+    Arc::new(Schema::new(fields))
+}
+
+fn kind_to_str(kind: &ActorKind) -> &'static str {
+    match kind {
+        ActorKind::Human => "human",
+        ActorKind::Service => "service",
+    }
+}
+
+fn role_to_str(role: &ActorRole) -> &'static str {
+    match role {
+        ActorRole::Admin => "admin",
+        ActorRole::Developer => "developer",
+        ActorRole::ReadOnly => "readonly",
+        ActorRole::Auditor => "auditor",
+    }
+}
+
+fn parse_kind(value: &str) -> io::Result<ActorKind> {
+    match value {
+        "human" => Ok(ActorKind::Human),
+        "service" => Ok(ActorKind::Service),
+        other => Err(invalid_data(format!("unknown actor_kind: {other}"))),
+    }
+}
+
+fn parse_role(value: &str) -> io::Result<ActorRole> {
+    match value {
+        "admin" => Ok(ActorRole::Admin),
+        "developer" => Ok(ActorRole::Developer),
+        "readonly" | "read_only" => Ok(ActorRole::ReadOnly),
+        "auditor" => Ok(ActorRole::Auditor),
+        other => Err(invalid_data(format!("unknown role: {other}"))),
+    }
+}
+
+fn encode_string_list(values: &[String]) -> String {
+    serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn parse_string_list(value: &str, field: &str) -> io::Result<Vec<String>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_data(format!("missing {field}")));
+    }
+
+    if trimmed.starts_with('[') {
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(Value::Array(items)) => {
+                let mut values = Vec::new();
+                for item in items {
+                    if let Value::String(value) = item {
+                        values.push(value);
+                    }
+                }
+                if values.is_empty() {
+                    return Err(invalid_data(format!("empty {field} list")));
+                }
+                return Ok(values);
+            }
+            _ => {
+                return Ok(vec![trimmed.to_string()]);
+            }
+        }
+    }
+
+    Ok(vec![trimmed.to_string()])
+}
+
+fn column_as_string_required(batch: &RecordBatch, index: usize) -> io::Result<Vec<String>> {
+    let array = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| invalid_data(format!("column {index} is not Utf8")))?;
+    let mut values = Vec::with_capacity(array.len());
+    for idx in 0..array.len() {
+        if array.is_null(idx) {
+            return Err(invalid_data(format!("missing column {index} value")));
+        }
+        values.push(array.value(idx).to_string());
+    }
+    Ok(values)
+}
+
+fn column_as_string_optional(batch: &RecordBatch, index: usize) -> io::Result<Vec<Option<String>>> {
+    let array = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| invalid_data(format!("column {index} is not Utf8")))?;
+    let mut values = Vec::with_capacity(array.len());
+    for idx in 0..array.len() {
+        if array.is_null(idx) {
+            values.push(None);
+        } else {
+            values.push(Some(array.value(idx).to_string()));
+        }
+    }
+    Ok(values)
+}
+
+fn column_as_i16(batch: &RecordBatch, index: usize) -> io::Result<Vec<i16>> {
+    let array = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .ok_or_else(|| invalid_data(format!("column {index} is not Int16")))?;
+    Ok((0..array.len()).map(|idx| array.value(idx)).collect())
+}
+
+fn column_as_i8(batch: &RecordBatch, index: usize) -> io::Result<Vec<i8>> {
+    let array = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<Int8Array>()
+        .ok_or_else(|| invalid_data(format!("column {index} is not Int8")))?;
+    Ok((0..array.len()).map(|idx| array.value(idx)).collect())
+}
+
+fn column_as_bool(batch: &RecordBatch, index: usize) -> io::Result<Vec<bool>> {
+    let array = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| invalid_data(format!("column {index} is not Boolean")))?;
+    Ok((0..array.len()).map(|idx| array.value(idx)).collect())
+}
+
+fn i16_to_u8(value: i16, field: &str) -> io::Result<u8> {
+    if value < 0 || value > u8::MAX as i16 {
+        return Err(invalid_data(format!("invalid {field}: {value}")));
+    }
+    Ok(value as u8)
+}
+
+fn invalid_data(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn map_parquet_err(err: ParquetError) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, err)
+}
+
+fn map_arrow_err(err: arrow_schema::ArrowError) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, err)
+}

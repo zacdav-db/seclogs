@@ -2,22 +2,26 @@ use crate::catalog::{resolve_event_weights, CatalogError, EventSelector, Weighte
 use crate::templates::{
     build_cloudtrail_event, default_error_profile, ActorContext, ErrorProfile,
 };
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use seclog_core::config::{CloudTrailSourceConfig, EventErrorConfig, RoleWeight};
+use seclog_core::actors::{ActorKind, ActorPopulation, ActorProfile, ActorRole};
+use seclog_core::config::{CloudTrailSourceConfig, EventErrorConfig, RegionWeight, RoleWeight};
 use seclog_core::event::{Actor, Event, EventEnvelope, Outcome};
 use seclog_core::traits::EventSource;
+use seclog_actors_parquet as actor_store;
 use std::collections::{HashMap, HashSet};
 
 pub struct CloudTrailGenerator {
     selector: EventSelector,
     rng: StdRng,
     actors: Vec<ActorProfile>,
+    actor_selector: WeightedIndex<f64>,
     event_weights: HashMap<String, f64>,
     allowed_events: HashSet<String>,
     error_profiles: HashMap<String, ErrorProfile>,
+    region_selector: RegionSelector,
 }
 
 impl CloudTrailGenerator {
@@ -27,7 +31,7 @@ impl CloudTrailGenerator {
     ) -> Result<Self, CatalogError> {
         let events = resolve_event_weights(config)?;
         let selector = EventSelector::new(events.clone())?;
-        Ok(Self::new(selector, events, config, seed))
+        Self::new(selector, events, config, seed)
     }
 
     pub fn new(
@@ -35,8 +39,8 @@ impl CloudTrailGenerator {
         events: Vec<WeightedEvent>,
         config: &CloudTrailSourceConfig,
         seed: Option<u64>,
-    ) -> Self {
-        let rng = match seed {
+    ) -> Result<Self, CatalogError> {
+        let mut rng = match seed {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => StdRng::from_entropy(),
         };
@@ -50,27 +54,47 @@ impl CloudTrailGenerator {
         let actor_count = config.actor_count.unwrap_or(500).max(1);
         let service_ratio = config.service_ratio.unwrap_or(0.2).clamp(0.0, 1.0);
         let roles = build_role_weights(config.role_distribution.as_ref());
-        let actors = build_actor_pool(&rng, actor_count, service_ratio, roles);
+        let region_selector =
+            build_region_selector(config.regions.as_ref(), config.region_distribution.as_ref());
+        let account_ids = build_account_pool(config);
+        let mut actors = load_actor_profiles(
+            &mut rng,
+            config,
+            actor_count,
+            service_ratio,
+            &roles,
+            &account_ids,
+        )?;
+        shuffle_actors(&mut actors, &mut rng);
+        let actor_selector = build_actor_selector(
+            actors.len(),
+            config.hot_actor_ratio.unwrap_or(0.1),
+            config.hot_actor_share.unwrap_or(0.6),
+        );
         let error_profiles = build_error_profiles(config.error_rates.as_ref());
 
-        Self {
+        Ok(Self {
             selector,
             rng,
             actors,
+            actor_selector,
             event_weights,
             allowed_events,
             error_profiles,
-        }
+            region_selector,
+        })
     }
 }
 
 impl EventSource for CloudTrailGenerator {
     fn next_event(&mut self) -> Option<Event> {
-        let actor_index = self.next_actor_index();
-        let event_name = self.pick_event_for_actor(actor_index);
-        let event_time = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let now = Utc::now();
+        let actor_index = self.next_active_actor_index(now)?;
+        let event_name = self.pick_event_for_actor(actor_index, now);
+        let event_time = now.to_rfc3339_opts(SecondsFormat::Millis, true);
 
-        let actor_context = actor_context(&self.actors[actor_index]);
+        let region = self.region_selector.pick(&mut self.rng);
+        let actor_context = actor_context(&mut self.actors[actor_index], region, &mut self.rng);
         let error_profile = self
             .error_profiles
             .get(&event_name)
@@ -116,41 +140,73 @@ impl EventSource for CloudTrailGenerator {
     }
 }
 
-fn build_actor_pool(
-    rng: &StdRng,
+fn load_actor_profiles(
+    rng: &mut StdRng,
+    config: &CloudTrailSourceConfig,
     total: usize,
     service_ratio: f64,
-    role_weights: Vec<(ActorRole, f64)>,
-) -> Vec<ActorProfile> {
-    let mut rng = rng.clone();
-    let service_count = ((total as f64) * service_ratio).round() as usize;
-    let human_count = total.saturating_sub(service_count);
-    let mut actors = Vec::with_capacity(total);
+    role_weights: &[(ActorRole, f64)],
+    account_ids: &[String],
+) -> Result<Vec<ActorProfile>, CatalogError> {
+    let population = if let Some(path) = &config.actor_population_path {
+        actor_store::read_population(path)
+            .map_err(|err| CatalogError::Population(err.to_string()))?
+    } else {
+        ActorPopulation::generate(rng, total, service_ratio, role_weights, account_ids)
+    };
+    Ok(population.profiles())
+}
 
-    for _ in 0..human_count {
-        actors.push(ActorProfile::new_human(&mut rng, &role_weights));
-    }
-    for _ in 0..service_count {
-        actors.push(ActorProfile::new_service(&mut rng));
-    }
-
-    actors
+pub fn generate_actor_population(
+    config: &CloudTrailSourceConfig,
+    seed: Option<u64>,
+) -> ActorPopulation {
+    let mut rng = match seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_entropy(),
+    };
+    let actor_count = config.actor_count.unwrap_or(500).max(1);
+    let service_ratio = config.service_ratio.unwrap_or(0.2).clamp(0.0, 1.0);
+    let roles = build_role_weights(config.role_distribution.as_ref());
+    let account_ids = build_account_pool(config);
+    ActorPopulation::generate(&mut rng, actor_count, service_ratio, &roles, &account_ids)
 }
 
 impl CloudTrailGenerator {
     fn next_actor_index(&mut self) -> usize {
-        self.rng.gen_range(0..self.actors.len())
+        self.actor_selector.sample(&mut self.rng)
     }
 
-    fn pick_event_for_actor(&mut self, actor_index: usize) -> String {
+    fn next_active_actor_index(&mut self, now: DateTime<Utc>) -> Option<usize> {
+        let attempts = self.actors.len().min(64).max(1);
+        for _ in 0..attempts {
+            let idx = self.next_actor_index();
+            if self.actors[idx].is_available(now, &mut self.rng) {
+                return Some(idx);
+            }
+        }
+
+        for idx in 0..self.actors.len() {
+            if self.actors[idx].is_available(now, &mut self.rng) {
+                return Some(idx);
+            }
+        }
+
+        None
+    }
+
+    fn pick_event_for_actor(&mut self, actor_index: usize, now: DateTime<Utc>) -> String {
         let (kind, last_event) = {
             let actor = &mut self.actors[actor_index];
-            actor.maybe_reset_session(&mut self.rng);
-            (actor.kind.clone(), actor.last_event.clone())
+            actor.ensure_session(now, &mut self.rng);
+            (actor.seed.kind.clone(), actor.last_event.clone())
         };
 
         let candidates = match kind {
-            ActorKind::Human(role) => human_candidates(role, last_event.as_deref()),
+            ActorKind::Human => {
+                let role = actor_role_or_default(&self.actors[actor_index]);
+                human_candidates(role, last_event.as_deref())
+            }
             ActorKind::Service => service_candidates(last_event.as_deref()),
         };
 
@@ -188,6 +244,14 @@ impl CloudTrailGenerator {
     }
 }
 
+fn actor_role_or_default(actor: &ActorProfile) -> ActorRole {
+    actor
+        .seed
+        .role
+        .clone()
+        .unwrap_or(ActorRole::Developer)
+}
+
 fn human_candidates(role: ActorRole, last: Option<&str>) -> Vec<(String, f64)> {
     match role {
         ActorRole::Admin => admin_candidates(last),
@@ -220,109 +284,20 @@ fn service_candidates(last: Option<&str>) -> Vec<(String, f64)> {
     }
 }
 
-#[derive(Debug, Clone)]
-enum ActorKind {
-    Human(ActorRole),
-    Service,
-}
-
-#[derive(Debug, Clone)]
-enum ActorRole {
-    Admin,
-    Developer,
-    ReadOnly,
-    Auditor,
-}
-
-#[derive(Debug, Clone)]
-struct ActorProfile {
-    kind: ActorKind,
-    identity_type: String,
-    principal_id: String,
-    arn: String,
-    account_id: String,
-    user_name: Option<String>,
-    user_agent: String,
-    source_ip: String,
-    last_event: Option<String>,
-    session_remaining: u8,
-}
-
-impl ActorProfile {
-    fn new_human(rng: &mut impl Rng, role_weights: &[(ActorRole, f64)]) -> Self {
-        let account_id = random_account_id(rng);
-        let user_name = format!("user-{}", random_alpha(rng, 6).to_lowercase());
-        let principal_id = format!("AIDA{}", random_alpha(rng, 16));
-        let arn = format!("arn:aws:iam::{}:user/{}", account_id, user_name);
-        let user_agent = random_human_user_agent(rng);
-        let role = pick_human_role(rng, role_weights);
-        Self {
-            kind: ActorKind::Human(role),
-            identity_type: "IAMUser".to_string(),
-            principal_id,
-            arn,
-            account_id,
-            user_name: Some(user_name),
-            user_agent,
-            source_ip: random_ip(rng),
-            last_event: None,
-            session_remaining: 0,
-        }
-    }
-
-    fn new_service(rng: &mut impl Rng) -> Self {
-        let account_id = random_account_id(rng);
-        let role_name = format!("svc-role-{}", random_alpha(rng, 4).to_lowercase());
-        let session_name = format!("svc-{}", random_alpha(rng, 8));
-        let principal_id = format!("AROA{}", random_alpha(rng, 16));
-        let arn = format!(
-            "arn:aws:sts::{}:assumed-role/{}/{}",
-            account_id, role_name, session_name
-        );
-        let user_agent = random_service_user_agent(rng);
-        Self {
-            kind: ActorKind::Service,
-            identity_type: "AssumedRole".to_string(),
-            principal_id,
-            arn,
-            account_id,
-            user_name: None,
-            user_agent,
-            source_ip: random_private_ip(rng),
-            last_event: None,
-            session_remaining: 0,
-        }
-    }
-
-    fn maybe_reset_session(&mut self, rng: &mut impl Rng) {
-        if self.session_remaining == 0 {
-            self.last_event = None;
-            self.session_remaining = match self.kind {
-                ActorKind::Human(_) => rng.gen_range(3..10),
-                ActorKind::Service => rng.gen_range(6..18),
-            };
-        }
-    }
-
-    fn consume_session(&mut self, rng: &mut impl Rng) {
-        if self.session_remaining > 0 {
-            self.session_remaining -= 1;
-        }
-        if self.session_remaining == 0 && rng.gen_bool(0.2) {
-            self.last_event = None;
-        }
-    }
-}
-
-fn actor_context(actor: &ActorProfile) -> ActorContext {
+fn actor_context(
+    actor: &mut ActorProfile,
+    region: String,
+    rng: &mut impl Rng,
+) -> ActorContext {
     ActorContext {
-        identity_type: actor.identity_type.clone(),
-        principal_id: actor.principal_id.clone(),
-        arn: actor.arn.clone(),
-        account_id: actor.account_id.clone(),
-        user_name: actor.user_name.clone(),
-        user_agent: actor.user_agent.clone(),
-        source_ip: actor.source_ip.clone(),
+        identity_type: actor.seed.identity_type.clone(),
+        principal_id: actor.seed.principal_id.clone(),
+        arn: actor.seed.arn.clone(),
+        account_id: actor.seed.account_id.clone(),
+        user_name: actor.seed.user_name.clone(),
+        user_agent: actor.current_user_agent(rng),
+        source_ip: actor.current_source_ip(rng),
+        region,
     }
 }
 
@@ -441,149 +416,8 @@ fn auditor_candidates(last: Option<&str>) -> Vec<(String, f64)> {
     }
 }
 
-fn pick_human_role(rng: &mut impl Rng, role_weights: &[(ActorRole, f64)]) -> ActorRole {
-    if role_weights.is_empty() {
-        return ActorRole::Developer;
-    }
-
-    let weights: Vec<f64> = role_weights.iter().map(|(_, weight)| *weight).collect();
-    if let Ok(dist) = WeightedIndex::new(&weights) {
-        return role_weights[dist.sample(rng)].0.clone();
-    }
-
-    ActorRole::Developer
-}
-
-fn random_alpha(rng: &mut impl Rng, len: usize) -> String {
-    const ALPHANUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    (0..len)
-        .map(|_| {
-            let idx = rng.gen_range(0..ALPHANUM.len());
-            ALPHANUM[idx] as char
-        })
-        .collect()
-}
-
 fn random_account_id(rng: &mut impl Rng) -> String {
     (0..12).map(|_| rng.gen_range(0..10).to_string()).collect()
-}
-
-fn random_ip(rng: &mut impl Rng) -> String {
-    format!(
-        "{}.{}.{}.{}",
-        rng.gen_range(1..=223),
-        rng.gen_range(0..=255),
-        rng.gen_range(0..=255),
-        rng.gen_range(1..=254)
-    )
-}
-
-fn random_private_ip(rng: &mut impl Rng) -> String {
-    match rng.gen_range(0..3) {
-        0 => format!("10.{}.{}.{}", rng.gen_range(0..=255), rng.gen_range(0..=255), rng.gen_range(1..=254)),
-        1 => format!(
-            "192.168.{}.{}",
-            rng.gen_range(0..=255),
-            rng.gen_range(1..=254)
-        ),
-        _ => format!(
-            "172.{}.{}.{}",
-            rng.gen_range(16..=31),
-            rng.gen_range(0..=255),
-            rng.gen_range(1..=254)
-        ),
-    }
-}
-
-fn random_human_user_agent(rng: &mut impl Rng) -> String {
-    match rng.gen_range(0..6) {
-        0 => {
-            let major = rng.gen_range(16..18);
-            let safari = format!("{}.{}", rng.gen_range(605..607), rng.gen_range(1..20));
-            format!(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_2) AppleWebKit/{} (KHTML, like Gecko) Version/{}.{} Safari/{}",
-                safari,
-                major,
-                rng.gen_range(0..3),
-                safari
-            )
-        }
-        1 => {
-            let major = rng.gen_range(118..123);
-            format!(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{}.0.0.0 Safari/537.36",
-                major
-            )
-        }
-        2 => {
-            let major = rng.gen_range(117..121);
-            format!(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{}.0.0.0 Safari/537.36",
-                major
-            )
-        }
-        3 => {
-            let major = rng.gen_range(116..121);
-            format!(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) Gecko/20100101 Firefox/{}.0",
-                major
-            )
-        }
-        4 => {
-            let major = rng.gen_range(16..18);
-            format!(
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_{} like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{}.0 Mobile/15E148 Safari/604.1",
-                rng.gen_range(0..3),
-                major
-            )
-        }
-        _ => {
-            let major = rng.gen_range(118..123);
-            let edge_build = rng.gen_range(1700..2400);
-            format!(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/{}.0.{}.{}",
-                major,
-                edge_build,
-                rng.gen_range(10..90)
-            )
-        }
-    }
-}
-
-fn random_service_user_agent(rng: &mut impl Rng) -> String {
-    match rng.gen_range(0..10) {
-        0 => format!("aws-cli/2.{}.{}", rng.gen_range(10..18), rng.gen_range(0..5)),
-        1 => format!(
-            "aws-sdk-go/1.{}.{} (go1.{})",
-            rng.gen_range(40..51),
-            rng.gen_range(0..10),
-            rng.gen_range(18..22)
-        ),
-        2 => format!(
-            "aws-sdk-java/1.12.{} Linux/5.15 OpenJDK_64-Bit_Server_VM",
-            rng.gen_range(500..700)
-        ),
-        3 => format!("aws-sdk-js/2.{}.0", rng.gen_range(1450..1600)),
-        4 => format!(
-            "Boto3/1.{}.{} Python/3.11.{} Linux/5.15",
-            rng.gen_range(28..36),
-            rng.gen_range(0..10),
-            rng.gen_range(0..10)
-        ),
-        5 => format!(
-            "Terraform/1.{}.{} (+https://www.terraform.io)",
-            rng.gen_range(5..8),
-            rng.gen_range(0..10)
-        ),
-        6 => format!(
-            "Pulumi/3.{}.{} (linux; x64)",
-            rng.gen_range(80..110),
-            rng.gen_range(0..10)
-        ),
-        7 => format!("DatadogAgent/7.{}.{}", rng.gen_range(40..50), rng.gen_range(0..10)),
-        8 => format!("Vault/1.{}.{}", rng.gen_range(10..15), rng.gen_range(0..10)),
-        _ => format!("AWSInternal/3.{}", rng.gen_range(0..5)),
-    }
 }
 
 fn build_error_profiles(config: Option<&Vec<EventErrorConfig>>) -> HashMap<String, ErrorProfile> {
@@ -615,6 +449,35 @@ fn build_error_profiles(config: Option<&Vec<EventErrorConfig>>) -> HashMap<Strin
         }
     }
     map
+}
+
+fn build_actor_selector(count: usize, hot_ratio: f64, hot_share: f64) -> WeightedIndex<f64> {
+    if count == 0 {
+        return WeightedIndex::new(vec![1.0]).expect("non-empty weights");
+    }
+
+    let ratio = hot_ratio.clamp(0.0, 1.0);
+    let share = hot_share.clamp(0.0, 1.0);
+    let hot_count = ((count as f64) * ratio).round() as usize;
+    let hot_count = hot_count.clamp(1, count);
+    let cold_count = count.saturating_sub(hot_count);
+
+    if cold_count == 0 || share == 0.0 || share == 1.0 {
+        return WeightedIndex::new(vec![1.0; count]).expect("non-empty weights");
+    }
+
+    let hot_weight = share / hot_count as f64;
+    let cold_weight = (1.0 - share) / cold_count as f64;
+
+    let mut weights = Vec::with_capacity(count);
+    for _ in 0..hot_count {
+        weights.push(hot_weight);
+    }
+    for _ in 0..cold_count {
+        weights.push(cold_weight);
+    }
+
+    WeightedIndex::new(weights).unwrap_or_else(|_| WeightedIndex::new(vec![1.0; count]).unwrap())
 }
 
 fn build_role_weights(config: Option<&Vec<RoleWeight>>) -> Vec<(ActorRole, f64)> {
@@ -649,5 +512,113 @@ fn build_role_weights(config: Option<&Vec<RoleWeight>>) -> Vec<(ActorRole, f64)>
         defaults
     } else {
         parsed
+    }
+}
+
+struct RegionSelector {
+    regions: Vec<String>,
+    weights: WeightedIndex<f64>,
+}
+
+impl RegionSelector {
+    fn pick(&self, rng: &mut impl Rng) -> String {
+        let idx = self.weights.sample(rng);
+        self.regions[idx].clone()
+    }
+}
+
+fn build_region_selector(
+    regions: Option<&Vec<String>>,
+    distribution: Option<&Vec<RegionWeight>>,
+) -> RegionSelector {
+    let defaults = vec![
+        "us-east-1".to_string(),
+        "us-west-2".to_string(),
+        "eu-west-1".to_string(),
+        "ap-southeast-1".to_string(),
+    ];
+
+    let mut base_regions = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(list) = regions {
+        for entry in list {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                base_regions.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if base_regions.is_empty() {
+        if let Some(list) = distribution {
+            for entry in list {
+                if !entry.weight.is_finite() || entry.weight <= 0.0 {
+                    continue;
+                }
+                let trimmed = entry.name.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if seen.insert(trimmed.to_string()) {
+                    base_regions.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    if base_regions.is_empty() {
+        base_regions = defaults;
+    }
+
+    let mut weight_map = HashMap::new();
+    if let Some(list) = distribution {
+        for entry in list {
+            if !entry.weight.is_finite() || entry.weight <= 0.0 {
+                continue;
+            }
+            let trimmed = entry.name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            weight_map.insert(trimmed.to_string(), entry.weight);
+        }
+    }
+
+    let weights: Vec<f64> = base_regions
+        .iter()
+        .map(|region| *weight_map.get(region).unwrap_or(&1.0))
+        .collect();
+
+    let index = WeightedIndex::new(weights).unwrap_or_else(|_| {
+        let weights = vec![1.0; base_regions.len()];
+        WeightedIndex::new(weights).expect("fallback weights")
+    });
+
+    RegionSelector {
+        regions: base_regions,
+        weights: index,
+    }
+}
+
+fn build_account_pool(config: &CloudTrailSourceConfig) -> Vec<String> {
+    if let Some(ids) = &config.account_ids {
+        let filtered: Vec<String> = ids.iter().cloned().filter(|id| id.len() == 12).collect();
+        if !filtered.is_empty() {
+            return filtered;
+        }
+    }
+
+    let count = config.account_count.unwrap_or(1).max(1);
+    let mut rng = rand::thread_rng();
+    (0..count).map(|_| random_account_id(&mut rng)).collect()
+}
+
+fn shuffle_actors(actors: &mut [ActorProfile], rng: &mut impl Rng) {
+    for idx in (1..actors.len()).rev() {
+        let swap_idx = rng.gen_range(0..=idx);
+        actors.swap(idx, swap_idx);
     }
 }

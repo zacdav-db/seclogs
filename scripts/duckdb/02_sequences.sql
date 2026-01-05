@@ -4,9 +4,12 @@ CREATE OR REPLACE VIEW events AS
 SELECT
   envelope.actor.id AS actor_id,
   envelope.event_type AS event_name,
-  try_cast(envelope.timestamp AS TIMESTAMP) AS ts_parsed,
-  envelope.user_agent AS user_agent
-FROM read_parquet('out-test-5/events-*.parquet');
+  coalesce(
+    try_cast(envelope.timestamp AS TIMESTAMP),
+    try_cast(cloudtrail.event_time AS TIMESTAMP)
+  ) AS ts_parsed,
+  coalesce(envelope.user_agent, cloudtrail.user_agent) AS user_agent
+FROM read_parquet('out-test/*.parquet');
 
 WITH ordered AS (
   SELECT
@@ -18,6 +21,7 @@ WITH ordered AS (
       ORDER BY ts_parsed
     ) AS prev_event
   FROM events
+  WHERE ts_parsed IS NOT NULL
 )
 SELECT
   prev_event,
@@ -39,6 +43,7 @@ WITH ordered AS (
       ORDER BY ts_parsed
     ) AS prev_event
   FROM events
+  WHERE ts_parsed IS NOT NULL
 )
 SELECT
   sum(CASE WHEN event_name = 'AssumeRole'
@@ -58,6 +63,7 @@ WITH ordered AS (
       ORDER BY ts_parsed
     ) AS prev_event
   FROM events
+  WHERE ts_parsed IS NOT NULL
 )
 SELECT
   sum(CASE WHEN event_name IN ('PutObject', 'GetObject')

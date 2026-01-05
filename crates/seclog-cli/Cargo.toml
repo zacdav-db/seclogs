@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 seclog-core = { path = "../seclog-core" }
+seclog-actors-parquet = { path = "../seclog-actors-parquet" }
 seclog-formats-jsonl = { path = "../seclog-formats-jsonl" }
 seclog-formats-parquet = { path = "../seclog-formats-parquet" }
 seclog-sources-cloudtrail = { path = "../seclog-sources-cloudtrail" }

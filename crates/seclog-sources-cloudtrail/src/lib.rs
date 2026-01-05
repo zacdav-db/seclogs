@@ -6,7 +6,7 @@ pub mod templates;
 pub use catalog::{
     resolve_event_weights, resolve_selector, CatalogError, EventSelector, WeightedEvent,
 };
-pub use generator::CloudTrailGenerator;
+pub use generator::{generate_actor_population, CloudTrailGenerator};
 pub use model::{CloudTrailEvent, UserIdentity};
 pub use templates::{
     apply_error, build_cloudtrail_event, default_error_profile, ActorContext, ErrorProfile,
