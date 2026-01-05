@@ -11,3 +11,4 @@
 .env.*
 /out/
 /out-*/
+*.parquet

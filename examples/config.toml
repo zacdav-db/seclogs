@@ -2,7 +2,7 @@ seed = 42
 
 [traffic]
 start_time = "2025-12-01T00:00:00Z"
-time_scale = 3600
+time_scale = 36000
 
 [output]
 dir = "./out"
@@ -10,11 +10,11 @@ dir = "./out"
 [output.rotation]
 target_size_mb = 50
 flush_interval_ms = 1000
-max_age_seconds = 60
+max_age_seconds = 10
 
 [output.format]
-type = "parquet"
-compression = "zstd"
+type = "jsonl"
+compression = "gzip"
 
 [source]
 type = "cloudtrail"

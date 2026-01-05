@@ -305,10 +305,11 @@ fn spawn_writer_shards(
         let bytes_counter = Arc::clone(&counters.bytes);
         let handle = thread::spawn(move || -> WorkerResult {
             let mut writer: Box<dyn EventWriter> = match format {
-                FormatConfig::Jsonl(_) => Box::new(JsonlWriter::new(
+                FormatConfig::Jsonl(options) => Box::new(JsonlWriter::new(
                     &dir,
                     target_size_mb,
                     max_age_seconds,
+                    options.compression.as_deref(),
                 )?),
                 FormatConfig::Parquet(_) => Box::new(ParquetWriter::new(
                     &dir,

@@ -929,6 +929,7 @@ name = "seclog-formats-jsonl"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flate2",
  "rand",
  "seclog-core",
  "serde_json",
