@@ -22,12 +22,4 @@ curated = true
 regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"]
 actor_population_path = "./actors.parquet"
 
-[[source.custom_events]]
-name = "ConsoleLogin"
-weight = 1.0
-
-[[source.custom_events]]
-name = "AssumeRole"
-weight = 0.8
-
 region_distribution = [0.6, 0.15, 0.2, 0.05]

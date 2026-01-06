@@ -118,21 +118,12 @@ pub enum SourceConfig {
 pub struct CloudTrailSourceConfig {
     /// Use curated event weights for CloudTrail.
     pub curated: bool,
-    /// Optional custom event weights.
-    pub custom_events: Option<Vec<EventWeight>>,
     /// Optional path to an actor population Parquet file.
     pub actor_population_path: Option<String>,
     /// Allowed regions.
     pub regions: Option<Vec<String>>,
     /// Optional region weighting for selection.
     pub region_distribution: Option<Vec<f64>>,
-}
-
-/// Event weight override for a specific event name.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventWeight {
-    pub name: String,
-    pub weight: f64,
 }
 
 /// Role weight for actor generation.

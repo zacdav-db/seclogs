@@ -76,12 +76,6 @@ pub fn resolve_event_weights(
         }
     }
 
-    if let Some(custom) = &config.custom_events {
-        for entry in custom {
-            events.insert(entry.name.clone(), entry.weight);
-        }
-    }
-
     let mut resolved = Vec::with_capacity(events.len());
     for (name, weight) in events {
         if !weight.is_finite() || weight <= 0.0 {
@@ -108,7 +102,7 @@ pub fn resolve_selector(
 fn curated_event_weights() -> Vec<(&'static str, f64)> {
     vec![
         ("ConsoleLogin", 1.0),
-        ("AssumeRole", 1.0),
+        ("AssumeRole", 0.8),
         ("GetSessionToken", 0.6),
         ("GetCallerIdentity", 0.6),
         ("CreateUser", 0.3),
@@ -144,13 +138,12 @@ fn curated_event_weights() -> Vec<(&'static str, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seclog_core::config::{CloudTrailSourceConfig, EventWeight};
+    use seclog_core::config::CloudTrailSourceConfig;
 
     #[test]
     fn curated_only() {
         let config = CloudTrailSourceConfig {
             curated: true,
-            custom_events: None,
             actor_population_path: None,
             regions: None,
             region_distribution: None,
@@ -160,42 +153,4 @@ mod tests {
         assert!(resolved.iter().any(|event| event.name == "ConsoleLogin"));
     }
 
-    #[test]
-    fn custom_overrides_curated() {
-        let config = CloudTrailSourceConfig {
-            curated: true,
-            custom_events: Some(vec![EventWeight {
-                name: "ConsoleLogin".to_string(),
-                weight: 3.0,
-            }]),
-            actor_population_path: None,
-            regions: None,
-            region_distribution: None,
-        };
-
-        let resolved = resolve_event_weights(&config).expect("resolved");
-        let login = resolved
-            .iter()
-            .find(|event| event.name == "ConsoleLogin")
-            .expect("login event");
-        assert_eq!(login.weight, 3.0);
-    }
-
-    #[test]
-    fn custom_only() {
-        let config = CloudTrailSourceConfig {
-            curated: false,
-            custom_events: Some(vec![EventWeight {
-                name: "CustomEvent".to_string(),
-                weight: 1.2,
-            }]),
-            actor_population_path: None,
-            regions: None,
-            region_distribution: None,
-        };
-
-        let resolved = resolve_event_weights(&config).expect("resolved");
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].name, "CustomEvent");
-    }
 }

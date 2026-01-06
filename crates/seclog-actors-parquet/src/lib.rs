@@ -272,7 +272,7 @@ fn parse_role(value: &str) -> io::Result<ActorRole> {
     match value {
         "admin" => Ok(ActorRole::Admin),
         "developer" => Ok(ActorRole::Developer),
-        "readonly" | "read_only" => Ok(ActorRole::ReadOnly),
+        "readonly" => Ok(ActorRole::ReadOnly),
         "auditor" => Ok(ActorRole::Auditor),
         other => Err(invalid_data(format!("unknown role: {other}"))),
     }

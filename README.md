@@ -97,12 +97,20 @@ pattern = "constant" # constant, diurnal, or bursty.
 | --- | --- | --- | --- |
 | `population.role_distribution.name` | string | yes | Selects which role to weight. |
 | `population.role_distribution.weight` | float | yes | Higher weight yields more of that role. |
+Valid role names: `admin`, `developer`, `readonly`, `auditor`.
+
+### Role meanings
+- `admin`: IAM and security changes, higher propensity for privileged actions (e.g. users, roles, access keys).
+- `developer`: EC2/S3 workload activity, resource creation and iteration, moderate privilege usage.
+- `readonly`: Mostly read‑only API calls (describe/list/get), lower mutation rate.
+- `auditor`: Read‑heavy with frequent logging/monitoring API usage.
 
 ### Role rate entries
 | Path | Type | Required | Effect |
 | --- | --- | --- | --- |
 | `population.role_rates_per_hour.name` | string | yes | Selects which role rate to override. |
 | `population.role_rates_per_hour.rate_per_hour` | float | yes | Baseline events/hour for that role. |
+Valid role names: `admin`, `developer`, `readonly`, `auditor`.
 
 ### Service profile entries
 | Path | Type | Required | Effect |
@@ -172,7 +180,6 @@ region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
 | `source.actor_population_path` | string | yes | - | Points to the actors parquet; generation fails if missing. |
 | `source.regions` | string[] | no | defaults | Region list for event emission. |
 | `source.region_distribution` | float[] | no | none | Weights aligned with `source.regions`; must match length. |
-| `source.custom_events` | table[] | no | none | Overrides curated weights or adds new events. |
 
 ### Region distribution (array form)
 Provide weights aligned with the `regions` list:
@@ -180,12 +187,6 @@ Provide weights aligned with the `regions` list:
 regions = ["us-east-1", "us-west-2", "eu-west-1"]
 region_distribution = [0.6, 0.25, 0.15]
 ```
-
-### Custom event entries
-| Path | Type | Required | Description |
-| --- | --- | --- | --- |
-| `source.custom_events.name` | string | yes | CloudTrail event name. |
-| `source.custom_events.weight` | float | yes | Relative weight (overrides curated). |
 
 
 ## DuckDB validation

@@ -552,7 +552,7 @@ fn build_role_weights(config: Option<&Vec<RoleWeight>>) -> Vec<(ActorRole, f64)>
         let role = match entry.name.as_str() {
             "admin" => ActorRole::Admin,
             "developer" => ActorRole::Developer,
-            "readonly" | "read_only" => ActorRole::ReadOnly,
+            "readonly" => ActorRole::ReadOnly,
             "auditor" => ActorRole::Auditor,
             _ => continue,
         };
@@ -581,7 +581,7 @@ fn build_role_rates(config: Option<&Vec<RoleRate>>) -> RoleRates {
         match entry.name.as_str() {
             "admin" => rates.admin = entry.rate_per_hour,
             "developer" => rates.developer = entry.rate_per_hour,
-            "readonly" | "read_only" => rates.readonly = entry.rate_per_hour,
+            "readonly" => rates.readonly = entry.rate_per_hour,
             "auditor" => rates.auditor = entry.rate_per_hour,
             _ => {}
         }
