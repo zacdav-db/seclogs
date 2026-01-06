@@ -889,75 +889,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
-name = "seclog-actors-parquet"
+name = "seclog"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
- "parquet",
- "seclog-core",
- "serde_json",
-]
-
-[[package]]
-name = "seclog-cli"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "seclog-actors-parquet",
- "seclog-core",
- "seclog-formats-jsonl",
- "seclog-formats-parquet",
- "seclog-sources-cloudtrail",
-]
-
-[[package]]
-name = "seclog-core"
-version = "0.1.0"
-dependencies = [
  "chrono",
  "chrono-tz",
+ "clap",
+ "flate2",
+ "parquet",
  "rand",
  "serde",
  "serde_json",
  "toml",
-]
-
-[[package]]
-name = "seclog-formats-jsonl"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "flate2",
- "rand",
- "seclog-core",
- "serde_json",
-]
-
-[[package]]
-name = "seclog-formats-parquet"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "chrono",
- "parquet",
- "rand",
- "seclog-core",
- "serde_json",
-]
-
-[[package]]
-name = "seclog-sources-cloudtrail"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "rand",
- "seclog-actors-parquet",
- "seclog-core",
- "serde",
- "serde_json",
 ]
 
 [[package]]

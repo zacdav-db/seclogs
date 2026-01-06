@@ -1,13 +1,13 @@
 use clap::{Parser, Subcommand};
 use chrono::{DateTime, Utc};
-use seclog_core::actors::generate_population;
-use seclog_core::config::{Config, FormatConfig, PopulationConfig, SourceConfig};
-use seclog_core::event::Event;
-use seclog_core::traits::{EventSource, EventWriter};
-use seclog_actors_parquet::write_population;
-use seclog_formats_jsonl::JsonlWriter;
-use seclog_formats_parquet::ParquetWriter;
-use seclog_sources_cloudtrail::CloudTrailGenerator;
+use seclog::actors_parquet::write_population;
+use seclog::core::actors::generate_population;
+use seclog::core::config::{Config, FormatConfig, PopulationConfig, SourceConfig};
+use seclog::core::event::Event;
+use seclog::core::traits::{EventSource, EventWriter};
+use seclog::formats::json::JsonlWriter;
+use seclog::formats::parquet::ParquetWriter;
+use seclog::sources::cloudtrail::CloudTrailGenerator;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -98,7 +98,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let (writer_txs, writer_handles) = spawn_writer_shards(
                 &loaded.output.dir,
                 loaded.output.files.target_size_mb,
-                loaded.output.files.max_age_seconds,
+                Some(loaded.output.files.max_age_seconds),
                 &loaded.output.format,
                 writer_shards,
                 queue_depth,
@@ -108,13 +108,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut last_written_events = 0_u64;
             let mut last_written_bytes = 0_u64;
 
-            let flush_interval = if loaded.output.files.max_age_seconds.is_some() {
-                Some(Duration::from_secs(1))
-            } else if let Some(ms) = loaded.output.files.flush_interval_ms {
-                Some(Duration::from_millis(ms))
-            } else {
-                Some(Duration::from_secs(30))
-            };
+            let flush_interval = Some(Duration::from_secs(1));
             let mut next_flush = flush_interval.map(|interval| Instant::now() + interval);
             let mut metrics = Metrics::new(Duration::from_millis(metrics_interval_ms));
             let start_time = Instant::now();

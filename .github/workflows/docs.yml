@@ -25,17 +25,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build docs
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --no-deps --package seclog
       - name: Add root index
         run: |
           if [ ! -f target/doc/index.html ]; then
             printf '%s\n' '<!doctype html><meta charset="utf-8"><title>Seclog Docs</title><h1>Seclog Docs</h1><ul>' > target/doc/index.html
-            for dir in target/doc/seclog_*; do
-              if [ -d "$dir" ]; then
-                name=$(basename "$dir");
+            for dir in target/doc/*; do
+              if [ -d "$dir" ] && [ -f "$dir/index.html" ]; then
+                name=$(basename "$dir")
+                case "$name" in
+                  src|implementors) continue ;;
+                esac
                 printf '%s\n' "<li><a href=\"$name/index.html\">$name</a></li>" >> target/doc/index.html
-              fi;
-            done;
+              fi
+            done
             printf '%s\n' '</ul>' >> target/doc/index.html
           fi
           touch target/doc/.nojekyll

@@ -9,7 +9,6 @@ dir = "./out"
 
 [output.files]
 target_size_mb = 50
-flush_interval_ms = 1000
 max_age_seconds = 10
 
 [output.format]

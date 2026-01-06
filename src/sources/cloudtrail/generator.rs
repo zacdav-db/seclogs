@@ -1,14 +1,14 @@
-use crate::catalog::{resolve_event_weights, CatalogError, EventSelector, WeightedEvent};
-use crate::templates::{build_cloudtrail_event, default_error_profile, ActorContext};
+use super::catalog::{resolve_event_weights, CatalogError, EventSelector, WeightedEvent};
+use super::templates::{build_cloudtrail_event, default_error_profile, ActorContext};
 use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use seclog_core::actors::{ActorKind, ActorProfile, ActorRole, ServicePattern, ServiceProfile};
-use seclog_core::config::CloudTrailSourceConfig;
-use seclog_core::event::{Actor, Event, EventEnvelope, Outcome};
-use seclog_core::traits::EventSource;
-use seclog_actors_parquet as actor_store;
+use crate::core::actors::{ActorKind, ActorProfile, ActorRole, ServicePattern, ServiceProfile};
+use crate::core::config::CloudTrailSourceConfig;
+use crate::core::event::{Actor, Event, EventEnvelope, Outcome};
+use crate::core::traits::EventSource;
+use crate::actors_parquet as actor_store;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 

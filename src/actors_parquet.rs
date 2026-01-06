@@ -13,7 +13,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
-use seclog_core::actors::{
+use crate::core::actors::{
     ActorKind, ActorPopulation, ActorRole, ActorSeed, RoleRates, ServicePattern, ServiceProfile,
 };
 use serde_json::Value;

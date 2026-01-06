@@ -9,8 +9,8 @@ use chrono::Utc;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
-use seclog_core::event::{Actor, Event, Geo, Outcome, Target};
-use seclog_core::traits::EventWriter;
+use crate::core::event::{Actor, Event, Geo, Outcome, Target};
+use crate::core::traits::EventWriter;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde_json::Value;
@@ -190,7 +190,7 @@ impl EventBatchBuilder {
         Ok(batch)
     }
 
-    fn append_envelope(&mut self, envelope: &seclog_core::event::EventEnvelope) {
+    fn append_envelope(&mut self, envelope: &crate::core::event::EventEnvelope) {
         let builder = &mut self.envelope;
 
         append_string(builder.field_builder::<StringBuilder>(0).unwrap(), Some(&envelope.schema_version));

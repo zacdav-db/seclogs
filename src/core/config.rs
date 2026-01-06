@@ -85,10 +85,8 @@ pub struct OutputConfig {
 pub struct FileConfig {
     /// Target file size before a new file is started.
     pub target_size_mb: u64,
-    /// Flush interval for writer buffers.
-    pub flush_interval_ms: Option<u64>,
     /// Maximum age for a file before a new one is started.
-    pub max_age_seconds: Option<u64>,
+    pub max_age_seconds: u64,
 }
 
 /// Output format selection.
@@ -133,7 +131,7 @@ pub struct RoleWeight {
     pub weight: f64,
 }
 
-/// Actor population configuration (used for `seclog-cli actors`).
+/// Actor population configuration (used for `seclog actors`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PopulationConfig {
     /// Optional RNG seed for deterministic output.

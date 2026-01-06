@@ -12,11 +12,11 @@ High-volume SIEM log generator with CloudTrail-style data.
 ## Getting started (end-to-end)
 1. Generate an actor population (Parquet):
 ```bash
-cargo run --bin seclog-cli -- actors --config examples/actors.toml --output ./actors.parquet
+cargo run --bin seclog -- actors --config examples/actors.toml --output ./actors.parquet
 ```
 2. Generate CloudTrail logs using that population:
 ```bash
-cargo run --bin seclog-cli -- gen --config examples/config.toml --output ./out-test
+cargo run --bin seclog -- gen --config examples/config.toml --output ./out-test
 ```
 
 ## actors.toml reference (population generation)
@@ -104,10 +104,17 @@ pattern = "constant" # constant, diurnal, or bursty.
 ### Service profile entries
 | Path | Type | Required | Effect |
 | --- | --- | --- | --- |
-| `population.service_profiles.name` | string | yes | Chooses the service behavior profile. |
+| `population.service_profiles.name` | string | yes | Chooses the service behavior profile: `generic`, `ec2_reaper`, `datalake_bot`, `logs_shipper`, `metrics_collector`. |
 | `population.service_profiles.weight` | float | yes | Higher weight increases share of that profile. |
 | `population.service_profiles.events_per_hour` | float | no | Overrides `population.service_events_per_hour` for this profile. |
 | `population.service_profiles.pattern` | string | no | Shapes activity over time (steady vs. diurnal vs. bursts). |
+
+### Service profile meanings
+- `generic`: Balanced mix of IAM, S3, EC2, and logs events.
+- `ec2_reaper`: Focused on instance lifecycle cleanup (describe/stop/terminate).
+- `datalake_bot`: Heavy S3 + KMS usage (put/get objects, encrypt/decrypt, data keys).
+- `logs_shipper`: CloudWatch Logs activity (create streams, put log events).
+- `metrics_collector`: CloudWatch Metrics activity (get/put metrics, list metrics).
 
 ### Error rate entries
 | Path | Type | Required | Effect |
@@ -132,8 +139,7 @@ dir = "./out-test" # Output directory.
 
 [output.files]
 target_size_mb = 50 # Start a new file at ~50 MB.
-flush_interval_ms = 1000 # Flush buffers at least every 1s.
-max_age_seconds = 30 # Start a new file even if size not reached.
+max_age_seconds = 30 # Always rotate if this age is reached.
 
 [output.format]
 type = "jsonl" # jsonl (CloudTrail Records JSON) or parquet.
@@ -158,8 +164,7 @@ region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
 | `output.dir` | string | yes | - | Output directory for generated files. |
 | `[output.files]` | table | yes | - | File output controls. |
 | `output.files.target_size_mb` | int | yes | - | Lower values create more, smaller files. |
-| `output.files.flush_interval_ms` | int | no | 30000 | Shorter interval flushes buffers more often. |
-| `output.files.max_age_seconds` | int | no | none | Forces periodic file rollover under low volume. |
+| `output.files.max_age_seconds` | int | yes | - | Forces periodic file rollover under low volume. |
 | `[output.format]` | table | yes | - | Output format selection. |
 | `output.format.type` | string | yes | - | `parquet` (structured) or `jsonl` (CloudTrail Records JSON). |
 | `output.format.compression` | string | no | none | `jsonl` supports `gzip` to write `.json.gz`. |

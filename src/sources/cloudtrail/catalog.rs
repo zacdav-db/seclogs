@@ -1,6 +1,6 @@
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
-use seclog_core::config::CloudTrailSourceConfig;
+use crate::core::config::CloudTrailSourceConfig;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -138,7 +138,7 @@ fn curated_event_weights() -> Vec<(&'static str, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seclog_core::config::CloudTrailSourceConfig;
+    use crate::core::config::CloudTrailSourceConfig;
 
     #[test]
     fn curated_only() {

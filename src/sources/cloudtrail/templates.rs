@@ -1,4 +1,4 @@
-use crate::model::{CloudTrailEvent, SessionAttributes, SessionContext, TlsDetails, UserIdentity};
+use super::model::{CloudTrailEvent, SessionAttributes, SessionContext, TlsDetails, UserIdentity};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde_json::{json, Value};
