@@ -185,7 +185,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Actors { config, output } => {
             let loaded = PopulationConfig::from_path(&config)?;
-            let population = generate_population(&loaded);
+            let population = generate_population(&loaded)?;
             write_population(&output, &population)?;
             println!("actor population written to {}", output.display());
         }

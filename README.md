@@ -7,7 +7,7 @@ High-volume SIEM log generator with CloudTrail-style data.
 
 ## Documentation
 - Rustdoc is the primary reference and is published to GitHub Pages.
-- Build locally with `cargo doc --workspace --no-deps`.
+- Build locally with `cargo doc --no-deps --package seclog`.
 
 ## Getting started (end-to-end)
 1. Generate an actor population (Parquet):
@@ -65,6 +65,24 @@ name = "datalake_bot"
 weight = 0.4 # Higher means more actors of this profile.
 events_per_hour = 30.0 # Overrides service_events_per_hour.
 pattern = "constant" # constant, diurnal, or bursty.
+
+# Explicit actors with fixed traits and behavior overrides.
+[[population.actor]]
+id = "human-mal-001"
+kind = "human"
+role = "admin"
+events_per_hour = 42.0
+error_rate = 0.18
+timezone = "Europe/London"
+active_start_hour = 8
+active_hours = 10
+weekend_active = false
+user_name = "n.rogue"
+account_id = "123456789012"
+user_agents = ["Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36", "curl/8.5.0"]
+source_ips = ["203.0.113.45", "198.51.100.23"]
+tags = ["malicious"]
+event_bias = { "ConsoleLogin" = 3.0, "AssumeRole" = 2.0 }
 ```
 
 ### Fields
@@ -75,7 +93,7 @@ pattern = "constant" # constant, diurnal, or bursty.
 | `timezone_distribution.name` | string | yes | - | IANA timezone name used to compute offsets. |
 | `timezone_distribution.weight` | float | yes | - | Higher increases share of actors in that timezone. |
 | `[population]` | table | yes | - | Population parameters. |
-| `population.actor_count` | int | no | 500 | Raises total volume and unique actor diversity. |
+| `population.actor_count` | int | no | 500 | Total actors; explicit entries count toward this number. |
 | `population.service_ratio` | float | no | 0.2 | Shifts traffic toward automated events as it increases. |
 | `population.hot_actor_ratio` | float | no | 0.1 | Increases number of high-activity actors. |
 | `population.hot_actor_multiplier` | float | no | 6.0 | Amplifies activity for hot actors. |
@@ -87,6 +105,7 @@ pattern = "constant" # constant, diurnal, or bursty.
 | `population.role` | table[] | no | defaults | Defines role weights and per-role throughput overrides. |
 | `population.service_events_per_hour` | float | no | 6.0 | Sets default throughput for services. |
 | `population.service_profiles` | table[] | no | none | Controls service profile mix and event families. |
+| `population.actor` | table[] | no | none | Adds explicit actors with fixed traits and optional behavior biasing. |
 
 ### Role entries
 | Path | Type | Required | Effect |
@@ -115,6 +134,34 @@ pattern = "constant" # constant, diurnal, or bursty.
 - `datalake_bot`: Heavy S3 + KMS usage (put/get objects, encrypt/decrypt, data keys).
 - `logs_shipper`: CloudWatch Logs activity (create streams, put log events).
 - `metrics_collector`: CloudWatch Metrics activity (get/put metrics, list metrics).
+
+### Explicit actor entries
+Explicit actors are always included. If `population.actor_count` is smaller than the
+explicit list size, Seclog keeps all explicit actors and skips generating additional ones.
+
+| Path | Type | Required | Effect |
+| --- | --- | --- | --- |
+| `population.actor.id` | string | yes | Unique identifier for the explicit actor. |
+| `population.actor.kind` | string | yes | `human` or `service`; controls session behavior and defaults. |
+| `population.actor.role` | string | human | Required for humans: `admin`, `developer`, `readonly`, `auditor`. |
+| `population.actor.service_profile` | string | service | Required for services: `generic`, `ec2_reaper`, `datalake_bot`, `logs_shipper`, `metrics_collector`. |
+| `population.actor.service_pattern` | string | no | Optional service pacing (`constant`, `diurnal`, `bursty`). |
+| `population.actor.events_per_hour` | float | yes | Baseline per‑actor throughput. |
+| `population.actor.error_rate` | float | no | Overrides sampled error rate (0.0–1.0). |
+| `population.actor.account_id` | string | no | Overrides the AWS account ID (12 digits). |
+| `population.actor.user_name` | string | no | Overrides IAM username for human actors. |
+| `population.actor.principal_id` | string | no | Overrides the principal ID. |
+| `population.actor.arn` | string | no | Overrides the full ARN. |
+| `population.actor.access_key_id` | string | no | Overrides the access key ID. |
+| `population.actor.identity_type` | string | no | Overrides identity type (defaults to `IAMUser` / `AssumedRole`). |
+| `population.actor.timezone` | string | no | IANA timezone name for activity windows; overrides distribution. |
+| `population.actor.active_start_hour` | int | no | Local hour (0–23) when the actor becomes active. |
+| `population.actor.active_hours` | int | no | Active window length in hours (1–24). |
+| `population.actor.weekend_active` | bool | no | When false, the actor skips weekends. |
+| `population.actor.user_agents` | string[] | no | Overrides the actor’s user‑agent pool. |
+| `population.actor.source_ips` | string[] | no | Overrides the actor’s source IP pool. |
+| `population.actor.tags` | string[] | no | Free‑form labels for downstream analytics. |
+| `population.actor.event_bias` | map | no | Multiplies CloudTrail event weights for this actor (e.g. `{ "ConsoleLogin" = 3.0 }`). |
 
 ### Error rate entries
 | Path | Type | Required | Effect |

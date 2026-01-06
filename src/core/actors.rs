@@ -5,10 +5,10 @@ use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
 use crate::config::{
-    ErrorRateConfig, ErrorRateDistribution, PopulationActorsConfig, PopulationConfig, RoleConfig,
-    ServicePatternConfig, ServiceProfileConfig, TimezoneWeight,
+    ErrorRateConfig, ErrorRateDistribution, ExplicitActorConfig, PopulationActorsConfig,
+    PopulationConfig, RoleConfig, ServicePatternConfig, ServiceProfileConfig, TimezoneWeight,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 /// High-level actor type used for session behavior and weighting.
@@ -43,11 +43,23 @@ pub enum ServicePattern {
     Bursty,
 }
 
+#[derive(Debug)]
+pub struct ActorConfigError(pub String);
+
+impl std::fmt::Display for ActorConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "actor config error: {}", self.0)
+    }
+}
+
+impl std::error::Error for ActorConfigError {}
+
 /// Stable actor attributes used to create runtime profiles.
 #[derive(Debug, Clone)]
 pub struct ActorSeed {
     pub kind: ActorKind,
     pub role: Option<ActorRole>,
+    pub id: Option<String>,
     pub identity_type: String,
     pub principal_id: String,
     pub arn: String,
@@ -55,6 +67,8 @@ pub struct ActorSeed {
     pub access_key_id: String,
     pub rate_per_hour: f64,
     pub error_rate: f64,
+    pub tags: Vec<String>,
+    pub event_bias: HashMap<String, f64>,
     pub service_profile: Option<ServiceProfile>,
     pub service_pattern: Option<ServicePattern>,
     pub user_name: Option<String>,
@@ -63,6 +77,7 @@ pub struct ActorSeed {
     pub active_start_hour: u8,
     pub active_hours: u8,
     pub timezone_offset: i8,
+    pub timezone_fixed: bool,
     pub weekend_active: bool,
 }
 
@@ -277,7 +292,10 @@ pub struct PopulationSpec<'a> {
 impl ActorPopulation {
     /// Generates a mixed population of human and service actors.
     pub fn generate(rng: &mut impl Rng, spec: &PopulationSpec<'_>) -> Self {
-        let total = spec.total.max(1);
+        let total = spec.total;
+        if total == 0 {
+            return Self { actors: Vec::new() };
+        }
         let service_count =
             ((total as f64) * spec.service_ratio.clamp(0.0, 1.0)).round() as usize;
         let human_count = total.saturating_sub(service_count);
@@ -323,13 +341,14 @@ impl ActorPopulation {
 }
 
 /// Builds an actor population from the dedicated population config.
-pub fn generate_population(config: &PopulationConfig) -> ActorPopulation {
+pub fn generate_population(
+    config: &PopulationConfig,
+) -> Result<ActorPopulation, ActorConfigError> {
     let mut rng = match config.seed {
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_entropy(),
     };
     let population = &config.population;
-    let total = population.actor_count.unwrap_or(500).max(1);
     let service_ratio = population.service_ratio.unwrap_or(0.2).clamp(0.0, 1.0);
     let hot_actor_ratio = population.hot_actor_ratio.unwrap_or(0.1).clamp(0.0, 1.0);
     let hot_actor_multiplier = population.hot_actor_multiplier.unwrap_or(6.0).max(1.0);
@@ -347,9 +366,24 @@ pub fn generate_population(config: &PopulationConfig) -> ActorPopulation {
     );
     let human_error = error_rate_spec(population.human_error_rate.as_ref(), baseline_error);
     let service_error = error_rate_spec(population.service_error_rate.as_ref(), baseline_error);
+    let start_time = Utc::now();
+    let explicit = build_explicit_actors(
+        &mut rng,
+        population.actor.as_ref(),
+        human_error,
+        service_error,
+        &account_ids,
+        start_time,
+    )?;
+    let total = population
+        .actor_count
+        .unwrap_or(500)
+        .max(explicit.len())
+        .max(1);
+    let remaining = total.saturating_sub(explicit.len());
 
     let spec = PopulationSpec {
-        total,
+        total: remaining,
         service_ratio,
         role_weights: &role_weights,
         role_rates: &role_rates,
@@ -363,14 +397,305 @@ pub fn generate_population(config: &PopulationConfig) -> ActorPopulation {
     };
 
     let mut population = ActorPopulation::generate(&mut rng, &spec);
-    let start_time = Utc::now();
+    population.actors.extend(explicit);
     apply_timezone_distribution(
         &mut population,
         config.timezone_distribution.as_ref(),
         start_time,
         &mut rng,
     );
-    population
+    Ok(population)
+}
+
+fn build_explicit_actors(
+    rng: &mut impl Rng,
+    entries: Option<&Vec<ExplicitActorConfig>>,
+    human_error: ErrorRateSpec,
+    service_error: ErrorRateSpec,
+    account_ids: &[String],
+    start_time: DateTime<Utc>,
+) -> Result<Vec<ActorSeed>, ActorConfigError> {
+    let Some(entries) = entries else {
+        return Ok(Vec::new());
+    };
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut actors = Vec::with_capacity(entries.len());
+    let mut ids = HashSet::new();
+    for entry in entries {
+        let id = entry.id.trim();
+        if id.is_empty() {
+            return Err(ActorConfigError(
+                "population.actor id must be non-empty".to_string(),
+            ));
+        }
+        if !ids.insert(id.to_string()) {
+            return Err(ActorConfigError(format!(
+                "population.actor id is duplicated: {id}"
+            )));
+        }
+
+        let kind = parse_actor_kind(&entry.kind, id)?;
+        let events_per_hour = require_events_per_hour(entry.events_per_hour, id)?;
+        let error_rate = match entry.error_rate {
+            Some(rate) => validate_error_rate(rate, id)?,
+            None => match kind {
+                ActorKind::Human => sample_error_rate(rng, human_error),
+                ActorKind::Service => sample_error_rate(rng, service_error),
+            },
+        };
+        let account_id = match &entry.account_id {
+            Some(value) => validate_account_id(value, id)?,
+            None => pick_account_id(rng, account_ids),
+        };
+        let tags = normalize_tags(&entry.tags);
+        let event_bias = normalize_event_bias(&entry.event_bias);
+
+        let mut actor = match kind {
+            ActorKind::Human => {
+                if entry.service_profile.is_some() {
+                    return Err(ActorConfigError(format!(
+                        "population.actor {id} is human but service_profile is set"
+                    )));
+                }
+                let role_name = entry.role.as_deref().ok_or_else(|| {
+                    ActorConfigError(format!(
+                        "population.actor {id} is human but role is missing"
+                    ))
+                })?;
+                let role = parse_actor_role(role_name, id)?;
+                let mut override_rates = RoleRates::default();
+                match role {
+                    ActorRole::Admin => override_rates.admin = events_per_hour,
+                    ActorRole::Developer => override_rates.developer = events_per_hour,
+                    ActorRole::ReadOnly => override_rates.readonly = events_per_hour,
+                    ActorRole::Auditor => override_rates.auditor = events_per_hour,
+                }
+                let role_weights = vec![(role, 1.0)];
+                let mut seed =
+                    ActorSeed::new_human(rng, &role_weights, &override_rates, &account_id, error_rate);
+                seed.rate_per_hour = events_per_hour;
+                if let Some(identity_type) = &entry.identity_type {
+                    seed.identity_type = identity_type.clone();
+                }
+                if let Some(principal_id) = &entry.principal_id {
+                    seed.principal_id = principal_id.clone();
+                }
+                if let Some(name) = &entry.user_name {
+                    seed.user_name = Some(name.clone());
+                    if entry.arn.is_none() {
+                        seed.arn = format!("arn:aws:iam::{}:user/{}", account_id, name);
+                    }
+                }
+                if let Some(arn) = &entry.arn {
+                    seed.arn = arn.clone();
+                }
+                if let Some(access_key_id) = &entry.access_key_id {
+                    seed.access_key_id = access_key_id.clone();
+                }
+                seed
+            }
+            ActorKind::Service => {
+                if entry.role.is_some() {
+                    return Err(ActorConfigError(format!(
+                        "population.actor {id} is service but role is set"
+                    )));
+                }
+                if entry.user_name.is_some() {
+                    return Err(ActorConfigError(format!(
+                        "population.actor {id} is service but user_name is set"
+                    )));
+                }
+                let profile_name = entry.service_profile.as_deref().ok_or_else(|| {
+                    ActorConfigError(format!(
+                        "population.actor {id} is service but service_profile is missing"
+                    ))
+                })?;
+                let profile = parse_service_profile(profile_name, id)?;
+                let pattern = entry
+                    .service_pattern
+                    .as_ref()
+                    .map(service_pattern_from_config)
+                    .unwrap_or(ServicePattern::Constant);
+                let mut seed =
+                    ActorSeed::new_service(rng, &account_id, profile, pattern, events_per_hour, error_rate);
+                if let Some(identity_type) = &entry.identity_type {
+                    seed.identity_type = identity_type.clone();
+                }
+                if let Some(principal_id) = &entry.principal_id {
+                    seed.principal_id = principal_id.clone();
+                }
+                if let Some(arn) = &entry.arn {
+                    seed.arn = arn.clone();
+                }
+                if let Some(access_key_id) = &entry.access_key_id {
+                    seed.access_key_id = access_key_id.clone();
+                }
+                seed
+            }
+        };
+
+        if let Some(user_agents) = &entry.user_agents {
+            let list = normalize_string_list(user_agents, id, "user_agents")?;
+            actor.user_agents = list;
+        }
+        if let Some(source_ips) = &entry.source_ips {
+            let list = normalize_string_list(source_ips, id, "source_ips")?;
+            actor.source_ips = list;
+        }
+        if let Some(active_start) = entry.active_start_hour {
+            if active_start > 23 {
+                return Err(ActorConfigError(format!(
+                    "population.actor {id} active_start_hour must be 0-23"
+                )));
+            }
+            actor.active_start_hour = active_start;
+        }
+        if let Some(active_hours) = entry.active_hours {
+            if active_hours == 0 || active_hours > 24 {
+                return Err(ActorConfigError(format!(
+                    "population.actor {id} active_hours must be 1-24"
+                )));
+            }
+            actor.active_hours = active_hours;
+        }
+        if let Some(weekend_active) = entry.weekend_active {
+            actor.weekend_active = weekend_active;
+        }
+        if let Some(timezone) = &entry.timezone {
+            let offset = timezone_offset_for_name(timezone, start_time, id)?;
+            actor.timezone_offset = offset;
+            actor.timezone_fixed = true;
+        }
+
+        actor.id = Some(id.to_string());
+        actor.tags = tags;
+        actor.event_bias = event_bias;
+        actors.push(actor);
+    }
+
+    Ok(actors)
+}
+
+fn parse_actor_kind(value: &str, id: &str) -> Result<ActorKind, ActorConfigError> {
+    match value.trim().to_lowercase().as_str() {
+        "human" => Ok(ActorKind::Human),
+        "service" => Ok(ActorKind::Service),
+        other => Err(ActorConfigError(format!(
+            "population.actor {id} has invalid kind: {other}"
+        ))),
+    }
+}
+
+fn parse_actor_role(value: &str, id: &str) -> Result<ActorRole, ActorConfigError> {
+    match value.trim().to_lowercase().as_str() {
+        "admin" => Ok(ActorRole::Admin),
+        "developer" => Ok(ActorRole::Developer),
+        "readonly" => Ok(ActorRole::ReadOnly),
+        "auditor" => Ok(ActorRole::Auditor),
+        other => Err(ActorConfigError(format!(
+            "population.actor {id} has invalid role: {other}"
+        ))),
+    }
+}
+
+fn parse_service_profile(value: &str, id: &str) -> Result<ServiceProfile, ActorConfigError> {
+    normalize_profile_name(value).ok_or_else(|| {
+        ActorConfigError(format!(
+            "population.actor {id} has invalid service_profile: {value}"
+        ))
+    })
+}
+
+fn require_events_per_hour(
+    value: Option<f64>,
+    id: &str,
+) -> Result<f64, ActorConfigError> {
+    let rate = value.ok_or_else(|| {
+        ActorConfigError(format!(
+            "population.actor {id} is missing events_per_hour"
+        ))
+    })?;
+    if !rate.is_finite() || rate <= 0.0 {
+        return Err(ActorConfigError(format!(
+            "population.actor {id} events_per_hour must be > 0"
+        )));
+    }
+    Ok(rate)
+}
+
+fn validate_error_rate(rate: f64, id: &str) -> Result<f64, ActorConfigError> {
+    if !rate.is_finite() || rate < 0.0 || rate > 1.0 {
+        return Err(ActorConfigError(format!(
+            "population.actor {id} error_rate must be between 0.0 and 1.0"
+        )));
+    }
+    Ok(rate)
+}
+
+fn validate_account_id(value: &str, id: &str) -> Result<String, ActorConfigError> {
+    let trimmed = value.trim();
+    let valid = trimmed.len() == 12 && trimmed.chars().all(|c| c.is_ascii_digit());
+    if !valid {
+        return Err(ActorConfigError(format!(
+            "population.actor {id} account_id must be a 12-digit string"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_string_list(
+    list: &[String],
+    id: &str,
+    field: &str,
+) -> Result<Vec<String>, ActorConfigError> {
+    let mut values: Vec<String> = list.iter().map(|value| value.trim().to_string()).collect();
+    values.retain(|value| !value.is_empty());
+    if values.is_empty() {
+        return Err(ActorConfigError(format!(
+            "population.actor {id} {field} must contain at least one value"
+        )));
+    }
+    Ok(values)
+}
+
+fn normalize_tags(tags: &[String]) -> Vec<String> {
+    let mut values: Vec<String> = tags.iter().map(|tag| tag.trim().to_string()).collect();
+    values.retain(|tag| !tag.is_empty());
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn normalize_event_bias(bias: &HashMap<String, f64>) -> HashMap<String, f64> {
+    let mut cleaned = HashMap::new();
+    for (name, weight) in bias {
+        let name = name.trim();
+        if name.is_empty() || !weight.is_finite() || *weight <= 0.0 {
+            continue;
+        }
+        cleaned.insert(name.to_string(), *weight);
+    }
+    cleaned
+}
+
+fn timezone_offset_for_name(
+    value: &str,
+    start_time: DateTime<Utc>,
+    id: &str,
+) -> Result<i8, ActorConfigError> {
+    let tz = Tz::from_str(value.trim()).map_err(|_| {
+        ActorConfigError(format!(
+            "population.actor {id} timezone must be a valid IANA name"
+        ))
+    })?;
+    let offset_seconds = tz
+        .offset_from_utc_datetime(&start_time.naive_utc())
+        .fix()
+        .local_minus_utc();
+    Ok((offset_seconds as f64 / 3600.0).round() as i8)
 }
 
 impl ActorSeed {
@@ -395,6 +720,7 @@ impl ActorSeed {
         Self {
             kind: ActorKind::Human,
             role: Some(role),
+            id: None,
             identity_type: "IAMUser".to_string(),
             principal_id,
             arn,
@@ -402,6 +728,8 @@ impl ActorSeed {
             access_key_id,
             rate_per_hour,
             error_rate,
+            tags: Vec::new(),
+            event_bias: HashMap::new(),
             service_profile: None,
             service_pattern: None,
             user_name: Some(user_name),
@@ -410,6 +738,7 @@ impl ActorSeed {
             active_start_hour,
             active_hours,
             timezone_offset,
+            timezone_fixed: false,
             weekend_active,
         }
     }
@@ -436,6 +765,7 @@ impl ActorSeed {
         Self {
             kind: ActorKind::Service,
             role: None,
+            id: None,
             identity_type: "AssumedRole".to_string(),
             principal_id,
             arn,
@@ -443,6 +773,8 @@ impl ActorSeed {
             access_key_id,
             rate_per_hour,
             error_rate,
+            tags: Vec::new(),
+            event_bias: HashMap::new(),
             service_profile: Some(profile),
             service_pattern: Some(pattern),
             user_name: None,
@@ -451,6 +783,7 @@ impl ActorSeed {
             active_start_hour,
             active_hours,
             timezone_offset: 0,
+            timezone_fixed: false,
             weekend_active: true,
         }
     }
@@ -761,6 +1094,9 @@ fn apply_timezone_distribution(
     };
 
     for actor in &mut population.actors {
+        if actor.timezone_fixed {
+            continue;
+        }
         let choice = index.sample(rng);
         actor.timezone_offset = offsets[choice];
     }

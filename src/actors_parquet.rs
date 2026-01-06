@@ -17,6 +17,7 @@ use crate::core::actors::{
     ActorKind, ActorPopulation, ActorRole, ActorSeed, RoleRates, ServicePattern, ServiceProfile,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -44,6 +45,9 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
     let mut service_profile_builder = StringBuilder::new();
     let mut service_pattern_builder = StringBuilder::new();
     let mut error_rate_builder = Float64Builder::new();
+    let mut actor_id_builder = StringBuilder::new();
+    let mut tags_builder = StringBuilder::new();
+    let mut event_bias_builder = StringBuilder::new();
 
     for actor in &population.actors {
         kind_builder.append_value(kind_to_str(&actor.kind));
@@ -80,6 +84,21 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
             service_pattern_builder.append_null();
         }
         error_rate_builder.append_value(actor.error_rate);
+        if let Some(id) = &actor.id {
+            actor_id_builder.append_value(id);
+        } else {
+            actor_id_builder.append_null();
+        }
+        if actor.tags.is_empty() {
+            tags_builder.append_null();
+        } else {
+            tags_builder.append_value(encode_string_list(&actor.tags));
+        }
+        if actor.event_bias.is_empty() {
+            event_bias_builder.append_null();
+        } else {
+            event_bias_builder.append_value(encode_event_bias(&actor.event_bias));
+        }
     }
 
     let batch = RecordBatch::try_new(
@@ -103,6 +122,9 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
             Arc::new(service_profile_builder.finish()),
             Arc::new(service_pattern_builder.finish()),
             Arc::new(error_rate_builder.finish()),
+            Arc::new(actor_id_builder.finish()),
+            Arc::new(tags_builder.finish()),
+            Arc::new(event_bias_builder.finish()),
         ],
     )
     .map_err(map_arrow_err)?;
@@ -150,6 +172,9 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
     let service_profile = column_as_string_optional_fallback(batch, 15)?;
     let service_pattern = column_as_string_optional_fallback(batch, 16)?;
     let error_rate = column_as_f64_optional_fallback(batch, 17)?;
+    let actor_id = column_as_string_optional_fallback(batch, 18)?;
+    let tags = column_as_string_optional_fallback(batch, 19)?;
+    let event_bias = column_as_string_optional_fallback(batch, 20)?;
 
     let mut actors = Vec::with_capacity(batch.num_rows());
     for idx in 0..batch.num_rows() {
@@ -189,10 +214,21 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
         if !resolved_error_rate.is_finite() || resolved_error_rate < 0.0 {
             resolved_error_rate = fallback_error_rate(&kind);
         }
+        let tags = tags
+            .get(idx)
+            .and_then(|value| value.as_deref())
+            .map(parse_optional_string_list)
+            .unwrap_or_default();
+        let event_bias = event_bias
+            .get(idx)
+            .and_then(|value| value.as_deref())
+            .map(parse_event_bias)
+            .unwrap_or_default();
 
         let seed = ActorSeed {
             kind,
             role,
+            id: actor_id.get(idx).and_then(|value| value.clone()),
             identity_type: identity_type[idx].clone(),
             principal_id: principal_id[idx].clone(),
             arn: arn[idx].clone(),
@@ -203,6 +239,8 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
                 .unwrap_or_else(|| fallback_access_key_id(&identity_type[idx], &principal_id[idx])),
             rate_per_hour: resolved_rate,
             error_rate: resolved_error_rate,
+            tags,
+            event_bias,
             service_profile: resolved_profile,
             service_pattern: resolved_pattern,
             user_name: user_name.get(idx).cloned().flatten(),
@@ -211,6 +249,7 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
             active_start_hour: i16_to_u8(active_start[idx], "active_start_hour")?,
             active_hours: i16_to_u8(active_hours[idx], "active_hours")?,
             timezone_offset: timezone_offset[idx],
+            timezone_fixed: false,
             weekend_active: weekend_active[idx],
         };
         actors.push(seed);
@@ -239,6 +278,9 @@ fn build_schema() -> SchemaRef {
         Field::new("service_profile", DataType::Utf8, true),
         Field::new("service_pattern", DataType::Utf8, true),
         Field::new("error_rate", DataType::Float64, false),
+        Field::new("actor_id", DataType::Utf8, true),
+        Field::new("tags", DataType::Utf8, true),
+        Field::new("event_bias", DataType::Utf8, true),
     ];
 
     Arc::new(Schema::new(fields))
@@ -320,6 +362,10 @@ fn encode_string_list(values: &[String]) -> String {
     serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
 }
 
+fn encode_event_bias(values: &HashMap<String, f64>) -> String {
+    serde_json::to_string(values).unwrap_or_else(|_| "{}".to_string())
+}
+
 fn parse_string_list(value: &str, field: &str) -> io::Result<Vec<String>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -347,6 +393,59 @@ fn parse_string_list(value: &str, field: &str) -> io::Result<Vec<String>> {
     }
 
     Ok(vec![trimmed.to_string()])
+}
+
+fn parse_optional_string_list(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if trimmed.starts_with('[') {
+        if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(trimmed) {
+            return items
+                .into_iter()
+                .filter_map(|item| {
+                    if let Value::String(value) = item {
+                        let trimmed = value.trim().to_string();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+    }
+    vec![trimmed.to_string()]
+}
+
+fn parse_event_bias(value: &str) -> HashMap<String, f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return HashMap::new();
+    }
+    let parsed = serde_json::from_str::<Value>(trimmed).ok();
+    let Some(Value::Object(map)) = parsed else {
+        return HashMap::new();
+    };
+    let mut bias = HashMap::new();
+    for (key, value) in map {
+        let Some(weight) = value.as_f64() else {
+            continue;
+        };
+        if !weight.is_finite() || weight <= 0.0 {
+            continue;
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        bias.insert(key.to_string(), weight);
+    }
+    bias
 }
 
 fn column_as_string_optional_fallback(

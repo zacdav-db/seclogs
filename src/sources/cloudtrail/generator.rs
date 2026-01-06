@@ -153,13 +153,17 @@ fn load_actor_profiles(
 
 impl CloudTrailGenerator {
     fn pick_event_for_actor(&mut self, actor_index: usize, now: DateTime<Utc>) -> String {
-        let (kind, last_event, service_profile) = {
+        {
             let actor = &mut self.actors[actor_index];
             actor.ensure_session(now, &mut self.rng);
+        }
+        let (kind, last_event, service_profile, event_bias) = {
+            let actor = &self.actors[actor_index];
             (
                 actor.seed.kind.clone(),
                 actor.last_event.clone(),
                 actor.seed.service_profile.clone(),
+                actor.seed.event_bias.clone(),
             )
         };
 
@@ -173,13 +177,17 @@ impl CloudTrailGenerator {
             }
         };
 
-        let event = self.pick_weighted_event(&candidates);
+        let event = self.pick_weighted_event(&candidates, &event_bias);
         let actor = &mut self.actors[actor_index];
         actor.last_event = Some(event.clone());
         event
     }
 
-    fn pick_weighted_event(&mut self, candidates: &[(String, f64)]) -> String {
+    fn pick_weighted_event(
+        &mut self,
+        candidates: &[(String, f64)],
+        event_bias: &HashMap<String, f64>,
+    ) -> String {
         let mut names = Vec::new();
         let mut weights = Vec::new();
 
@@ -189,7 +197,13 @@ impl CloudTrailGenerator {
             }
             let base = *self.event_weights.get(name).unwrap_or(&1.0);
             names.push(name.clone());
-            weights.push(base * *weight);
+            let mut combined = base * *weight;
+            if let Some(bias) = event_bias.get(name) {
+                if bias.is_finite() && *bias > 0.0 {
+                    combined *= *bias;
+                }
+            }
+            weights.push(combined);
         }
 
         if names.is_empty() {

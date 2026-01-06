@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -165,6 +166,8 @@ pub struct PopulationActorsConfig {
     #[serde(rename = "service_events_per_hour", alias = "service_rate_per_hour")]
     pub service_events_per_hour: Option<f64>,
     pub service_profiles: Option<Vec<ServiceProfileConfig>>,
+    /// Explicit actors with fixed traits and overrides.
+    pub actor: Option<Vec<ExplicitActorConfig>>,
 }
 
 /// Per-role configuration entry.
@@ -173,6 +176,34 @@ pub struct RoleConfig {
     pub name: String,
     pub weight: f64,
     pub events_per_hour: f64,
+}
+
+/// Explicit actor overrides for population generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplicitActorConfig {
+    pub id: String,
+    pub kind: String,
+    pub role: Option<String>,
+    pub service_profile: Option<String>,
+    pub service_pattern: Option<ServicePatternConfig>,
+    pub events_per_hour: Option<f64>,
+    pub error_rate: Option<f64>,
+    pub account_id: Option<String>,
+    pub user_name: Option<String>,
+    pub principal_id: Option<String>,
+    pub arn: Option<String>,
+    pub access_key_id: Option<String>,
+    pub identity_type: Option<String>,
+    pub timezone: Option<String>,
+    pub active_start_hour: Option<u8>,
+    pub active_hours: Option<u8>,
+    pub weekend_active: Option<bool>,
+    pub user_agents: Option<Vec<String>>,
+    pub source_ips: Option<Vec<String>>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub event_bias: HashMap<String, f64>,
 }
 
 /// Error rate range configuration for actor populations.

@@ -78,3 +78,37 @@ name = "metrics_collector"
 weight = 0.15
 events_per_hour = 8.0
 pattern = "diurnal"
+
+# Explicit actors with fixed traits and behavior overrides.
+[[population.actor]]
+id = "human-mal-001"
+kind = "human"
+role = "admin"
+events_per_hour = 42.0
+error_rate = 0.18
+timezone = "Europe/London"
+active_start_hour = 8
+active_hours = 10
+weekend_active = false
+user_name = "n.rogue"
+account_id = "123456789012"
+user_agents = [
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+  "curl/8.5.0",
+]
+source_ips = ["203.0.113.45", "198.51.100.23"]
+tags = ["malicious"]
+event_bias = { "ConsoleLogin" = 3.0, "AssumeRole" = 2.0 }
+
+[[population.actor]]
+id = "svc-exfil-01"
+kind = "service"
+service_profile = "datalake_bot"
+service_pattern = "constant"
+events_per_hour = 120.0
+error_rate = 0.02
+account_id = "123456789012"
+user_agents = ["aws-sdk-java/1.12.603"]
+source_ips = ["10.32.1.14"]
+tags = ["malicious", "high-volume"]
+event_bias = { "GetObject" = 4.0, "ListBuckets" = 2.0, "Decrypt" = 1.5 }
