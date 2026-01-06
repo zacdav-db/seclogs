@@ -5,8 +5,8 @@ use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
 use crate::config::{
-    ErrorRateConfig, ErrorRateDistribution, PopulationActorsConfig, PopulationConfig, RoleRate,
-    RoleWeight, ServicePatternConfig, ServiceProfileConfig, TimezoneWeight,
+    ErrorRateConfig, ErrorRateDistribution, PopulationActorsConfig, PopulationConfig, RoleConfig,
+    ServicePatternConfig, ServiceProfileConfig, TimezoneWeight,
 };
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -19,7 +19,7 @@ pub enum ActorKind {
 }
 
 /// Role label applied to human actors.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorRole {
     Admin,
     Developer,
@@ -333,10 +333,12 @@ pub fn generate_population(config: &PopulationConfig) -> ActorPopulation {
     let service_ratio = population.service_ratio.unwrap_or(0.2).clamp(0.0, 1.0);
     let hot_actor_ratio = population.hot_actor_ratio.unwrap_or(0.1).clamp(0.0, 1.0);
     let hot_actor_multiplier = population.hot_actor_multiplier.unwrap_or(6.0).max(1.0);
-    let role_weights = build_role_weights(population.role_distribution.as_ref());
-    let role_rates = build_role_rates(population.role_rates_per_hour.as_ref());
+    let (role_weights, role_rates) = build_role_config(population.role.as_ref());
     let account_ids = build_account_pool(population);
-    let service_rate = population.service_rate_per_hour.unwrap_or(6.0).max(0.1);
+    let service_rate = population
+        .service_events_per_hour
+        .unwrap_or(6.0)
+        .max(0.1);
     let service_profiles =
         build_service_profiles(population.service_profiles.as_ref(), service_rate);
     let baseline_error = error_rate_spec(
@@ -531,24 +533,21 @@ fn build_account_pool(config: &PopulationActorsConfig) -> Vec<String> {
     (0..count).map(|_| random_account_id(&mut rng)).collect()
 }
 
-fn build_role_weights(config: Option<&Vec<RoleWeight>>) -> Vec<(ActorRole, f64)> {
-    let defaults = vec![
+fn build_role_config(config: Option<&Vec<RoleConfig>>) -> (Vec<(ActorRole, f64)>, RoleRates) {
+    let mut weights = vec![
         (ActorRole::Admin, 0.15),
         (ActorRole::Developer, 0.55),
         (ActorRole::ReadOnly, 0.25),
         (ActorRole::Auditor, 0.05),
     ];
+    let mut rates = RoleRates::default();
 
     let entries = match config {
         Some(list) if !list.is_empty() => list,
-        _ => return defaults,
+        _ => return (weights, rates),
     };
 
-    let mut parsed = Vec::new();
     for entry in entries {
-        if !entry.weight.is_finite() || entry.weight <= 0.0 {
-            continue;
-        }
         let role = match entry.name.as_str() {
             "admin" => ActorRole::Admin,
             "developer" => ActorRole::Developer,
@@ -556,38 +555,24 @@ fn build_role_weights(config: Option<&Vec<RoleWeight>>) -> Vec<(ActorRole, f64)>
             "auditor" => ActorRole::Auditor,
             _ => continue,
         };
-        parsed.push((role, entry.weight));
-    }
-
-    if parsed.is_empty() {
-        defaults
-    } else {
-        parsed
-    }
-}
-
-fn build_role_rates(config: Option<&Vec<RoleRate>>) -> RoleRates {
-    let mut rates = RoleRates::default();
-
-    let entries = match config {
-        Some(list) if !list.is_empty() => list,
-        _ => return rates,
-    };
-
-    for entry in entries {
-        if !entry.rate_per_hour.is_finite() || entry.rate_per_hour <= 0.0 {
-            continue;
+        let weight = entry.weight;
+        if weight.is_finite() && weight > 0.0 {
+            if let Some(slot) = weights.iter_mut().find(|(r, _)| *r == role) {
+                slot.1 = weight;
+            }
         }
-        match entry.name.as_str() {
-            "admin" => rates.admin = entry.rate_per_hour,
-            "developer" => rates.developer = entry.rate_per_hour,
-            "readonly" => rates.readonly = entry.rate_per_hour,
-            "auditor" => rates.auditor = entry.rate_per_hour,
-            _ => {}
+        let rate = entry.events_per_hour;
+        if rate.is_finite() && rate > 0.0 {
+            match role {
+                ActorRole::Admin => rates.admin = rate,
+                ActorRole::Developer => rates.developer = rate,
+                ActorRole::ReadOnly => rates.readonly = rate,
+                ActorRole::Auditor => rates.auditor = rate,
+            }
         }
     }
 
-    rates
+    (weights, rates)
 }
 
 fn build_service_profiles(
@@ -608,7 +593,7 @@ fn build_service_profiles(
             Some(profile) => profile,
             None => continue,
         };
-        let rate = entry.rate_per_hour.unwrap_or(fallback_rate).max(0.1);
+        let rate = entry.events_per_hour.unwrap_or(fallback_rate).max(0.1);
         let pattern = entry
             .pattern
             .as_ref()

@@ -38,7 +38,7 @@ service_ratio = 0.25 # Share of service actors (0.0–1.0).
 hot_actor_ratio = 0.12 # Share of hot actors.
 hot_actor_multiplier = 6.0 # Rate multiplier for hot actors.
 account_count = 1 # Generate this many random account IDs if none provided.
-service_rate_per_hour = 6.0 # Default rate for services.
+service_events_per_hour = 6.0 # Default events/hour for services.
 
 [population.error_rate]
 min = 0.01 # Min per-actor error probability.
@@ -55,18 +55,15 @@ min = 0.005
 max = 0.02
 distribution = "uniform"
 
-[[population.role_distribution]]
+[[population.role]]
 name = "admin"
 weight = 0.15 # Higher means more admins in the population.
-
-[[population.role_rates_per_hour]]
-name = "admin"
-rate_per_hour = 24.0 # Baseline activity rate.
+events_per_hour = 24.0 # Baseline activity rate.
 
 [[population.service_profiles]]
 name = "datalake_bot"
 weight = 0.4 # Higher means more actors of this profile.
-rate_per_hour = 30.0 # Overrides service_rate_per_hour.
+events_per_hour = 30.0 # Overrides service_events_per_hour.
 pattern = "constant" # constant, diurnal, or bursty.
 ```
 
@@ -87,17 +84,16 @@ pattern = "constant" # constant, diurnal, or bursty.
 | `population.error_rate` | table | no | defaults | Sets baseline per-actor error probability range. |
 | `population.human_error_rate` | table | no | baseline | Overrides baseline for humans (often higher auth errors). |
 | `population.service_error_rate` | table | no | baseline | Overrides baseline for services (often lower). |
-| `population.role_distribution` | table[] | no | defaults | Changes the mix of human roles, affecting event types. |
-| `population.role_rates_per_hour` | table[] | no | defaults | Adjusts per-role throughput and session density. |
-| `population.service_rate_per_hour` | float | no | 6.0 | Sets default throughput for services. |
+| `population.role` | table[] | no | defaults | Defines role weights and per-role throughput overrides. |
+| `population.service_events_per_hour` | float | no | 6.0 | Sets default throughput for services. |
 | `population.service_profiles` | table[] | no | none | Controls service profile mix and event families. |
 
-### Role distribution entries
+### Role entries
 | Path | Type | Required | Effect |
 | --- | --- | --- | --- |
-| `population.role_distribution.name` | string | yes | Selects which role to weight. |
-| `population.role_distribution.weight` | float | yes | Higher weight yields more of that role. |
-Valid role names: `admin`, `developer`, `readonly`, `auditor`.
+| `population.role.name` | string | yes | Selects which role to configure: `admin`, `developer`, `readonly`, `auditor`. |
+| `population.role.weight` | float | yes | Higher weight yields more of that role. |
+| `population.role.events_per_hour` | float | yes | Baseline events/hour for that role. |
 
 ### Role meanings
 - `admin`: IAM and security changes, higher propensity for privileged actions (e.g. users, roles, access keys).
@@ -105,19 +101,12 @@ Valid role names: `admin`, `developer`, `readonly`, `auditor`.
 - `readonly`: Mostly read‑only API calls (describe/list/get), lower mutation rate.
 - `auditor`: Read‑heavy with frequent logging/monitoring API usage.
 
-### Role rate entries
-| Path | Type | Required | Effect |
-| --- | --- | --- | --- |
-| `population.role_rates_per_hour.name` | string | yes | Selects which role rate to override. |
-| `population.role_rates_per_hour.rate_per_hour` | float | yes | Baseline events/hour for that role. |
-Valid role names: `admin`, `developer`, `readonly`, `auditor`.
-
 ### Service profile entries
 | Path | Type | Required | Effect |
 | --- | --- | --- | --- |
 | `population.service_profiles.name` | string | yes | Chooses the service behavior profile. |
 | `population.service_profiles.weight` | float | yes | Higher weight increases share of that profile. |
-| `population.service_profiles.rate_per_hour` | float | no | Overrides default service rate for this profile. |
+| `population.service_profiles.events_per_hour` | float | no | Overrides `population.service_events_per_hour` for this profile. |
 | `population.service_profiles.pattern` | string | no | Shapes activity over time (steady vs. diurnal vs. bursts). |
 
 ### Error rate entries
@@ -141,10 +130,10 @@ time_scale = 100.0 # 100x faster than real time.
 [output]
 dir = "./out-test" # Output directory.
 
-[output.rotation]
-target_size_mb = 50 # Rotate when buffer hits ~50 MB.
+[output.files]
+target_size_mb = 50 # Start a new file at ~50 MB.
 flush_interval_ms = 1000 # Flush buffers at least every 1s.
-max_age_seconds = 30 # Rotate even if size not reached.
+max_age_seconds = 30 # Start a new file even if size not reached.
 
 [output.format]
 type = "jsonl" # jsonl (CloudTrail Records JSON) or parquet.
@@ -167,10 +156,10 @@ region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
 | `traffic.time_scale` | float | no | 1.0 | Increases/decreases how fast simulated time advances. |
 | `[output]` | table | yes | - | Output sink configuration. |
 | `output.dir` | string | yes | - | Output directory for generated files. |
-| `[output.rotation]` | table | yes | - | Rotation controls. |
-| `output.rotation.target_size_mb` | int | yes | - | Lower values create more, smaller files. |
-| `output.rotation.flush_interval_ms` | int | no | 30000 | Shorter interval flushes buffers more often. |
-| `output.rotation.max_age_seconds` | int | no | none | Forces periodic rotation even under low volume. |
+| `[output.files]` | table | yes | - | File output controls. |
+| `output.files.target_size_mb` | int | yes | - | Lower values create more, smaller files. |
+| `output.files.flush_interval_ms` | int | no | 30000 | Shorter interval flushes buffers more often. |
+| `output.files.max_age_seconds` | int | no | none | Forces periodic file rollover under low volume. |
 | `[output.format]` | table | yes | - | Output format selection. |
 | `output.format.type` | string | yes | - | `parquet` (structured) or `jsonl` (CloudTrail Records JSON). |
 | `output.format.compression` | string | no | none | `jsonl` supports `gzip` to write `.json.gz`. |

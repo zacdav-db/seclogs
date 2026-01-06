@@ -97,8 +97,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let counters = WriterCounters::new();
             let (writer_txs, writer_handles) = spawn_writer_shards(
                 &loaded.output.dir,
-                loaded.output.rotation.target_size_mb,
-                loaded.output.rotation.max_age_seconds,
+                loaded.output.files.target_size_mb,
+                loaded.output.files.max_age_seconds,
                 &loaded.output.format,
                 writer_shards,
                 queue_depth,
@@ -108,9 +108,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut last_written_events = 0_u64;
             let mut last_written_bytes = 0_u64;
 
-            let flush_interval = if loaded.output.rotation.max_age_seconds.is_some() {
+            let flush_interval = if loaded.output.files.max_age_seconds.is_some() {
                 Some(Duration::from_secs(1))
-            } else if let Some(ms) = loaded.output.rotation.flush_interval_ms {
+            } else if let Some(ms) = loaded.output.files.flush_interval_ms {
                 Some(Duration::from_millis(ms))
             } else {
                 Some(Duration::from_secs(30))

@@ -74,20 +74,20 @@ pub struct TimezoneWeight {
 pub struct OutputConfig {
     /// Output directory for generated files.
     pub dir: String,
-    /// Rotation and flush settings.
-    pub rotation: RotationConfig,
+    /// File write settings.
+    pub files: FileConfig,
     /// Output format selection.
     pub format: FormatConfig,
 }
 
-/// Controls file rotation and flush behavior.
+/// Controls file output and flush behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RotationConfig {
-    /// Target file size for rotation.
+pub struct FileConfig {
+    /// Target file size before a new file is started.
     pub target_size_mb: u64,
     /// Flush interval for writer buffers.
     pub flush_interval_ms: Option<u64>,
-    /// Maximum age for a file before rotation.
+    /// Maximum age for a file before a new one is started.
     pub max_age_seconds: Option<u64>,
 }
 
@@ -163,17 +163,18 @@ pub struct PopulationActorsConfig {
     pub error_rate: Option<ErrorRateConfig>,
     pub human_error_rate: Option<ErrorRateConfig>,
     pub service_error_rate: Option<ErrorRateConfig>,
-    pub role_distribution: Option<Vec<RoleWeight>>,
-    pub role_rates_per_hour: Option<Vec<RoleRate>>,
-    pub service_rate_per_hour: Option<f64>,
+    pub role: Option<Vec<RoleConfig>>,
+    #[serde(rename = "service_events_per_hour", alias = "service_rate_per_hour")]
+    pub service_events_per_hour: Option<f64>,
     pub service_profiles: Option<Vec<ServiceProfileConfig>>,
 }
 
-/// Per-role event rate in events/hour.
+/// Per-role configuration entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoleRate {
+pub struct RoleConfig {
     pub name: String,
-    pub rate_per_hour: f64,
+    pub weight: f64,
+    pub events_per_hour: f64,
 }
 
 /// Error rate range configuration for actor populations.
@@ -197,7 +198,8 @@ pub enum ErrorRateDistribution {
 pub struct ServiceProfileConfig {
     pub name: String,
     pub weight: f64,
-    pub rate_per_hour: Option<f64>,
+    #[serde(rename = "events_per_hour", alias = "rate_per_hour")]
+    pub events_per_hour: Option<f64>,
     pub pattern: Option<ServicePatternConfig>,
 }
 

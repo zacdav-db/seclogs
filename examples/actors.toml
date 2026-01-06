@@ -18,7 +18,7 @@ service_ratio = 0.20
 hot_actor_ratio = 0.05
 hot_actor_multiplier = 6.0
 account_count = 1
-service_rate_per_hour = 6.0
+service_events_per_hour = 6.0
 
 [population.error_rate]
 min = 0.01
@@ -35,58 +35,46 @@ min = 0.005
 max = 0.02
 distribution = "uniform"
 
-[[population.role_distribution]]
+[[population.role]]
 name = "admin"
 weight = 0.15
+events_per_hour = 24.0
 
-[[population.role_distribution]]
+[[population.role]]
 name = "developer"
 weight = 0.55
+events_per_hour = 18.0
 
-[[population.role_distribution]]
+[[population.role]]
 name = "readonly"
 weight = 0.25
+events_per_hour = 8.0
 
-[[population.role_distribution]]
+[[population.role]]
 name = "auditor"
 weight = 0.05
-
-[[population.role_rates_per_hour]]
-name = "admin"
-rate_per_hour = 24.0
-
-[[population.role_rates_per_hour]]
-name = "developer"
-rate_per_hour = 18.0
-
-[[population.role_rates_per_hour]]
-name = "readonly"
-rate_per_hour = 8.0
-
-[[population.role_rates_per_hour]]
-name = "auditor"
-rate_per_hour = 6.0
+events_per_hour = 6.0
 
 [[population.service_profiles]]
 name = "datalake_bot"
 weight = 0.4
-rate_per_hour = 30.0
+events_per_hour = 30.0
 pattern = "constant"
 
 [[population.service_profiles]]
 name = "ec2_reaper"
 weight = 0.25
-rate_per_hour = 12.0
+events_per_hour = 12.0
 pattern = "bursty"
 
 [[population.service_profiles]]
 name = "logs_shipper"
 weight = 0.2
-rate_per_hour = 20.0
+events_per_hour = 20.0
 pattern = "constant"
 
 [[population.service_profiles]]
 name = "metrics_collector"
 weight = 0.15
-rate_per_hour = 8.0
+events_per_hour = 8.0
 pattern = "diurnal"
