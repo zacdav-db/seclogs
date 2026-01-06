@@ -19,6 +19,25 @@ cargo run --bin seclog -- actors --config examples/actors.toml --output ./actors
 cargo run --bin seclog -- gen --config examples/config.toml --output ./out-test
 ```
 
+## CLI usage
+### `seclog gen`
+| Flag | Required | Default | Effect |
+| --- | --- | --- | --- |
+| `--config` | yes | - | Path to `config.toml`. |
+| `--output` | no | from config | Overrides `output.dir`. |
+| `--dry-run` | no | false | Prints the loaded config and exits. |
+| `--max-events` | no | none | Stops after emitting this many events. |
+| `--max-seconds` | no | none | Stops after this many **wall‑clock seconds** (e.g. `300` for 5 minutes). |
+| `--metrics-interval-ms` | no | 1000 | Metrics print interval in milliseconds. |
+| `--gen-workers` | no | 0 | Number of generator workers (actor‑driven mode forces 1). |
+| `--writer-shards` | no | 0 | Number of writer shards (0 = auto). |
+
+### `seclog actors`
+| Flag | Required | Default | Effect |
+| --- | --- | --- | --- |
+| `--config` | yes | - | Path to `actors.toml`. |
+| `--output` | yes | - | Output Parquet file for the actor population. |
+
 ## actors.toml reference (population generation)
 `actors.toml` controls how the actor population is built and stored as Parquet.
 Error rates are sampled per actor and applied at generation time; error codes and
