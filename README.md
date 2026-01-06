@@ -186,8 +186,8 @@ region_distribution = [0.6, 0.25, 0.15]
 ## DuckDB validation
 Run the analysis scripts against generated Parquet logs:
 ```bash
-duckdb -c ".read scripts/duckdb/01_summary.sql"
-duckdb -c ".read scripts/duckdb/02_sequences.sql"
-duckdb -c ".read scripts/duckdb/03_errors.sql"
-duckdb -c ".read scripts/duckdb/04_actor_chains.sql"
+duckdb -c ".read scripts/duckdb/cloudtrail/parquet/01_summary.sql"
+duckdb -c ".read scripts/duckdb/cloudtrail/parquet/02_sequences.sql"
+duckdb -c ".read scripts/duckdb/cloudtrail/parquet/03_errors.sql"
+duckdb -c ".read scripts/duckdb/cloudtrail/parquet/04_actor_chains.sql"
 ```
