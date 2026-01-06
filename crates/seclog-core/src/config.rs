@@ -122,12 +122,10 @@ pub struct CloudTrailSourceConfig {
     pub custom_events: Option<Vec<EventWeight>>,
     /// Optional path to an actor population Parquet file.
     pub actor_population_path: Option<String>,
-    /// Per-event error injection settings.
-    pub error_rates: Option<Vec<EventErrorConfig>>,
     /// Allowed regions.
     pub regions: Option<Vec<String>>,
     /// Optional region weighting for selection.
-    pub region_distribution: Option<Vec<RegionWeight>>,
+    pub region_distribution: Option<Vec<f64>>,
 }
 
 /// Event weight override for a specific event name.
@@ -137,25 +135,9 @@ pub struct EventWeight {
     pub weight: f64,
 }
 
-/// Error injection settings per event name.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventErrorConfig {
-    pub name: String,
-    pub rate: f64,
-    pub code: Option<String>,
-    pub message: Option<String>,
-}
-
 /// Role weight for actor generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleWeight {
-    pub name: String,
-    pub weight: f64,
-}
-
-/// Region weight for event generation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegionWeight {
     pub name: String,
     pub weight: f64,
 }
@@ -187,6 +169,9 @@ pub struct PopulationActorsConfig {
     pub hot_actor_multiplier: Option<f64>,
     pub account_ids: Option<Vec<String>>,
     pub account_count: Option<usize>,
+    pub error_rate: Option<ErrorRateConfig>,
+    pub human_error_rate: Option<ErrorRateConfig>,
+    pub service_error_rate: Option<ErrorRateConfig>,
     pub role_distribution: Option<Vec<RoleWeight>>,
     pub role_rates_per_hour: Option<Vec<RoleRate>>,
     pub service_rate_per_hour: Option<f64>,
@@ -198,6 +183,22 @@ pub struct PopulationActorsConfig {
 pub struct RoleRate {
     pub name: String,
     pub rate_per_hour: f64,
+}
+
+/// Error rate range configuration for actor populations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorRateConfig {
+    pub min: f64,
+    pub max: f64,
+    pub distribution: Option<ErrorRateDistribution>,
+}
+
+/// Distribution used to sample error rates within a range.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorRateDistribution {
+    Uniform,
+    Normal,
 }
 
 /// Service actor profile distribution.

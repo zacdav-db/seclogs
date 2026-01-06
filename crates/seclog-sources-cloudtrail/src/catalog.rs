@@ -152,7 +152,6 @@ mod tests {
             curated: true,
             custom_events: None,
             actor_population_path: None,
-            error_rates: None,
             regions: None,
             region_distribution: None,
         };
@@ -170,7 +169,6 @@ mod tests {
                 weight: 3.0,
             }]),
             actor_population_path: None,
-            error_rates: None,
             regions: None,
             region_distribution: None,
         };
@@ -192,7 +190,6 @@ mod tests {
                 weight: 1.2,
             }]),
             actor_population_path: None,
-            error_rates: None,
             regions: None,
             region_distribution: None,
         };

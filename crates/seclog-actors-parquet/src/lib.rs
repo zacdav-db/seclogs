@@ -43,6 +43,7 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
     let mut rate_per_hour_builder = Float64Builder::new();
     let mut service_profile_builder = StringBuilder::new();
     let mut service_pattern_builder = StringBuilder::new();
+    let mut error_rate_builder = Float64Builder::new();
 
     for actor in &population.actors {
         kind_builder.append_value(kind_to_str(&actor.kind));
@@ -78,6 +79,7 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
         } else {
             service_pattern_builder.append_null();
         }
+        error_rate_builder.append_value(actor.error_rate);
     }
 
     let batch = RecordBatch::try_new(
@@ -100,6 +102,7 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
             Arc::new(rate_per_hour_builder.finish()),
             Arc::new(service_profile_builder.finish()),
             Arc::new(service_pattern_builder.finish()),
+            Arc::new(error_rate_builder.finish()),
         ],
     )
     .map_err(map_arrow_err)?;
@@ -146,6 +149,7 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
     let rate_per_hour = column_as_f64_optional_fallback(batch, 14)?;
     let service_profile = column_as_string_optional_fallback(batch, 15)?;
     let service_pattern = column_as_string_optional_fallback(batch, 16)?;
+    let error_rate = column_as_f64_optional_fallback(batch, 17)?;
 
     let mut actors = Vec::with_capacity(batch.num_rows());
     for idx in 0..batch.num_rows() {
@@ -178,6 +182,13 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
         if !resolved_rate.is_finite() || resolved_rate <= 0.0 {
             resolved_rate = fallback_rate_per_hour(&kind, role.as_ref());
         }
+        let mut resolved_error_rate = error_rate
+            .get(idx)
+            .and_then(|value| *value)
+            .unwrap_or_else(|| fallback_error_rate(&kind));
+        if !resolved_error_rate.is_finite() || resolved_error_rate < 0.0 {
+            resolved_error_rate = fallback_error_rate(&kind);
+        }
 
         let seed = ActorSeed {
             kind,
@@ -191,6 +202,7 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
                 .and_then(|value| value.clone())
                 .unwrap_or_else(|| fallback_access_key_id(&identity_type[idx], &principal_id[idx])),
             rate_per_hour: resolved_rate,
+            error_rate: resolved_error_rate,
             service_profile: resolved_profile,
             service_pattern: resolved_pattern,
             user_name: user_name.get(idx).cloned().flatten(),
@@ -226,6 +238,7 @@ fn build_schema() -> SchemaRef {
         Field::new("rate_per_hour", DataType::Float64, false),
         Field::new("service_profile", DataType::Utf8, true),
         Field::new("service_pattern", DataType::Utf8, true),
+        Field::new("error_rate", DataType::Float64, false),
     ];
 
     Arc::new(Schema::new(fields))
@@ -361,6 +374,13 @@ fn fallback_rate_per_hour(kind: &ActorKind, role: Option<&ActorRole>) -> f64 {
             rates.for_role(role)
         }
         ActorKind::Service => 6.0,
+    }
+}
+
+fn fallback_error_rate(kind: &ActorKind) -> f64 {
+    match kind {
+        ActorKind::Human => 0.03,
+        ActorKind::Service => 0.01,
     }
 }
 

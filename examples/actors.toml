@@ -20,6 +20,21 @@ hot_actor_multiplier = 6.0
 account_count = 1
 service_rate_per_hour = 6.0
 
+[population.error_rate]
+min = 0.01
+max = 0.04
+distribution = "uniform"
+
+[population.human_error_rate]
+min = 0.02
+max = 0.06
+distribution = "normal"
+
+[population.service_error_rate]
+min = 0.005
+max = 0.02
+distribution = "uniform"
+
 [[population.role_distribution]]
 name = "admin"
 weight = 0.15

@@ -5,8 +5,8 @@ use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
 use crate::config::{
-    PopulationActorsConfig, PopulationConfig, RoleRate, RoleWeight, ServicePatternConfig,
-    ServiceProfileConfig, TimezoneWeight,
+    ErrorRateConfig, ErrorRateDistribution, PopulationActorsConfig, PopulationConfig, RoleRate,
+    RoleWeight, ServicePatternConfig, ServiceProfileConfig, TimezoneWeight,
 };
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -54,6 +54,7 @@ pub struct ActorSeed {
     pub account_id: String,
     pub access_key_id: String,
     pub rate_per_hour: f64,
+    pub error_rate: f64,
     pub service_profile: Option<ServiceProfile>,
     pub service_pattern: Option<ServicePattern>,
     pub user_name: Option<String>,
@@ -244,6 +245,13 @@ impl RoleRates {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ErrorRateSpec {
+    pub min: f64,
+    pub max: f64,
+    pub distribution: ErrorRateDistribution,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceProfileSpec {
     pub profile: ServiceProfile,
@@ -261,6 +269,8 @@ pub struct PopulationSpec<'a> {
     pub service_profiles: &'a [ServiceProfileSpec],
     pub hot_actor_ratio: f64,
     pub hot_actor_multiplier: f64,
+    pub human_error_rate: ErrorRateSpec,
+    pub service_error_rate: ErrorRateSpec,
     pub account_ids: &'a [String],
 }
 
@@ -275,22 +285,26 @@ impl ActorPopulation {
 
         for _ in 0..human_count {
             let account_id = pick_account_id(rng, spec.account_ids);
+            let error_rate = sample_error_rate(rng, spec.human_error_rate);
             actors.push(ActorSeed::new_human(
                 rng,
                 spec.role_weights,
                 spec.role_rates,
                 &account_id,
+                error_rate,
             ));
         }
         for _ in 0..service_count {
             let account_id = pick_account_id(rng, spec.account_ids);
             let profile = pick_service_profile(rng, spec.service_profiles, spec.service_rate_per_hour);
+            let error_rate = sample_error_rate(rng, spec.service_error_rate);
             actors.push(ActorSeed::new_service(
                 rng,
                 &account_id,
                 profile.profile,
                 profile.pattern,
                 profile.rate_per_hour,
+                error_rate,
             ));
         }
 
@@ -325,6 +339,12 @@ pub fn generate_population(config: &PopulationConfig) -> ActorPopulation {
     let service_rate = population.service_rate_per_hour.unwrap_or(6.0).max(0.1);
     let service_profiles =
         build_service_profiles(population.service_profiles.as_ref(), service_rate);
+    let baseline_error = error_rate_spec(
+        population.error_rate.as_ref(),
+        default_error_rate_spec(),
+    );
+    let human_error = error_rate_spec(population.human_error_rate.as_ref(), baseline_error);
+    let service_error = error_rate_spec(population.service_error_rate.as_ref(), baseline_error);
 
     let spec = PopulationSpec {
         total,
@@ -335,6 +355,8 @@ pub fn generate_population(config: &PopulationConfig) -> ActorPopulation {
         service_profiles: &service_profiles,
         hot_actor_ratio,
         hot_actor_multiplier,
+        human_error_rate: human_error,
+        service_error_rate: service_error,
         account_ids: &account_ids,
     };
 
@@ -355,6 +377,7 @@ impl ActorSeed {
         role_weights: &[(ActorRole, f64)],
         role_rates: &RoleRates,
         account_id: &str,
+        error_rate: f64,
     ) -> Self {
         let user_name = format!("user-{}", random_alpha(rng, 6).to_lowercase());
         let principal_id = format!("AIDA{}", random_alpha(rng, 16));
@@ -376,6 +399,7 @@ impl ActorSeed {
             account_id: account_id.to_string(),
             access_key_id,
             rate_per_hour,
+            error_rate,
             service_profile: None,
             service_pattern: None,
             user_name: Some(user_name),
@@ -394,6 +418,7 @@ impl ActorSeed {
         profile: ServiceProfile,
         pattern: ServicePattern,
         rate_per_hour: f64,
+        error_rate: f64,
     ) -> Self {
         let role_name = format!("svc-role-{}", random_alpha(rng, 4).to_lowercase());
         let session_name = format!("svc-{}", random_alpha(rng, 8));
@@ -415,6 +440,7 @@ impl ActorSeed {
             account_id: account_id.to_string(),
             access_key_id,
             rate_per_hour,
+            error_rate,
             service_profile: Some(profile),
             service_pattern: Some(pattern),
             user_name: None,
@@ -597,6 +623,67 @@ fn build_service_profiles(
     }
 
     profiles
+}
+
+fn default_error_rate_spec() -> ErrorRateSpec {
+    ErrorRateSpec {
+        min: 0.01,
+        max: 0.05,
+        distribution: ErrorRateDistribution::Uniform,
+    }
+}
+
+fn error_rate_spec(config: Option<&ErrorRateConfig>, fallback: ErrorRateSpec) -> ErrorRateSpec {
+    let Some(config) = config else {
+        return fallback;
+    };
+    let mut min = config.min;
+    let mut max = config.max;
+    if !min.is_finite() || !max.is_finite() {
+        return fallback;
+    }
+    min = min.clamp(0.0, 1.0);
+    max = max.clamp(0.0, 1.0);
+    if max < min {
+        std::mem::swap(&mut min, &mut max);
+    }
+    let distribution = config
+        .distribution
+        .clone()
+        .unwrap_or(ErrorRateDistribution::Uniform);
+    ErrorRateSpec {
+        min,
+        max,
+        distribution,
+    }
+}
+
+fn sample_error_rate(rng: &mut impl Rng, spec: ErrorRateSpec) -> f64 {
+    let min = spec.min;
+    let max = spec.max;
+    if (max - min).abs() <= f64::EPSILON {
+        return min;
+    }
+    match spec.distribution {
+        ErrorRateDistribution::Uniform => rng.gen_range(min..=max),
+        ErrorRateDistribution::Normal => {
+            let mean = (min + max) / 2.0;
+            let std = ((max - min) / 6.0).max(0.000_1);
+            for _ in 0..6 {
+                let value = mean + std * standard_normal(rng);
+                if value >= min && value <= max {
+                    return value;
+                }
+            }
+            (mean + std * standard_normal(rng)).clamp(min, max)
+        }
+    }
+}
+
+fn standard_normal(rng: &mut impl Rng) -> f64 {
+    let u1: f64 = rng.gen_range(0.0..1.0);
+    let u2: f64 = rng.gen_range(0.0..1.0);
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
 fn normalize_profile_name(name: &str) -> Option<ServiceProfile> {

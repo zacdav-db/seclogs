@@ -1,15 +1,11 @@
 use crate::catalog::{resolve_event_weights, CatalogError, EventSelector, WeightedEvent};
-use crate::templates::{
-    build_cloudtrail_event, default_error_profile, ActorContext, ErrorProfile,
-};
+use crate::templates::{build_cloudtrail_event, default_error_profile, ActorContext};
 use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use seclog_core::actors::{ActorKind, ActorProfile, ActorRole, ServicePattern, ServiceProfile};
-use seclog_core::config::{
-    CloudTrailSourceConfig, EventErrorConfig, RegionWeight,
-};
+use seclog_core::config::CloudTrailSourceConfig;
 use seclog_core::event::{Actor, Event, EventEnvelope, Outcome};
 use seclog_core::traits::EventSource;
 use seclog_actors_parquet as actor_store;
@@ -24,7 +20,6 @@ pub struct CloudTrailGenerator {
     schedule: BinaryHeap<Reverse<(DateTime<Utc>, usize)>>,
     event_weights: HashMap<String, f64>,
     allowed_events: HashSet<String>,
-    error_profiles: HashMap<String, ErrorProfile>,
     region_selector: RegionSelector,
 }
 
@@ -64,8 +59,6 @@ impl CloudTrailGenerator {
         let mut actors = load_actor_profiles(config)?;
         shuffle_actors(&mut actors, &mut rng);
         let schedule = build_schedule(&actors, start_time, &mut rng);
-        let error_profiles = build_error_profiles(config.error_rates.as_ref());
-
         Ok(Self {
             selector,
             rng,
@@ -73,7 +66,6 @@ impl CloudTrailGenerator {
             schedule,
             event_weights,
             allowed_events,
-            error_profiles,
             region_selector,
         })
     }
@@ -93,15 +85,12 @@ impl EventSource for CloudTrailGenerator {
             let event_time = now.to_rfc3339_opts(SecondsFormat::Millis, true);
 
             let region = self.region_selector.pick(&mut self.rng);
-            let actor_context = {
+            let (actor_context, error_rate) = {
                 let actor = &mut self.actors[actor_index];
-                actor_context(actor, region, &mut self.rng)
+                let error_rate = actor.seed.error_rate;
+                (actor_context(actor, region, &mut self.rng), error_rate)
             };
-            let error_profile = self
-                .error_profiles
-                .get(&event_name)
-                .cloned()
-                .or_else(|| default_error_profile(&event_name));
+            let error_profile = default_error_profile(&event_name);
             let cloudtrail =
                 build_cloudtrail_event(
                     &event_name,
@@ -109,6 +98,7 @@ impl EventSource for CloudTrailGenerator {
                     &mut self.rng,
                     &event_time,
                     error_profile,
+                    error_rate,
                 )
                 .ok()?;
 
@@ -507,37 +497,6 @@ fn auditor_candidates(last: Option<&str>) -> Vec<(String, f64)> {
     }
 }
 
-fn build_error_profiles(config: Option<&Vec<EventErrorConfig>>) -> HashMap<String, ErrorProfile> {
-    let mut map = HashMap::new();
-    if let Some(entries) = config {
-        for entry in entries {
-            if !entry.rate.is_finite() || entry.rate < 0.0 || entry.rate > 1.0 {
-                continue;
-            }
-            let fallback = default_error_profile(&entry.name);
-            let code = entry
-                .code
-                .clone()
-                .or_else(|| fallback.as_ref().map(|profile| profile.code.clone()))
-                .unwrap_or_else(|| "AccessDenied".to_string());
-            let message = entry
-                .message
-                .clone()
-                .or_else(|| fallback.as_ref().map(|profile| profile.message.clone()))
-                .unwrap_or_else(|| "Access denied".to_string());
-            map.insert(
-                entry.name.clone(),
-                ErrorProfile {
-                    rate: entry.rate,
-                    code,
-                    message,
-                },
-            );
-        }
-    }
-    map
-}
-
 fn build_schedule(
     actors: &[ActorProfile],
     start_time: DateTime<Utc>,
@@ -636,7 +595,7 @@ impl RegionSelector {
 
 fn build_region_selector(
     regions: Option<&Vec<String>>,
-    distribution: Option<&Vec<RegionWeight>>,
+    distribution: Option<&Vec<f64>>,
 ) -> RegionSelector {
     let defaults = vec![
         "us-east-1".to_string(),
@@ -660,44 +619,10 @@ fn build_region_selector(
     }
 
     if base_regions.is_empty() {
-        if let Some(list) = distribution {
-            for entry in list {
-                if !entry.weight.is_finite() || entry.weight <= 0.0 {
-                    continue;
-                }
-                let trimmed = entry.name.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if seen.insert(trimmed.to_string()) {
-                    base_regions.push(trimmed.to_string());
-                }
-            }
-        }
-    }
-
-    if base_regions.is_empty() {
         base_regions = defaults;
     }
 
-    let mut weight_map = HashMap::new();
-    if let Some(list) = distribution {
-        for entry in list {
-            if !entry.weight.is_finite() || entry.weight <= 0.0 {
-                continue;
-            }
-            let trimmed = entry.name.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            weight_map.insert(trimmed.to_string(), entry.weight);
-        }
-    }
-
-    let weights: Vec<f64> = base_regions
-        .iter()
-        .map(|region| *weight_map.get(region).unwrap_or(&1.0))
-        .collect();
+    let weights = weights_for_regions(&base_regions, distribution);
 
     let index = WeightedIndex::new(weights).unwrap_or_else(|_| {
         let weights = vec![1.0; base_regions.len()];
@@ -708,6 +633,27 @@ fn build_region_selector(
         regions: base_regions,
         weights: index,
     }
+}
+
+fn weights_for_regions(
+    regions: &[String],
+    distribution: Option<&Vec<f64>>,
+) -> Vec<f64> {
+    let Some(distribution) = distribution else {
+        return vec![1.0; regions.len()];
+    };
+    if distribution.len() != regions.len() {
+        return vec![1.0; regions.len()];
+    }
+    let mut weights = Vec::with_capacity(regions.len());
+    for weight in distribution {
+        if weight.is_finite() && *weight > 0.0 {
+            weights.push(*weight);
+        } else {
+            weights.push(1.0);
+        }
+    }
+    weights
 }
 
 fn shuffle_actors(actors: &mut [ActorProfile], rng: &mut impl Rng) {

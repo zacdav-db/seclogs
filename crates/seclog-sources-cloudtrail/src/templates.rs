@@ -20,7 +20,6 @@ pub struct ActorContext {
 
 #[derive(Debug, Clone)]
 pub struct ErrorProfile {
-    pub rate: f64,
     pub code: String,
     pub message: String,
 }
@@ -46,6 +45,7 @@ pub fn build_cloudtrail_event(
     rng: &mut impl Rng,
     event_time: &str,
     error_profile: Option<ErrorProfile>,
+    error_rate: f64,
 ) -> Result<CloudTrailEvent, TemplateError> {
     if event_name.trim().is_empty() {
         return Err(TemplateError::EmptyEventName);
@@ -64,7 +64,7 @@ pub fn build_cloudtrail_event(
         _ => generic_event(base, event_name),
     };
 
-    Ok(apply_error(event, rng, error_profile))
+    Ok(apply_error(event, rng, error_profile, error_rate))
 }
 
 struct BaseFields {
@@ -399,13 +399,15 @@ pub fn apply_error(
     mut event: CloudTrailEvent,
     rng: &mut impl Rng,
     profile: Option<ErrorProfile>,
+    error_rate: f64,
 ) -> CloudTrailEvent {
     let profile = match profile {
         Some(profile) => profile,
         None => return event,
     };
 
-    if rng.gen_bool(profile.rate) {
+    let rate = error_rate.clamp(0.0, 1.0);
+    if rng.gen_bool(rate) {
         event.error_code = Some(profile.code);
         event.error_message = Some(profile.message);
         if event.event_name == "ConsoleLogin" {
@@ -423,32 +425,26 @@ pub fn apply_error(
 pub fn default_error_profile(event_name: &str) -> Option<ErrorProfile> {
     let profile = match event_name {
         "ConsoleLogin" => ErrorProfile {
-            rate: 0.08,
             code: "SigninFailure".to_string(),
             message: "Failed authentication".to_string(),
         },
         "GetSessionToken" => ErrorProfile {
-            rate: 0.05,
             code: "AccessDenied".to_string(),
             message: "Invalid MFA token".to_string(),
         },
         "AssumeRole" => ErrorProfile {
-            rate: 0.03,
             code: "AccessDenied".to_string(),
             message: "Not authorized to assume role".to_string(),
         },
         "PutObject" | "GetObject" => ErrorProfile {
-            rate: 0.02,
             code: "AccessDenied".to_string(),
             message: "Access denied".to_string(),
         },
         "RunInstances" => ErrorProfile {
-            rate: 0.02,
             code: "UnauthorizedOperation".to_string(),
             message: "Not authorized to perform operation".to_string(),
         },
         _ => ErrorProfile {
-            rate: 0.01,
             code: "AccessDenied".to_string(),
             message: "Access denied".to_string(),
         },
@@ -483,6 +479,7 @@ mod tests {
             &mut rng,
             "2024-01-01T00:00:00Z",
             None,
+            0.0,
         )
             .expect("event");
         assert_eq!(event.event_source, "signin.amazonaws.com");

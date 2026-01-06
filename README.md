@@ -21,143 +21,165 @@ cargo run --bin seclog-cli -- gen --config examples/config.toml --output ./out-t
 
 ## actors.toml reference (population generation)
 `actors.toml` controls how the actor population is built and stored as Parquet.
+Error rates are sampled per actor and applied at generation time; error codes and
+messages come from built-in CloudTrail defaults per event.
 
 ### Example
 ```toml
-seed = 42
+seed = 42 # Optional: set for repeatable populations.
 
 [[timezone_distribution]]
-name = "America/Los_Angeles"
-weight = 0.63
+name = "America/Los_Angeles" # IANA timezone.
+weight = 0.63 # Higher means more actors in this zone.
 
 [population]
-actor_count = 800
-service_ratio = 0.25
-hot_actor_ratio = 0.12
-hot_actor_multiplier = 6.0
-account_count = 1
-service_rate_per_hour = 6.0
+actor_count = 800 # Total actors.
+service_ratio = 0.25 # Share of service actors (0.0–1.0).
+hot_actor_ratio = 0.12 # Share of hot actors.
+hot_actor_multiplier = 6.0 # Rate multiplier for hot actors.
+account_count = 1 # Generate this many random account IDs if none provided.
+service_rate_per_hour = 6.0 # Default rate for services.
+
+[population.error_rate]
+min = 0.01 # Min per-actor error probability.
+max = 0.04 # Max per-actor error probability.
+distribution = "uniform" # uniform or normal.
+
+[population.human_error_rate]
+min = 0.02
+max = 0.06
+distribution = "normal" # Concentrated around the mid-point.
+
+[population.service_error_rate]
+min = 0.005
+max = 0.02
+distribution = "uniform"
 
 [[population.role_distribution]]
 name = "admin"
-weight = 0.15
+weight = 0.15 # Higher means more admins in the population.
 
 [[population.role_rates_per_hour]]
 name = "admin"
-rate_per_hour = 24.0
+rate_per_hour = 24.0 # Baseline activity rate.
 
 [[population.service_profiles]]
 name = "datalake_bot"
-weight = 0.4
-rate_per_hour = 30.0
-pattern = "constant"
+weight = 0.4 # Higher means more actors of this profile.
+rate_per_hour = 30.0 # Overrides service_rate_per_hour.
+pattern = "constant" # constant, diurnal, or bursty.
 ```
 
 ### Fields
-| Path | Type | Required | Default | Description |
+| Path | Type | Required | Default | Effect |
 | --- | --- | --- | --- | --- |
-| `seed` | int | no | random | RNG seed for deterministic populations. |
-| `[[timezone_distribution]]` | table[] | no | none | IANA timezones with weights. |
-| `timezone_distribution.name` | string | yes | - | Timezone name, e.g. `America/Los_Angeles`. |
-| `timezone_distribution.weight` | float | yes | - | Relative weighting across timezones. |
+| `seed` | int | no | random | Fixes RNG for repeatable populations. |
+| `[[timezone_distribution]]` | table[] | no | none | Assigns actor local timezones; affects active windows and diurnal patterns. |
+| `timezone_distribution.name` | string | yes | - | IANA timezone name used to compute offsets. |
+| `timezone_distribution.weight` | float | yes | - | Higher increases share of actors in that timezone. |
 | `[population]` | table | yes | - | Population parameters. |
-| `population.actor_count` | int | no | 500 | Total number of actors. |
-| `population.service_ratio` | float | no | 0.2 | Fraction of actors that are services (0.0–1.0). |
-| `population.hot_actor_ratio` | float | no | 0.1 | Fraction of actors with boosted rates. |
-| `population.hot_actor_multiplier` | float | no | 6.0 | Rate multiplier for hot actors. |
-| `population.account_ids` | string[] | no | none | Explicit 12-digit AWS account IDs. |
-| `population.account_count` | int | no | 1 | Number of random account IDs if none provided. |
-| `population.role_distribution` | table[] | no | defaults | Role weight overrides. |
-| `population.role_rates_per_hour` | table[] | no | defaults | Per-role baseline rate overrides. |
-| `population.service_rate_per_hour` | float | no | 6.0 | Baseline rate for service actors. |
-| `population.service_profiles` | table[] | no | none | Service profile mix and overrides. |
+| `population.actor_count` | int | no | 500 | Raises total volume and unique actor diversity. |
+| `population.service_ratio` | float | no | 0.2 | Shifts traffic toward automated events as it increases. |
+| `population.hot_actor_ratio` | float | no | 0.1 | Increases number of high-activity actors. |
+| `population.hot_actor_multiplier` | float | no | 6.0 | Amplifies activity for hot actors. |
+| `population.account_ids` | string[] | no | none | Fixes account IDs for stable, repeatable IDs. |
+| `population.account_count` | int | no | 1 | Generates this many random account IDs if none provided. |
+| `population.error_rate` | table | no | defaults | Sets baseline per-actor error probability range. |
+| `population.human_error_rate` | table | no | baseline | Overrides baseline for humans (often higher auth errors). |
+| `population.service_error_rate` | table | no | baseline | Overrides baseline for services (often lower). |
+| `population.role_distribution` | table[] | no | defaults | Changes the mix of human roles, affecting event types. |
+| `population.role_rates_per_hour` | table[] | no | defaults | Adjusts per-role throughput and session density. |
+| `population.service_rate_per_hour` | float | no | 6.0 | Sets default throughput for services. |
+| `population.service_profiles` | table[] | no | none | Controls service profile mix and event families. |
 
 ### Role distribution entries
-| Path | Type | Required | Description |
+| Path | Type | Required | Effect |
 | --- | --- | --- | --- |
-| `population.role_distribution.name` | string | yes | `admin` \| `developer` \| `readonly` \| `auditor`. |
-| `population.role_distribution.weight` | float | yes | Relative weight across roles. |
+| `population.role_distribution.name` | string | yes | Selects which role to weight. |
+| `population.role_distribution.weight` | float | yes | Higher weight yields more of that role. |
 
 ### Role rate entries
-| Path | Type | Required | Description |
+| Path | Type | Required | Effect |
 | --- | --- | --- | --- |
-| `population.role_rates_per_hour.name` | string | yes | `admin` \| `developer` \| `readonly` \| `auditor`. |
-| `population.role_rates_per_hour.rate_per_hour` | float | yes | Events per hour for that role. |
+| `population.role_rates_per_hour.name` | string | yes | Selects which role rate to override. |
+| `population.role_rates_per_hour.rate_per_hour` | float | yes | Baseline events/hour for that role. |
 
 ### Service profile entries
-| Path | Type | Required | Description |
+| Path | Type | Required | Effect |
 | --- | --- | --- | --- |
-| `population.service_profiles.name` | string | yes | `generic` \| `ec2_reaper` \| `datalake_bot` \| `logs_shipper` \| `metrics_collector`. |
-| `population.service_profiles.weight` | float | yes | Relative selection weight across profiles. |
-| `population.service_profiles.rate_per_hour` | float | no | Overrides `population.service_rate_per_hour`. |
-| `population.service_profiles.pattern` | string | no | `constant` \| `diurnal` \| `bursty`. |
+| `population.service_profiles.name` | string | yes | Chooses the service behavior profile. |
+| `population.service_profiles.weight` | float | yes | Higher weight increases share of that profile. |
+| `population.service_profiles.rate_per_hour` | float | no | Overrides default service rate for this profile. |
+| `population.service_profiles.pattern` | string | no | Shapes activity over time (steady vs. diurnal vs. bursts). |
+
+### Error rate entries
+| Path | Type | Required | Effect |
+| --- | --- | --- | --- |
+| `population.error_rate.min` | float | yes | Lower bound for sampled error rates. |
+| `population.error_rate.max` | float | yes | Upper bound for sampled error rates. |
+| `population.error_rate.distribution` | string | no | `uniform` spreads evenly; `normal` concentrates around mid-range. |
 
 ## config.toml reference (log generation)
 `config.toml` controls generation, output, and CloudTrail source options.
 
 ### Example
 ```toml
-seed = 42
+seed = 42 # Optional: deterministic generation.
 
 [traffic]
-start_time = "2025-12-01T00:00:00Z"
-time_scale = 100.0
+start_time = "2025-12-01T00:00:00Z" # Optional simulated clock start.
+time_scale = 100.0 # 100x faster than real time.
 
 [output]
-dir = "./out-test"
+dir = "./out-test" # Output directory.
 
 [output.rotation]
-target_size_mb = 50
-flush_interval_ms = 1000
-max_age_seconds = 30
+target_size_mb = 50 # Rotate when buffer hits ~50 MB.
+flush_interval_ms = 1000 # Flush buffers at least every 1s.
+max_age_seconds = 30 # Rotate even if size not reached.
 
 [output.format]
-type = "jsonl"
-compression = "gzip"
+type = "jsonl" # jsonl (CloudTrail Records JSON) or parquet.
+compression = "gzip" # jsonl only: writes .json.gz.
 
 [source]
 type = "cloudtrail"
-curated = true
-actor_population_path = "./actors.parquet"
-regions = ["us-east-1", "us-west-2"]
-
-[[source.error_rates]]
-name = "ConsoleLogin"
-rate = 0.06
-code = "SigninFailure"
-message = "Failed authentication"
+curated = true # Load curated event weights.
+actor_population_path = "./actors.parquet" # Required.
+regions = ["us-east-1", "us-west-2", "eu-west-1"]
+region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
 ```
 
 ### Fields
-| Path | Type | Required | Default | Description |
+| Path | Type | Required | Default | Effect |
 | --- | --- | --- | --- | --- |
-| `seed` | int | no | random | RNG seed for deterministic output. |
+| `seed` | int | no | random | Fixes RNG for repeatable output sequences. |
 | `[traffic]` | table | yes | - | Simulated clock controls. |
-| `traffic.start_time` | string | no | now | RFC3339 start time for the simulation. |
-| `traffic.time_scale` | float | no | 1.0 | 1.0 = real time, 100.0 = 100x. |
+| `traffic.start_time` | string | no | now | Shifts event timestamps; use for backfill windows. |
+| `traffic.time_scale` | float | no | 1.0 | Increases/decreases how fast simulated time advances. |
 | `[output]` | table | yes | - | Output sink configuration. |
-| `output.dir` | string | yes | - | Output directory. |
+| `output.dir` | string | yes | - | Output directory for generated files. |
 | `[output.rotation]` | table | yes | - | Rotation controls. |
-| `output.rotation.target_size_mb` | int | yes | - | Target file size before rotation. |
-| `output.rotation.flush_interval_ms` | int | no | 30000 | Flush interval for buffered writers. |
-| `output.rotation.max_age_seconds` | int | no | none | Rotate file if older than this. |
+| `output.rotation.target_size_mb` | int | yes | - | Lower values create more, smaller files. |
+| `output.rotation.flush_interval_ms` | int | no | 30000 | Shorter interval flushes buffers more often. |
+| `output.rotation.max_age_seconds` | int | no | none | Forces periodic rotation even under low volume. |
 | `[output.format]` | table | yes | - | Output format selection. |
-| `output.format.type` | string | yes | - | `parquet` or `jsonl`. |
-| `output.format.compression` | string | no | none | `jsonl`: `gzip` (writes `.json.gz`). |
+| `output.format.type` | string | yes | - | `parquet` (structured) or `jsonl` (CloudTrail Records JSON). |
+| `output.format.compression` | string | no | none | `jsonl` supports `gzip` to write `.json.gz`. |
 | `[source]` | table | yes | - | Source configuration (CloudTrail). |
-| `source.type` | string | yes | - | `cloudtrail`. |
-| `source.curated` | bool | yes | - | Use curated event weights. |
-| `source.actor_population_path` | string | yes | - | Path to actors parquet file. |
-| `source.regions` | string[] | no | defaults | Allowed AWS regions. |
-| `source.region_distribution` | table[] | no | none | Weighted region selection. |
-| `source.custom_events` | table[] | no | none | Event weight overrides. |
-| `source.error_rates` | table[] | no | none | Per-event error injection. |
+| `source.type` | string | yes | - | Must be `cloudtrail`. |
+| `source.curated` | bool | yes | - | Enables curated event set and weights. |
+| `source.actor_population_path` | string | yes | - | Points to the actors parquet; generation fails if missing. |
+| `source.regions` | string[] | no | defaults | Region list for event emission. |
+| `source.region_distribution` | float[] | no | none | Weights aligned with `source.regions`; must match length. |
+| `source.custom_events` | table[] | no | none | Overrides curated weights or adds new events. |
 
-### Region distribution entries
-| Path | Type | Required | Description |
-| --- | --- | --- | --- |
-| `source.region_distribution.name` | string | yes | Region name (e.g. `us-east-1`). |
-| `source.region_distribution.weight` | float | yes | Relative weight across regions. |
+### Region distribution (array form)
+Provide weights aligned with the `regions` list:
+```toml
+regions = ["us-east-1", "us-west-2", "eu-west-1"]
+region_distribution = [0.6, 0.25, 0.15]
+```
 
 ### Custom event entries
 | Path | Type | Required | Description |
@@ -165,13 +187,6 @@ message = "Failed authentication"
 | `source.custom_events.name` | string | yes | CloudTrail event name. |
 | `source.custom_events.weight` | float | yes | Relative weight (overrides curated). |
 
-### Error rate entries
-| Path | Type | Required | Description |
-| --- | --- | --- | --- |
-| `source.error_rates.name` | string | yes | CloudTrail event name. |
-| `source.error_rates.rate` | float | yes | Error rate (0.0–1.0). |
-| `source.error_rates.code` | string | no | Error code to emit. |
-| `source.error_rates.message` | string | no | Error message to emit. |
 
 ## DuckDB validation
 Run the analysis scripts against generated Parquet logs:
