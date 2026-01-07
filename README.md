@@ -1,6 +1,10 @@
 # Seclog
 
-High-volume SIEM log generator with CloudTrail-style data.
+High-volume SIEM log generator that creates realistic CloudTrail-style data from a reproducible actor population.
+
+Use it to seed demo pipelines, load test SIEM analytics, or generate repeatable datasets with controlled volume, timing, and behavior.
+
+Data realism comes from actor-driven generation: each actor has a role or service profile, session windows, timezones, and per-actor error rates. Events are selected with role-aware sequences and curated weights, then emitted over an accelerated or real-time clock. This produces traffic patterns that look like real users and service accounts, rather than uniform synthetic noise.
 
 > [!NOTE]
 > This project is under active development.
