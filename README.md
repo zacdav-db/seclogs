@@ -1,10 +1,12 @@
 # Seclog
 
-High-volume SIEM log generator that creates realistic CloudTrail-style data from a reproducible actor population.
+High-volume SIEM log generator that creates realistic CloudTrail and Entra ID data from a reproducible actor population.
 
 Use it to seed demo pipelines, load test SIEM analytics, or generate repeatable datasets with controlled volume, timing, and behavior.
 
 Data realism comes from actor-driven generation: each actor has a role or service profile, session windows, timezones, and per-actor error rates. Events are selected with role-aware sequences and curated weights, then emitted over an accelerated or real-time clock. This produces traffic patterns that look like real users and service accounts, rather than uniform synthetic noise.
+
+Multi-source runs reuse the same actor population, so identities overlap across systems while still allowing per-source selection ratios.
 
 > [!NOTE]
 > This project is under active development.
@@ -18,7 +20,7 @@ Data realism comes from actor-driven generation: each actor has a role or servic
 ```bash
 cargo run --bin seclog -- actors --config examples/actors.toml --output ./actors.parquet
 ```
-2. Generate CloudTrail logs using that population:
+2. Generate logs using that population (single or multiple sources):
 ```bash
 cargo run --bin seclog -- gen --config examples/config.toml --output ./out-test
 ```
@@ -44,8 +46,9 @@ cargo run --bin seclog -- gen --config examples/config.toml --output ./out-test
 
 ## actors.toml reference (population generation)
 `actors.toml` controls how the actor population is built and stored as Parquet.
-Error rates are sampled per actor and applied at generation time; error codes and
-messages come from built-in CloudTrail defaults per event.
+It also defines per-source selectors that pick subsets of the shared population
+for multi-source generation. Error rates are sampled per actor and applied at
+generation time; error codes and messages come from built-in defaults per event.
 
 ### Example
 ```toml
@@ -106,6 +109,18 @@ user_agents = ["Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/537.36 
 source_ips = ["203.0.113.45", "198.51.100.23"]
 tags = ["malicious"]
 event_bias = { "ConsoleLogin" = 3.0, "AssumeRole" = 2.0 }
+
+[[population.selector]]
+source_id = "cloudtrail"
+human_ratio = 0.7
+service_ratio = 1.0
+seed = 7
+
+[[population.selector]]
+source_id = "entra_id"
+human_ratio = 0.6
+service_ratio = 0.2
+seed = 7
 ```
 
 ### Fields
@@ -129,6 +144,7 @@ event_bias = { "ConsoleLogin" = 3.0, "AssumeRole" = 2.0 }
 | `population.service_events_per_hour` | float | no | 6.0 | Sets default throughput for services. |
 | `population.service_profiles` | table[] | no | none | Controls service profile mix and event families. |
 | `population.actor` | table[] | no | none | Adds explicit actors with fixed traits and optional behavior biasing. |
+| `population.selector` | table[] | no | none | Selects source-specific subsets from the shared population. |
 
 ### Role entries
 | Path | Type | Required | Effect |
@@ -184,7 +200,19 @@ explicit list size, Seclog keeps all explicit actors and skips generating additi
 | `population.actor.user_agents` | string[] | no | Overrides the actor’s user‑agent pool. |
 | `population.actor.source_ips` | string[] | no | Overrides the actor’s source IP pool. |
 | `population.actor.tags` | string[] | no | Free‑form labels for downstream analytics. |
-| `population.actor.event_bias` | map | no | Multiplies CloudTrail event weights for this actor (e.g. `{ "ConsoleLogin" = 3.0 }`). |
+| `population.actor.event_bias` | map | no | Multiplies per-source event weights for this actor (e.g. `{ "ConsoleLogin" = 3.0 }`). |
+
+### Selector entries
+Selectors choose a deterministic subset of actors per source, allowing partial overlap
+between systems while preserving identity consistency. If a source has no selector
+entry, all actors are used.
+
+| Path | Type | Required | Effect |
+| --- | --- | --- | --- |
+| `population.selector.source_id` | string | yes | Must match a `source.id` in `config.toml`. |
+| `population.selector.human_ratio` | float | yes | Share of human actors included (0.0–1.0). |
+| `population.selector.service_ratio` | float | yes | Share of service actors included (0.0–1.0). |
+| `population.selector.seed` | int | no | Seeds the selection hash for repeatable overlap. |
 
 ### Error rate entries
 | Path | Type | Required | Effect |
@@ -194,7 +222,8 @@ explicit list size, Seclog keeps all explicit actors and skips generating additi
 | `population.error_rate.distribution` | string | no | `uniform` spreads evenly; `normal` concentrates around mid-range. |
 
 ## config.toml reference (log generation)
-`config.toml` controls generation, output, and CloudTrail source options.
+`config.toml` controls generation, output, the shared actor population, and
+multiple sources in a single run.
 
 ### Example
 ```toml
@@ -205,22 +234,37 @@ start_time = "2025-12-01T00:00:00Z" # Optional simulated clock start.
 time_scale = 100.0 # 100x faster than real time.
 
 [output]
-dir = "./out-test" # Output directory.
+dir = "./out-test" # Output directory (sources use subdirs).
 
 [output.files]
 target_size_mb = 50 # Start a new file at ~50 MB.
 max_age_seconds = 30 # Always rotate if this age is reached.
 
-[output.format]
+[population]
+actors_config_path = "./actors.toml" # Required for selectors.
+actor_population_path = "./actors.parquet" # Required for generation.
+
+[[source]]
+id = "cloudtrail"
+type = "cloudtrail"
+curated = true # Load curated event weights.
+regions = ["us-east-1", "us-west-2", "eu-west-1"]
+region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
+
+[source.output.format]
 type = "jsonl" # jsonl (CloudTrail Records JSON) or parquet.
 compression = "gzip" # jsonl only: writes .json.gz.
 
-[source]
-type = "cloudtrail"
-curated = true # Load curated event weights.
-actor_population_path = "./actors.parquet" # Required.
-regions = ["us-east-1", "us-west-2", "eu-west-1"]
-region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
+[[source]]
+id = "entra_id"
+type = "entra_id"
+tenant_id = "72f988bf-86f1-41af-91ab-2d7cd011db47"
+tenant_domain = "contoso.onmicrosoft.com"
+categories = ["signin", "audit"]
+category_weights = [0.7, 0.3]
+
+[source.output.format]
+type = "parquet"
 ```
 
 ### Fields
@@ -231,19 +275,27 @@ region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
 | `traffic.start_time` | string | no | now | Shifts event timestamps; use for backfill windows. |
 | `traffic.time_scale` | float | no | 1.0 | Increases/decreases how fast simulated time advances. |
 | `[output]` | table | yes | - | Output sink configuration. |
-| `output.dir` | string | yes | - | Output directory for generated files. |
+| `output.dir` | string | yes | - | Base output directory for generated files. |
 | `[output.files]` | table | yes | - | File output controls. |
 | `output.files.target_size_mb` | int | yes | - | Lower values create more, smaller files. |
 | `output.files.max_age_seconds` | int | yes | - | Forces periodic file rollover under low volume. |
-| `[output.format]` | table | yes | - | Output format selection. |
-| `output.format.type` | string | yes | - | `parquet` (structured) or `jsonl` (CloudTrail Records JSON). |
-| `output.format.compression` | string | no | none | `jsonl` supports `gzip` to write `.json.gz`. |
-| `[source]` | table | yes | - | Source configuration (CloudTrail). |
-| `source.type` | string | yes | - | Must be `cloudtrail`. |
-| `source.curated` | bool | yes | - | Enables curated event set and weights. |
-| `source.actor_population_path` | string | yes | - | Points to the actors parquet; generation fails if missing. |
-| `source.regions` | string[] | no | defaults | Region list for event emission. |
-| `source.region_distribution` | float[] | no | none | Weights aligned with `source.regions`; must match length. |
+| `[population]` | table | yes | - | Shared actor population config. |
+| `population.actors_config_path` | string | yes | - | Points to `actors.toml` for selectors. |
+| `population.actor_population_path` | string | yes | - | Points to the actors parquet file. |
+| `[[source]]` | table[] | yes | - | One or more sources to generate in a single run. |
+| `source.id` | string | yes | - | Identifier referenced by population selectors. |
+| `source.type` | string | yes | - | Source type (`cloudtrail`, `entra_id`). |
+| `source.output.dir` | string | no | source.id | Subdirectory under `output.dir`. |
+| `[source.output.format]` | table | yes | - | Output format selection per source. |
+| `source.output.format.type` | string | yes | - | `parquet` (structured) or `jsonl` (CloudTrail Records JSON or JSONL). |
+| `source.output.format.compression` | string | no | none | `jsonl` supports `gzip` to write `.json.gz`. |
+| `source.curated` | bool | cloudtrail | - | Enables curated event set and weights. |
+| `source.regions` | string[] | cloudtrail | defaults | Region list for event emission. |
+| `source.region_distribution` | float[] | cloudtrail | none | Weights aligned with `source.regions`; must match length. |
+| `source.tenant_id` | string | entra_id | - | Entra tenant GUID. |
+| `source.tenant_domain` | string | entra_id | - | Entra tenant domain. |
+| `source.categories` | string[] | entra_id | signin+audit | Log categories to emit (`signin`, `audit`). |
+| `source.category_weights` | float[] | entra_id | none | Weights aligned with `source.categories`. |
 
 ### Region distribution (array form)
 Provide weights aligned with the `regions` list:

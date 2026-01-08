@@ -6,7 +6,7 @@ SELECT
   envelope.outcome AS outcome,
   cloudtrail.errorCode AS error_code,
   cloudtrail.errorMessage AS error_message
-FROM read_parquet('out-test/*.parquet');
+FROM read_parquet('out-test/cloudtrail/*.parquet');
 
 SELECT
   event_name,

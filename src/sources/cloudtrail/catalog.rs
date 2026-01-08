@@ -138,13 +138,17 @@ fn curated_event_weights() -> Vec<(&'static str, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::CloudTrailSourceConfig;
+    use crate::core::config::{CloudTrailSourceConfig, FormatConfig, FormatOptions, SourceOutputConfig};
 
     #[test]
     fn curated_only() {
         let config = CloudTrailSourceConfig {
+            id: "cloudtrail".to_string(),
+            output: SourceOutputConfig {
+                dir: None,
+                format: FormatConfig::Jsonl(FormatOptions { compression: None }),
+            },
             curated: true,
-            actor_population_path: None,
             regions: None,
             region_distribution: None,
         };

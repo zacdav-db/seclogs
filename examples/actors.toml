@@ -58,7 +58,7 @@ events_per_hour = 6.0
 [[population.service_profiles]]
 name = "datalake_bot"
 weight = 0.4
-events_per_hour = 30.0
+events_per_hour = 80.0
 pattern = "constant"
 
 [[population.service_profiles]]
@@ -70,7 +70,7 @@ pattern = "bursty"
 [[population.service_profiles]]
 name = "logs_shipper"
 weight = 0.2
-events_per_hour = 20.0
+events_per_hour = 30.0
 pattern = "constant"
 
 [[population.service_profiles]]
@@ -105,10 +105,22 @@ id = "svc-exfil-01"
 kind = "service"
 service_profile = "datalake_bot"
 service_pattern = "constant"
-events_per_hour = 120.0
+events_per_hour = 180.0
 error_rate = 0.02
 account_id = "123456789012"
 user_agents = ["aws-sdk-java/1.12.603"]
 source_ips = ["10.32.1.14"]
 tags = ["malicious", "high-volume"]
 event_bias = { "GetObject" = 4.0, "ListBuckets" = 2.0, "Decrypt" = 1.5 }
+
+[[population.selector]]
+source_id = "cloudtrail"
+human_ratio = 0.7
+service_ratio = 1.0
+seed = 7
+
+[[population.selector]]
+source_id = "entra_id"
+human_ratio = 0.6
+service_ratio = 0.2
+seed = 7

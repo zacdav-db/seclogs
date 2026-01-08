@@ -9,7 +9,7 @@ SELECT
     try_cast(cloudtrail.eventTime AS TIMESTAMP)
   ) AS ts_parsed,
   coalesce(envelope.user_agent, cloudtrail.userAgent) AS user_agent
-FROM read_parquet('out-test/*.parquet');
+FROM read_parquet('out-test/cloudtrail/*.parquet');
 
 WITH ordered AS (
   SELECT

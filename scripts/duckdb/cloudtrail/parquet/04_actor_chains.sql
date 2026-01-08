@@ -8,7 +8,7 @@ SELECT
     try_cast(envelope.timestamp AS TIMESTAMP),
     try_cast(cloudtrail.eventTime AS TIMESTAMP)
   ) AS ts_parsed
-FROM read_parquet('out-test/*.parquet');
+FROM read_parquet('out-test/cloudtrail/*.parquet');
 
 -- Allowed transitions (extend as needed).
 WITH allowed AS (

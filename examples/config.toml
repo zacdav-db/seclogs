@@ -5,20 +5,34 @@ start_time = "2025-12-01T00:00:00Z"
 time_scale = 36000
 
 [output]
-dir = "./out"
+dir = "./out-test"
 
 [output.files]
 target_size_mb = 50
-max_age_seconds = 10
+max_age_seconds = 60
 
-[output.format]
-type = "jsonl"
-compression = "gzip"
+[population]
+actors_config_path = "./actors.toml"
+actor_population_path = "./actors.parquet"
 
-[source]
+[[source]]
+id = "cloudtrail"
 type = "cloudtrail"
 curated = true
 regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"]
-actor_population_path = "./actors.parquet"
-
 region_distribution = [0.6, 0.15, 0.2, 0.05]
+
+[source.output.format]
+type = "jsonl"
+compression = "gzip"
+
+[[source]]
+id = "entra_id"
+type = "entra_id"
+tenant_id = "72f988bf-86f1-41af-91ab-2d7cd011db47"
+tenant_domain = "contoso.onmicrosoft.com"
+categories = ["signin", "audit"]
+category_weights = [0.7, 0.3]
+
+[source.output.format]
+type = "parquet"

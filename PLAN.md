@@ -4,7 +4,7 @@
 - Generate high volumes of logs (up to GB/s in some cases).
 - Support size-based file rotation (e.g., ~100MB per file).
 - Provide two traffic modes: constant flow and realistic flow.
-- Start with CloudTrail as the initial source; extend to Okta/Entra later.
+- Start with CloudTrail and add Entra ID as a first multi-source pair.
 - Output formats: JSONL for text and Parquet preferred when possible.
 - Use nested structs in Parquet; JSONL mirrors nested structure.
 - Default to global organization behavior across multiple timezones.
@@ -15,7 +15,7 @@
 - Language: Rust.
 - Sources (v1): CloudTrail curated event catalog with custom override list.
 - Formats (v1): JSONL and Parquet.
-- Config (v1): single source and single output format per run.
+- Config (v1): multi-source per run with per-source output formats.
 - Rotation: size-based with configurable target size.
 - Volume control:
   - Constant flow: fixed events/sec or bytes/sec.
@@ -26,18 +26,19 @@
 ## Architecture Overview
 ### Core Components
 - **Generator Engine**
-  - Produces events from source modules.
-  - Supports multiple workers with independent RNG streams.
+  - Orchestrates multiple sources in one run.
+  - Uses a shared actor population with per-source selectors.
   - Applies traffic mode (constant vs realistic) to event rate.
 - **Source Modules**
   - CloudTrail module with event templates and weighted mixes.
-  - Curated catalog with custom list override.
+  - Entra ID module with sign-in and audit logs.
+  - Curated catalogs with optional overrides.
 - **Output Pipeline**
   - Streaming writers for JSONL and Parquet.
   - Size-based rotation and flush controls.
 - **Config and CLI**
-  - Config-driven behavior via TOML/YAML.
-  - CLI for running generation jobs and selecting outputs.
+  - Config-driven behavior via TOML (multi-source + shared population).
+  - CLI for generating actor populations and running log generation.
 
 ### Data Model
 - **Common Event Envelope**
@@ -47,6 +48,7 @@
 - **Source-Specific Payloads**
   - CloudTrail fields: region, service, request_parameters,
     response_elements, error_code, error_message, account_id, etc.
+  - Entra ID fields: sign-in status, app/user identity, audit targets, etc.
 - **Schema Versioning**
   - Include a schema version field in the envelope for evolution.
 
@@ -88,6 +90,8 @@
 - Allow flagging specific events as suspicious (not necessarily malicious) with controllable rates.
 - Generate a shared actor population with stable characteristics that can be reused across sources.
 - Incorporate detailed CloudTrail log examples from AWS docs for higher fidelity.
+- Incorporate Entra ID schema examples to improve realism.
+- Couple actor sessions across sources to strengthen cross-system correlation.
 
 ## Milestones
 1) Project scaffolding + config + CLI skeleton.

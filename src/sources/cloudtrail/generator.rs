@@ -8,7 +8,6 @@ use crate::core::actors::{ActorKind, ActorProfile, ActorRole, ServicePattern, Se
 use crate::core::config::CloudTrailSourceConfig;
 use crate::core::event::{Actor, Event, EventEnvelope, Outcome};
 use crate::core::traits::EventSource;
-use crate::actors_parquet as actor_store;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -27,12 +26,13 @@ impl CloudTrailGenerator {
     /// Builds a generator from the CloudTrail config and optional seed.
     pub fn from_config(
         config: &CloudTrailSourceConfig,
+        actors: Vec<ActorProfile>,
         seed: Option<u64>,
         start_time: DateTime<Utc>,
     ) -> Result<Self, CatalogError> {
         let events = resolve_event_weights(config)?;
         let selector = EventSelector::new(events.clone())?;
-        Self::new(selector, events, config, seed, start_time)
+        Self::new(selector, events, config, actors, seed, start_time)
     }
 
     /// Builds a generator from a prepared selector and event list.
@@ -40,6 +40,7 @@ impl CloudTrailGenerator {
         selector: EventSelector,
         events: Vec<WeightedEvent>,
         config: &CloudTrailSourceConfig,
+        mut actors: Vec<ActorProfile>,
         seed: Option<u64>,
         start_time: DateTime<Utc>,
     ) -> Result<Self, CatalogError> {
@@ -56,7 +57,6 @@ impl CloudTrailGenerator {
 
         let region_selector =
             build_region_selector(config.regions.as_ref(), config.region_distribution.as_ref());
-        let mut actors = load_actor_profiles(config)?;
         shuffle_actors(&mut actors, &mut rng);
         let schedule = build_schedule(&actors, start_time, &mut rng);
         Ok(Self {
@@ -138,17 +138,6 @@ impl EventSource for CloudTrailGenerator {
             });
         }
     }
-}
-
-fn load_actor_profiles(
-    config: &CloudTrailSourceConfig,
-) -> Result<Vec<ActorProfile>, CatalogError> {
-    let path = config.actor_population_path.as_ref().ok_or_else(|| {
-        CatalogError::Population("actor_population_path is required".to_string())
-    })?;
-    let population = actor_store::read_population(path)
-        .map_err(|err| CatalogError::Population(err.to_string()))?;
-    Ok(population.profiles())
 }
 
 impl CloudTrailGenerator {

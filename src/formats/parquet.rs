@@ -31,6 +31,7 @@ pub struct ParquetWriter {
     batch_size: usize,
     max_age: Option<Duration>,
     regions: HashMap<RegionKey, RegionState>,
+    file_prefix: Option<String>,
 }
 
 impl ParquetWriter {
@@ -40,7 +41,23 @@ impl ParquetWriter {
         target_size_mb: u64,
         max_age_seconds: Option<u64>,
     ) -> io::Result<Self> {
-        Self::with_batch_size(dir, target_size_mb, max_age_seconds, DEFAULT_BATCH_SIZE)
+        Self::with_batch_size(dir, target_size_mb, max_age_seconds, DEFAULT_BATCH_SIZE, None)
+    }
+
+    /// Creates a Parquet writer with a prefix applied to file names.
+    pub fn with_prefix(
+        dir: impl Into<PathBuf>,
+        target_size_mb: u64,
+        max_age_seconds: Option<u64>,
+        prefix: impl Into<String>,
+    ) -> io::Result<Self> {
+        Self::with_batch_size(
+            dir,
+            target_size_mb,
+            max_age_seconds,
+            DEFAULT_BATCH_SIZE,
+            Some(prefix.into()),
+        )
     }
 
     /// Creates a Parquet writer with a custom batch size.
@@ -49,6 +66,7 @@ impl ParquetWriter {
         target_size_mb: u64,
         max_age_seconds: Option<u64>,
         batch_size: usize,
+        file_prefix: Option<String>,
     ) -> io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
@@ -62,6 +80,7 @@ impl ParquetWriter {
             batch_size,
             max_age,
             regions: HashMap::new(),
+            file_prefix,
         })
     }
 
@@ -99,7 +118,13 @@ impl EventWriter for ParquetWriter {
         state.current_size += size;
 
         if state.current_size >= self.target_size_bytes {
-            flush_region(&self.dir, &self.schema, &key, state)?;
+            flush_region(
+                &self.dir,
+                &self.schema,
+                self.file_prefix.as_deref(),
+                &key,
+                state,
+            )?;
         }
 
         Ok(size)
@@ -121,7 +146,13 @@ impl EventWriter for ParquetWriter {
                         continue;
                     }
                 }
-                flush_region(&self.dir, &self.schema, key, state)?;
+                flush_region(
+                    &self.dir,
+                    &self.schema,
+                    self.file_prefix.as_deref(),
+                    key,
+                    state,
+                )?;
             }
         }
         Ok(())
@@ -319,10 +350,15 @@ fn build_file_path(
     stamp: &str,
     unique: &str,
     ext: &str,
+    prefix: Option<&str>,
 ) -> PathBuf {
-    dir.join(format!(
-        "{account_id}_CloudTrail_{region}_{stamp}_{unique}.{ext}"
-    ))
+    let name = match prefix {
+        Some(prefix) if !prefix.trim().is_empty() => {
+            format!("{prefix}_{account_id}_{region}_{stamp}_{unique}.{ext}")
+        }
+        _ => format!("{account_id}_CloudTrail_{region}_{stamp}_{unique}.{ext}"),
+    };
+    dir.join(name)
 }
 
 fn open_writer(
@@ -333,8 +369,9 @@ fn open_writer(
     unique: &str,
     ext: &str,
     schema: SchemaRef,
+    prefix: Option<&str>,
 ) -> io::Result<(ArrowWriter<File>, PathBuf)> {
-    let path = build_file_path(dir, account_id, region, stamp, unique, ext);
+    let path = build_file_path(dir, account_id, region, stamp, unique, ext, prefix);
     let file = File::create(&path)?;
     let props = WriterProperties::builder().build();
     let writer = ArrowWriter::try_new(file, schema, Some(props)).map_err(map_parquet_err)?;
@@ -757,6 +794,7 @@ impl RegionState {
 fn flush_region(
     dir: &Path,
     schema: &SchemaRef,
+    prefix: Option<&str>,
     key: &RegionKey,
     state: &mut RegionState,
 ) -> io::Result<()> {
@@ -775,10 +813,19 @@ fn flush_region(
         &unique,
         "parquet.tmp",
         schema.clone(),
+        prefix,
     )?;
     writer.write(&batch).map_err(map_parquet_err)?;
     writer.close().map_err(map_parquet_err)?;
-    let final_path = build_file_path(dir, &key.account_id, &key.region, &stamp, &unique, "parquet");
+    let final_path = build_file_path(
+        dir,
+        &key.account_id,
+        &key.region,
+        &stamp,
+        &unique,
+        "parquet",
+        prefix,
+    );
     fs::rename(&temp_path, &final_path)?;
     state.current_size = 0;
     state.first_event_at = None;

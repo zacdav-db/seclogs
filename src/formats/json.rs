@@ -1,6 +1,7 @@
 //! JSON sink for seclog events.
 //!
-//! Writes CloudTrail-style files per account/region and rotates by size or age.
+//! Writes CloudTrail-style files per account/region or generic JSONL files
+//! depending on the writer used.
 
 use chrono::Utc;
 use flate2::write::GzEncoder;
@@ -22,6 +23,18 @@ pub struct JsonlWriter {
     max_age: Option<Duration>,
     compression: JsonlCompression,
     files: HashMap<RegionKey, RegionBuffer>,
+}
+
+/// JSONL writer that emits one record per line with size/age rotation.
+pub struct JsonLinesWriter {
+    dir: PathBuf,
+    target_size_bytes: u64,
+    max_age: Option<Duration>,
+    compression: JsonlCompression,
+    buffer: Vec<u8>,
+    current_size: u64,
+    first_event_at: Option<Instant>,
+    file_prefix: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +62,33 @@ impl JsonlWriter {
             max_age,
             compression,
             files: HashMap::new(),
+        })
+    }
+}
+
+impl JsonLinesWriter {
+    /// Creates a JSONL writer with size-based rotation and optional max age.
+    pub fn new(
+        dir: impl Into<PathBuf>,
+        target_size_mb: u64,
+        max_age_seconds: Option<u64>,
+        compression: Option<&str>,
+        file_prefix: &str,
+    ) -> io::Result<Self> {
+        let dir = dir.into();
+        fs::create_dir_all(&dir)?;
+        let max_age = max_age_seconds
+            .and_then(|seconds| if seconds > 0 { Some(Duration::from_secs(seconds)) } else { None });
+        let compression = parse_compression(compression)?;
+        Ok(Self {
+            dir,
+            target_size_bytes: target_size_mb.saturating_mul(1024 * 1024),
+            max_age,
+            compression,
+            buffer: Vec::new(),
+            current_size: 0,
+            first_event_at: None,
+            file_prefix: file_prefix.to_string(),
         })
     }
 }
@@ -108,6 +148,60 @@ impl EventWriter for JsonlWriter {
             if region.current_size > 0 {
                 flush_region(&self.dir, key, region, self.compression)?;
             }
+        }
+        Ok(())
+    }
+}
+
+impl EventWriter for JsonLinesWriter {
+    fn write_event(&mut self, event: &Event) -> io::Result<u64> {
+        let record_bytes = record_bytes_for_event(event)?;
+        let size = record_bytes.len() as u64;
+
+        if self.current_size == 0 {
+            self.first_event_at = Some(Instant::now());
+        }
+        self.buffer.extend_from_slice(&record_bytes);
+        self.buffer.push(b'\n');
+        self.current_size = self.buffer.len() as u64;
+
+        if self.current_size >= self.target_size_bytes {
+            let dir = self.dir.clone();
+            let prefix = self.file_prefix.clone();
+            flush_lines(&dir, &prefix, self, self.compression)?;
+        }
+
+        Ok(size)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        if self.current_size == 0 {
+            return Ok(());
+        }
+        if let Some(max_age) = self.max_age {
+            let start = match self.first_event_at {
+                Some(start) => start,
+                None => {
+                    self.first_event_at = Some(now);
+                    return Ok(());
+                }
+            };
+            if now.duration_since(start) < max_age {
+                return Ok(());
+            }
+        }
+        let dir = self.dir.clone();
+        let prefix = self.file_prefix.clone();
+        flush_lines(&dir, &prefix, self, self.compression)?;
+        Ok(())
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        if self.current_size > 0 {
+            let dir = self.dir.clone();
+            let prefix = self.file_prefix.clone();
+            flush_lines(&dir, &prefix, self, self.compression)?;
         }
         Ok(())
     }
@@ -197,6 +291,21 @@ fn open_file(
     File::create(path)
 }
 
+fn open_lines_file(
+    dir: &Path,
+    prefix: &str,
+    compression: JsonlCompression,
+) -> io::Result<File> {
+    let stamp = current_stamp();
+    let unique = unique_id();
+    let ext = match compression {
+        JsonlCompression::None => "jsonl",
+        JsonlCompression::Gzip => "jsonl.gz",
+    };
+    let path = dir.join(format!("{prefix}_{stamp}_{unique}.{ext}"));
+    File::create(path)
+}
+
 fn current_stamp() -> String {
     let now = Utc::now();
     format!("{}", now.format("%Y%m%dT%H%MZ"))
@@ -256,6 +365,34 @@ fn flush_region(
     region.current_size = 0;
     region.first_event_at = None;
     region.record_count = 0;
+    Ok(())
+}
+
+fn flush_lines(
+    dir: &Path,
+    prefix: &str,
+    writer: &mut JsonLinesWriter,
+    compression: JsonlCompression,
+) -> io::Result<()> {
+    if writer.current_size == 0 {
+        return Ok(());
+    }
+
+    let file = open_lines_file(dir, prefix, compression)?;
+    match compression {
+        JsonlCompression::None => {
+            let mut file = file;
+            file.write_all(&writer.buffer)?;
+        }
+        JsonlCompression::Gzip => {
+            let mut encoder = GzEncoder::new(file, Compression::default());
+            encoder.write_all(&writer.buffer)?;
+            encoder.finish()?;
+        }
+    }
+    writer.buffer.clear();
+    writer.current_size = 0;
+    writer.first_event_at = None;
     Ok(())
 }
 

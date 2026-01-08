@@ -1,13 +1,14 @@
 use clap::{Parser, Subcommand};
 use chrono::{DateTime, Utc};
-use seclog::actors_parquet::write_population;
-use seclog::core::actors::generate_population;
+use seclog::actors_parquet::{read_population, write_population};
+use seclog::core::actors::{generate_population, select_population};
 use seclog::core::config::{Config, FormatConfig, PopulationConfig, SourceConfig};
 use seclog::core::event::Event;
 use seclog::core::traits::{EventSource, EventWriter};
-use seclog::formats::json::JsonlWriter;
+use seclog::formats::json::{JsonLinesWriter, JsonlWriter};
 use seclog::formats::parquet::ParquetWriter;
 use seclog::sources::cloudtrail::CloudTrailGenerator;
+use seclog::sources::entra_id::EntraIdGenerator;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -95,15 +96,67 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let queue_depth = 1024;
 
             let counters = WriterCounters::new();
-            let (writer_txs, writer_handles) = spawn_writer_shards(
-                &loaded.output.dir,
-                loaded.output.files.target_size_mb,
-                Some(loaded.output.files.max_age_seconds),
-                &loaded.output.format,
-                writer_shards,
-                queue_depth,
-                &counters,
-            );
+            let mut writer_handles = Vec::new();
+
+            let population_config =
+                PopulationConfig::from_path(&loaded.population.actors_config_path)?;
+            let population = read_population(&loaded.population.actor_population_path)?;
+            let selectors = population_config.population.selector.as_ref();
+
+            let max_duration = max_seconds.map(Duration::from_secs);
+            let start_time = Instant::now();
+            let start_sim_time = parse_start_time(loaded.traffic.start_time.as_deref())?;
+            let time_scale = loaded.traffic.time_scale.unwrap_or(1.0);
+            let time_scale = if time_scale <= 0.0 { None } else { Some(time_scale) };
+            let mut last_sim_time = start_sim_time;
+            let mut last_wall = Instant::now();
+
+            let mut sources = Vec::new();
+            for source in &loaded.sources {
+                let selector = selectors.and_then(|list| {
+                    list.iter()
+                        .find(|entry| entry.source_id == source.id())
+                });
+                let selected = select_population(&population, selector, loaded.seed)?;
+                let actors = selected.profiles();
+
+                let generator: Box<dyn EventSource> = match source {
+                    SourceConfig::CloudTrail(config) => Box::new(
+                        CloudTrailGenerator::from_config(
+                            config,
+                            actors,
+                            loaded.seed,
+                            start_sim_time,
+                        )?,
+                    ),
+                    SourceConfig::EntraId(config) => Box::new(
+                        EntraIdGenerator::from_config(config, actors, loaded.seed, start_sim_time)?,
+                    ),
+                };
+
+                let output_dir = source_output_dir(&loaded.output.dir, source);
+                let (writer_txs, handles) = spawn_writer_shards(
+                    &output_dir,
+                    source.source_type(),
+                    source.id(),
+                    loaded.output.files.target_size_mb,
+                    Some(loaded.output.files.max_age_seconds),
+                    source.output().format.clone(),
+                    writer_shards,
+                    queue_depth,
+                    &counters,
+                );
+                writer_handles.extend(handles);
+
+                let mut state = SourceState::new(generator, writer_txs, writer_shards);
+                state.fill_next_event(start_sim_time);
+                sources.push(state);
+            }
+
+            if sources.is_empty() {
+                return Err("no sources configured".into());
+            }
+
             let mut total_dispatched = 0_u64;
             let mut last_written_events = 0_u64;
             let mut last_written_bytes = 0_u64;
@@ -111,19 +164,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let flush_interval = Some(Duration::from_secs(1));
             let mut next_flush = flush_interval.map(|interval| Instant::now() + interval);
             let mut metrics = Metrics::new(Duration::from_millis(metrics_interval_ms));
-            let start_time = Instant::now();
-            let max_duration = max_seconds.map(Duration::from_secs);
-            let start_sim_time = parse_start_time(loaded.traffic.start_time.as_deref())?;
-            let time_scale = loaded.traffic.time_scale.unwrap_or(1.0);
-            let time_scale = if time_scale <= 0.0 { None } else { Some(time_scale) };
-            let mut last_sim_time = start_sim_time;
-            let mut last_wall = Instant::now();
-
-            let mut generator = match &loaded.source {
-                SourceConfig::CloudTrail(config) => {
-                    CloudTrailGenerator::from_config(config, loaded.seed, start_sim_time)?
-                }
-            };
 
             loop {
                 let loop_start = Instant::now();
@@ -138,19 +178,26 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                let Some(event) = generator.next_event() else {
+                let Some(idx) = next_source_index(&sources) else {
                     break;
                 };
+                let event_time = sources[idx]
+                    .next_event_time
+                    .unwrap_or_else(|| Utc::now());
+                let Some(event) = sources[idx].next_event.take() else {
+                    sources[idx].next_event_time = None;
+                    continue;
+                };
 
-                if let Some(event_time) = parse_event_time(&event) {
-                    if let Some(scale) = time_scale {
-                        throttle_to_sim_time(event_time, last_sim_time, scale, &mut last_wall);
-                    }
-                    last_sim_time = event_time;
+                if let Some(scale) = time_scale {
+                    throttle_to_sim_time(event_time, last_sim_time, scale, &mut last_wall);
                 }
+                last_sim_time = event_time;
 
-                dispatch_event(event, &writer_txs, writer_shards)?;
+                dispatch_event(event, &sources[idx].writer_txs, sources[idx].writer_shards)?;
                 total_dispatched += 1;
+
+                sources[idx].fill_next_event(event_time);
 
                 let current_events = counters.events.load(Ordering::Relaxed);
                 let current_bytes = counters.bytes.load(Ordering::Relaxed);
@@ -161,8 +208,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                 if let (Some(interval), Some(next)) = (flush_interval, next_flush) {
                     if loop_start >= next {
-                        for tx in &writer_txs {
-                            let _ = tx.send(WriterCommand::Flush);
+                        for source in &sources {
+                            for tx in &source.writer_txs {
+                                let _ = tx.send(WriterCommand::Flush);
+                            }
                         }
                         next_flush = Some(loop_start + interval);
                     }
@@ -170,10 +219,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                 metrics.record(loop_events, loop_bytes, Duration::ZERO, 0);
             }
-            for tx in &writer_txs {
-                let _ = tx.send(WriterCommand::Close);
+            for source in &sources {
+                for tx in &source.writer_txs {
+                    let _ = tx.send(WriterCommand::Close);
+                }
             }
-            drop(writer_txs);
 
             for handle in writer_handles {
                 match handle.join() {
@@ -200,6 +250,39 @@ enum WriterCommand {
     Event(Event),
     Flush,
     Close,
+}
+
+struct SourceState {
+    generator: Box<dyn EventSource>,
+    writer_txs: Vec<SyncSender<WriterCommand>>,
+    writer_shards: usize,
+    next_event: Option<Event>,
+    next_event_time: Option<DateTime<Utc>>,
+}
+
+impl SourceState {
+    fn new(
+        generator: Box<dyn EventSource>,
+        writer_txs: Vec<SyncSender<WriterCommand>>,
+        writer_shards: usize,
+    ) -> Self {
+        Self {
+            generator,
+            writer_txs,
+            writer_shards,
+            next_event: None,
+            next_event_time: None,
+        }
+    }
+
+    fn fill_next_event(&mut self, fallback_time: DateTime<Utc>) {
+        self.next_event = self.generator.next_event();
+        self.next_event_time = self
+            .next_event
+            .as_ref()
+            .and_then(parse_event_time)
+            .or(Some(fallback_time));
+    }
 }
 
 struct WriterCounters {
@@ -254,6 +337,23 @@ fn parse_event_time(event: &Event) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+fn next_source_index(sources: &[SourceState]) -> Option<usize> {
+    let mut best: Option<(usize, DateTime<Utc>)> = None;
+    for (idx, source) in sources.iter().enumerate() {
+        let Some(when) = source.next_event_time else {
+            continue;
+        };
+        let is_better = match best {
+            None => true,
+            Some((_, best_when)) => when < best_when,
+        };
+        if is_better {
+            best = Some((idx, when));
+        }
+    }
+    best.map(|(idx, _)| idx)
+}
+
 fn throttle_to_sim_time(
     current: DateTime<Utc>,
     previous: DateTime<Utc>,
@@ -276,11 +376,22 @@ fn throttle_to_sim_time(
     *last_wall = Instant::now();
 }
 
+fn source_output_dir(base: &str, source: &SourceConfig) -> PathBuf {
+    let subdir = source
+        .output()
+        .dir
+        .as_deref()
+        .unwrap_or_else(|| source.id());
+    PathBuf::from(base).join(subdir)
+}
+
 fn spawn_writer_shards(
-    dir: &str,
+    dir: &PathBuf,
+    source_type: &str,
+    source_id: &str,
     target_size_mb: u64,
     max_age_seconds: Option<u64>,
-    format: &FormatConfig,
+    format: FormatConfig,
     shards: usize,
     queue_depth: usize,
     counters: &WriterCounters,
@@ -294,21 +405,36 @@ fn spawn_writer_shards(
         let (tx, rx): (SyncSender<WriterCommand>, Receiver<WriterCommand>) =
             sync_channel(queue_depth);
         let format = format.clone();
-        let dir = dir.to_string();
+        let dir = dir.clone();
+        let source_type = source_type.to_string();
+        let source_id = source_id.to_string();
         let events_counter = Arc::clone(&counters.events);
         let bytes_counter = Arc::clone(&counters.bytes);
         let handle = thread::spawn(move || -> WorkerResult {
-            let mut writer: Box<dyn EventWriter> = match format {
-                FormatConfig::Jsonl(options) => Box::new(JsonlWriter::new(
+            let mut writer: Box<dyn EventWriter> = match (source_type.as_str(), format) {
+                ("cloudtrail", FormatConfig::Jsonl(options)) => Box::new(JsonlWriter::new(
                     &dir,
                     target_size_mb,
                     max_age_seconds,
                     options.compression.as_deref(),
                 )?),
-                FormatConfig::Parquet(_) => Box::new(ParquetWriter::new(
+                (_, FormatConfig::Jsonl(options)) => Box::new(JsonLinesWriter::new(
                     &dir,
                     target_size_mb,
                     max_age_seconds,
+                    options.compression.as_deref(),
+                    &source_id,
+                )?),
+                ("cloudtrail", FormatConfig::Parquet(_)) => Box::new(ParquetWriter::new(
+                    &dir,
+                    target_size_mb,
+                    max_age_seconds,
+                )?),
+                (_, FormatConfig::Parquet(_)) => Box::new(ParquetWriter::with_prefix(
+                    &dir,
+                    target_size_mb,
+                    max_age_seconds,
+                    source_id,
                 )?),
             };
             while let Ok(command) = rx.recv() {
@@ -365,6 +491,7 @@ fn writer_index_for_event(event: &Event, shards: usize) -> usize {
         .unwrap_or("global");
 
     let mut hasher = DefaultHasher::new();
+    event.envelope.source.hash(&mut hasher);
     account_id.hash(&mut hasher);
     region.hash(&mut hasher);
     (hasher.finish() as usize) % shards

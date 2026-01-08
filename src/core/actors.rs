@@ -6,13 +6,15 @@ use rand::Rng;
 use rand::SeedableRng;
 use crate::config::{
     ErrorRateConfig, ErrorRateDistribution, ExplicitActorConfig, PopulationActorsConfig,
-    PopulationConfig, RoleConfig, ServicePatternConfig, ServiceProfileConfig, TimezoneWeight,
+    PopulationConfig, PopulationSelectorConfig, RoleConfig, ServicePatternConfig,
+    ServiceProfileConfig, TimezoneWeight,
 };
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 /// High-level actor type used for session behavior and weighting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActorKind {
     Human,
     Service,
@@ -231,6 +233,46 @@ impl ActorProfile {
 #[derive(Debug, Clone)]
 pub struct ActorPopulation {
     pub actors: Vec<ActorSeed>,
+}
+
+/// Selects a deterministic subset of actors for a source.
+pub fn select_population(
+    population: &ActorPopulation,
+    selector: Option<&PopulationSelectorConfig>,
+    fallback_seed: Option<u64>,
+) -> Result<ActorPopulation, ActorConfigError> {
+    let Some(selector) = selector else {
+        return Ok(population.clone());
+    };
+    let human_ratio = selector.human_ratio.clamp(0.0, 1.0);
+    let service_ratio = selector.service_ratio.clamp(0.0, 1.0);
+    let seed = selector.seed.or(fallback_seed).unwrap_or(0);
+    let mut selected = Vec::new();
+    for actor in &population.actors {
+        let ratio = match actor.kind {
+            ActorKind::Human => human_ratio,
+            ActorKind::Service => service_ratio,
+        };
+        if ratio <= 0.0 {
+            continue;
+        }
+        if ratio >= 1.0 {
+            selected.push(actor.clone());
+            continue;
+        }
+        let key = actor_selection_key(actor);
+        let score = selector_score(seed, &key);
+        if score <= ratio {
+            selected.push(actor.clone());
+        }
+    }
+    if selected.is_empty() {
+        return Err(ActorConfigError(format!(
+            "population selector {} filtered out all actors",
+            selector.source_id
+        )));
+    }
+    Ok(ActorPopulation { actors: selected })
 }
 
 pub struct RoleRates {
@@ -1336,4 +1378,20 @@ fn service_source_ips(rng: &mut impl Rng) -> Vec<String> {
         }
     }
     list
+}
+
+fn actor_selection_key(actor: &ActorSeed) -> String {
+    if let Some(id) = &actor.id {
+        return id.clone();
+    }
+    actor.principal_id.clone()
+}
+
+fn selector_score(seed: u64, key: &str) -> f64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    key.hash(&mut hasher);
+    let value = hasher.finish();
+    let max = u64::MAX as f64;
+    (value as f64) / max
 }

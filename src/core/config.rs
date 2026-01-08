@@ -42,8 +42,11 @@ pub struct Config {
     pub traffic: TrafficConfig,
     /// Output sink configuration.
     pub output: OutputConfig,
+    /// Actor population configuration for multi-source runs.
+    pub population: PopulationRunConfig,
     /// Source-specific configuration.
-    pub source: SourceConfig,
+    #[serde(rename = "source")]
+    pub sources: Vec<SourceConfig>,
 }
 
 impl Config {
@@ -77,8 +80,6 @@ pub struct OutputConfig {
     pub dir: String,
     /// File write settings.
     pub files: FileConfig,
-    /// Output format selection.
-    pub format: FormatConfig,
 }
 
 /// Controls file output and flush behavior.
@@ -104,25 +105,87 @@ pub struct FormatOptions {
     pub compression: Option<String>,
 }
 
+/// Actor population configuration used when generating logs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PopulationRunConfig {
+    /// Path to the actors.toml config (for selectors).
+    pub actors_config_path: String,
+    /// Path to the actor population parquet file.
+    pub actor_population_path: String,
+}
+
+/// Per-source output configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceOutputConfig {
+    /// Optional subdirectory under output.dir.
+    pub dir: Option<String>,
+    /// Output format selection.
+    pub format: FormatConfig,
+}
+
 /// Source configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceConfig {
     #[serde(rename = "cloudtrail", alias = "cloud_trail")]
     CloudTrail(CloudTrailSourceConfig),
+    #[serde(rename = "entra_id", alias = "entra")]
+    EntraId(EntraIdSourceConfig),
+}
+
+impl SourceConfig {
+    pub fn id(&self) -> &str {
+        match self {
+            SourceConfig::CloudTrail(config) => &config.id,
+            SourceConfig::EntraId(config) => &config.id,
+        }
+    }
+
+    pub fn output(&self) -> &SourceOutputConfig {
+        match self {
+            SourceConfig::CloudTrail(config) => &config.output,
+            SourceConfig::EntraId(config) => &config.output,
+        }
+    }
+
+    pub fn source_type(&self) -> &'static str {
+        match self {
+            SourceConfig::CloudTrail(_) => "cloudtrail",
+            SourceConfig::EntraId(_) => "entra_id",
+        }
+    }
 }
 
 /// CloudTrail-specific configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudTrailSourceConfig {
+    /// Source identifier used by population selectors.
+    pub id: String,
+    /// Per-source output settings.
+    pub output: SourceOutputConfig,
     /// Use curated event weights for CloudTrail.
     pub curated: bool,
-    /// Optional path to an actor population Parquet file.
-    pub actor_population_path: Option<String>,
     /// Allowed regions.
     pub regions: Option<Vec<String>>,
     /// Optional region weighting for selection.
     pub region_distribution: Option<Vec<f64>>,
+}
+
+/// Entra ID-specific configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntraIdSourceConfig {
+    /// Source identifier used by population selectors.
+    pub id: String,
+    /// Per-source output settings.
+    pub output: SourceOutputConfig,
+    /// Tenant ID (GUID).
+    pub tenant_id: String,
+    /// Tenant domain (e.g. contoso.onmicrosoft.com).
+    pub tenant_domain: String,
+    /// Log categories to emit.
+    pub categories: Option<Vec<String>>,
+    /// Optional weights aligned with categories.
+    pub category_weights: Option<Vec<f64>>,
 }
 
 /// Role weight for actor generation.
@@ -168,6 +231,8 @@ pub struct PopulationActorsConfig {
     pub service_profiles: Option<Vec<ServiceProfileConfig>>,
     /// Explicit actors with fixed traits and overrides.
     pub actor: Option<Vec<ExplicitActorConfig>>,
+    /// Per-source selectors for shared populations.
+    pub selector: Option<Vec<PopulationSelectorConfig>>,
 }
 
 /// Per-role configuration entry.
@@ -204,6 +269,15 @@ pub struct ExplicitActorConfig {
     pub tags: Vec<String>,
     #[serde(default)]
     pub event_bias: HashMap<String, f64>,
+}
+
+/// Per-source selector settings for population reuse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PopulationSelectorConfig {
+    pub source_id: String,
+    pub human_ratio: f64,
+    pub service_ratio: f64,
+    pub seed: Option<u64>,
 }
 
 /// Error rate range configuration for actor populations.
