@@ -3,15 +3,21 @@ name = "seclog"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+zerobus = ["dep:databricks-zerobus-ingest-sdk", "dep:tokio"]
+
 [dependencies]
 arrow-array = "51.0"
 arrow-schema = "51.0"
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", features = ["clock"] }
 chrono-tz = "0.10"
+databricks-zerobus-ingest-sdk = { version = "2.0.0", optional = true }
 flate2 = "1.0"
 parquet = { version = "51.0", features = ["arrow"] }
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time"], optional = true }
 toml = "0.8"

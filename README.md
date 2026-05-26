@@ -1,8 +1,8 @@
 # Seclog
 
-High-volume SIEM log generator that creates realistic CloudTrail-style data from a reproducible actor population.
+High-volume SIEM log generator that creates realistic source-native security log data from a reproducible actor population.
 
-Use it to seed demo pipelines, load test SIEM analytics, or generate repeatable datasets with controlled volume, timing, and behavior.
+Use it to seed test pipelines, load test SIEM analytics, or generate repeatable datasets with controlled volume, timing, and behavior.
 
 Data realism comes from actor-driven generation: each actor has a role or service profile, session windows, timezones, and per-actor error rates. Events are selected with role-aware sequences and curated weights, then emitted over an accelerated or real-time clock. This produces traffic patterns that look like real users and service accounts, rather than uniform synthetic noise.
 
@@ -23,12 +23,35 @@ cargo run --bin seclog -- actors --config examples/actors.toml --output ./actors
 cargo run --bin seclog -- gen --config examples/config.toml --output ./out-test
 ```
 
+To generate Databricks audit rows from a shared identity registry:
+```bash
+cargo run --bin seclog -- gen --config examples/databricks_audit.toml --output ./out-databricks
+```
+
+To generate Okta System Log events from a shared identity registry:
+```bash
+cargo run --bin seclog -- gen --config examples/okta_system_log.toml --output ./out-okta
+```
+
+To generate CloudTrail, Databricks audit, and Okta System Log from one shared
+identity registry in a single run:
+```bash
+cargo run --bin seclog -- gen --config examples/all_sources.toml --max-events 100
+```
+
+To stream the same sources to Databricks Zerobus Ingest:
+```bash
+export DATABRICKS_CLIENT_ID="..."
+export DATABRICKS_CLIENT_SECRET="..."
+cargo run --features zerobus --bin seclog -- gen --config examples/all_sources_zerobus.toml --max-events 100
+```
+
 ## CLI usage
 ### `seclog gen`
 | Flag | Required | Default | Effect |
 | --- | --- | --- | --- |
 | `--config` | yes | - | Path to `config.toml`. |
-| `--output` | no | from config | Overrides `output.dir`. |
+| `--output` | no | from config | Overrides file-output `output.dir`. Not valid for Zerobus output. |
 | `--dry-run` | no | false | Prints the loaded config and exits. |
 | `--max-events` | no | none | Stops after emitting this many events. |
 | `--max-seconds` | no | none | Stops after this many **wall‑clock seconds** (e.g. `300` for 5 minutes). |
@@ -41,6 +64,36 @@ cargo run --bin seclog -- gen --config examples/config.toml --output ./out-test
 | --- | --- | --- | --- |
 | `--config` | yes | - | Path to `actors.toml`. |
 | `--output` | yes | - | Output Parquet file for the actor population. |
+
+## Shared identity registry
+Sources that need cross-system identity correlation can load an identity registry TOML.
+The registry maps stable internal actor IDs to source-native identifiers such as email,
+Okta user ID, Databricks username, and AWS principal identifiers. Scenario-specific
+people and service accounts should live in registry data files rather than source code.
+
+```toml
+name = "example_identity_registry"
+
+[[identity]]
+actor_id = "user-001"
+email = "user.one@example.com"
+employee_id = "E-000001"
+display_name = "User One"
+role_persona = "Business user"
+department = "Business Operations"
+home_location = "Sydney, NSW, Australia"
+normal_countries_regions = ["Australia", "Australia/NSW"]
+okta_user_id = "00u-example-user-001"
+databricks_username = "user.one@example.com"
+service_account = false
+tags = ["human"]
+
+[[identity.aws_principals]]
+account_id = "123456789012"
+principal_id = "AIDAEXAMPLEUSER001"
+arn = "arn:aws:iam::123456789012:user/user.one"
+access_key_id = "AKIAEXAMPLEUSER01"
+```
 
 ## actors.toml reference (population generation)
 `actors.toml` controls how the actor population is built and stored as Parquet.
@@ -231,19 +284,191 @@ region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
 | `traffic.start_time` | string | no | now | Shifts event timestamps; use for backfill windows. |
 | `traffic.time_scale` | float | no | 1.0 | Increases/decreases how fast simulated time advances. |
 | `[output]` | table | yes | - | Output sink configuration. |
-| `output.dir` | string | yes | - | Output directory for generated files. |
-| `[output.files]` | table | yes | - | File output controls. |
-| `output.files.target_size_mb` | int | yes | - | Lower values create more, smaller files. |
-| `output.files.max_age_seconds` | int | yes | - | Forces periodic file rollover under low volume. |
-| `[output.format]` | table | yes | - | Output format selection. |
-| `output.format.type` | string | yes | - | `parquet` (structured) or `jsonl` (CloudTrail Records JSON). |
+| `output.type` | string | no | file | Set to `zerobus` for Databricks Zerobus output; omit for file output. |
+| `output.dir` | string | file only | - | Output directory for generated files. |
+| `[output.files]` | table | file only | - | File output controls. |
+| `output.files.target_size_mb` | int | file only | - | Lower values create more, smaller files. |
+| `output.files.max_age_seconds` | int | file only | - | Forces periodic file rollover under low volume. |
+| `[output.format]` | table | file only | - | Output format selection. |
+| `output.format.type` | string | file only | - | `parquet` (structured) or `jsonl` (CloudTrail Records JSON). |
 | `output.format.compression` | string | no | none | `jsonl` supports `gzip` to write `.json.gz`. |
-| `[source]` | table | yes | - | Source configuration (CloudTrail). |
-| `source.type` | string | yes | - | Must be `cloudtrail`. |
+| `[source]` | table | yes | - | Source configuration. |
+| `source.type` | string | yes | - | Source generator: `cloudtrail`, `databricks_audit`, `okta`, or `multi`. |
 | `source.curated` | bool | yes | - | Enables curated event set and weights. |
-| `source.actor_population_path` | string | yes | - | Points to the actors parquet; generation fails if missing. |
+| `source.actor_population_path` | string | no | - | For CloudTrail Parquet-backed generation, points to the actors parquet. |
+| `source.identity_registry_path` | string | no | - | For CloudTrail registry-backed generation, uses the shared identity registry instead of an actor Parquet file. |
 | `source.regions` | string[] | no | defaults | Region list for event emission. |
 | `source.region_distribution` | float[] | no | none | Weights aligned with `source.regions`; must match length. |
+
+### Databricks audit source
+Use `source.type = "databricks_audit"` to emit payloads shaped like
+Databricks `system.access.audit` rows. The source loads a shared identity
+registry, generates optional baseline activity for each identity, and can inject
+deterministic audit events for a scenario.
+
+This source is intentionally limited today. It preserves the real
+`system.access.audit` row shape and supports deterministic baseline rows plus
+explicit injected events, but it is not yet a broad Databricks audit catalog
+covering every service/action family.
+
+```toml
+[source]
+type = "databricks_audit"
+identity_registry_path = "./examples/identity_registry.toml"
+account_id = "example-account-id"
+workspace_id = "1234567890"
+baseline_events_per_actor = 2
+
+[source.baseline_source_ips]
+user-001 = ["198.51.100.10"]
+
+[[source.event]]
+actor_id = "user-001"
+offset_seconds = 10
+source_ip_address = "203.0.113.45"
+service_name = "accounts"
+action_name = "IpAccessDenied"
+request_params = { login_type = "browser" }
+response_status_code = 403
+response_error_message = "Current IP is not allowed"
+```
+
+Databricks audit payloads include `event_time`, `source_ip_address`,
+`user_identity.email`, `service_name`, `action_name`, `request_params`,
+`response.status_code`, and `response.error_message`. The generator follows the
+observed `system.access.audit` schema: `request_params` is a `map<string,string>`,
+`response` is `struct<status_code:int,error_message:string,result:string>`, and
+`identity_metadata` includes `run_by`, `run_as`, `acting_resource`,
+`run_by_display_name`, and `run_as_display_name`.
+
+### Okta System Log source
+Use `source.type = "okta"` to emit payloads shaped like Okta System Log
+`LogEvent` records. The alias `okta_system_log` is also accepted. The source
+loads the shared identity registry, maps generated actors to Okta user/client
+IDs, emits deterministic baseline auth/session/app-access activity, and can
+inject explicit System Log events.
+
+This source is intentionally limited today. It preserves the real root
+`LogEvent` shape and selected nested objects, including `actor`,
+`authenticationContext`, `client`, `debugContext`, `outcome`, `request`,
+`securityContext`, `target`, and `transaction`, but it is not a full
+implementation of the Okta event-type catalog.
+
+```toml
+[source]
+type = "okta"
+identity_registry_path = "./examples/identity_registry.toml"
+org_id = "okta-example-org"
+baseline_events_per_actor = 2
+
+[source.baseline_source_ips]
+user-001 = ["198.51.100.10"]
+
+[[source.event]]
+actor_id = "user-001"
+offset_seconds = 10
+event_type = "app.generic.unauth_app_access_attempt"
+display_message = "User attempted unauthorized access to app"
+legacy_event_type = "app.generic.unauth_app_access_attempt"
+outcome_result = "FAILURE"
+severity = "WARN"
+source_ip_address = "203.0.113.45"
+source_geo_country = "Example Country"
+source_geo_city = "Example City"
+
+[[source.event.target]]
+id = "0oa-example-operations"
+type = "AppInstance"
+alternate_id = "Operations Portal"
+display_name = "Operations Portal"
+detail_entry = { signOnModeType = "SAML_2_0" }
+```
+
+Okta payloads use Okta camelCase field names. `client.ipAddress` is mirrored to
+`request.ipChain[0].ip`, `debugContext.debugData` remains a dynamic JSON object,
+and `target` entries carry typed `type` values such as `AppInstance` and
+`AppUser`; consumers should search targets by type rather than array position.
+
+### Multi-source generation
+Use `source.type = "multi"` when one run should emit independent log sources
+from the same actor population. Each child source remains source-native. For
+file output, `source.outputs` routes events by normalized source name.
+
+```toml
+[source]
+type = "multi"
+identity_registry_path = "./examples/identity_registry.toml"
+
+[source.outputs.cloudtrail]
+dir = "./out-all-sources/cloudtrail"
+
+[source.outputs.cloudtrail.files]
+target_size_mb = 50
+max_age_seconds = 10
+
+[source.outputs.cloudtrail.format]
+type = "jsonl"
+compression = "gzip"
+
+[[source.sources]]
+type = "cloudtrail"
+curated = true
+
+[[source.sources]]
+type = "databricks_audit"
+account_id = "example-account-id"
+workspace_id = "1234567890"
+
+[[source.sources]]
+type = "okta"
+org_id = "okta-example-org"
+```
+
+The built-in route keys are `cloudtrail`, `databricks_audit`, and
+`okta_system_log`. If a file route is not listed under `source.outputs`, the
+top-level file `[output]` sink is used as a fallback.
+
+### Databricks Zerobus output
+Use `[output] type = "zerobus"` to stream generated rows directly into
+pre-created Unity Catalog Delta tables through Databricks Zerobus Ingest. This
+is an output sink, not a source; generated events remain source-native and are
+routed by `event.envelope.source`.
+
+```toml
+[output]
+type = "zerobus"
+workspace_url = "https://dbc-example.cloud.databricks.com"
+endpoint = "https://1234567890123456.zerobus.us-west-2.cloud.databricks.com"
+client_id_env = "DATABRICKS_CLIENT_ID"
+client_secret_env = "DATABRICKS_CLIENT_SECRET"
+batch_size = 500
+max_inflight_requests = 10000
+flush_interval_ms = 1000
+
+[output.tables]
+cloudtrail = "main.seclog.cloudtrail_events"
+databricks_audit = "main.seclog.databricks_audit_events"
+okta_system_log = "main.seclog.okta_system_log_events"
+```
+
+Build with the optional feature:
+```bash
+cargo run --features zerobus --bin seclog -- gen --config examples/all_sources_zerobus.toml
+```
+
+Secrets are read from the configured environment variables and are never stored
+in TOML. Target tables must already exist as managed Delta tables in the same
+region as the Zerobus endpoint. The service principal needs `USE CATALOG`,
+`USE SCHEMA`, `SELECT`, and `MODIFY` on the destination objects. A table DDL
+template is available at `scripts/databricks/zerobus/create_seclog_tables.sql`.
+
+Each destination table uses the common seclog row shape:
+`event_time`, `event_date`, `event_ts_ms`, `source`, `event_type`,
+`actor_id`, `actor_kind`, `actor_name`, `target_id`, `target_kind`,
+`target_name`, `outcome`, `ip`, `user_agent`, `session_id`, `tenant_id`,
+`envelope_json`, `payload_json`, `run_id`, and `generated_at`.
+`payload_json` preserves the exact CloudTrail, Databricks audit, or Okta
+payload emitted by the source generator.
 
 ### Region distribution (array form)
 Provide weights aligned with the `regions` list:

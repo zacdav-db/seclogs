@@ -2,6 +2,8 @@
 //!
 //! Buffers Arrow batches per account/region and rotates by size or age.
 
+use crate::core::event::{Actor, Event, Geo, Outcome, Target};
+use crate::core::traits::EventWriter;
 use arrow_array::builder::{BooleanBuilder, Float64Builder, StringBuilder, StructBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
@@ -9,8 +11,6 @@ use chrono::Utc;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
-use crate::core::event::{Actor, Event, Geo, Outcome, Target};
-use crate::core::traits::EventWriter;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde_json::Value;
@@ -53,8 +53,13 @@ impl ParquetWriter {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
         let schema = build_schema();
-        let max_age = max_age_seconds
-            .and_then(|seconds| if seconds > 0 { Some(Duration::from_secs(seconds)) } else { None });
+        let max_age = max_age_seconds.and_then(|seconds| {
+            if seconds > 0 {
+                Some(Duration::from_secs(seconds))
+            } else {
+                None
+            }
+        });
         Ok(Self {
             dir,
             target_size_bytes: target_size_mb.saturating_mul(1024 * 1024),
@@ -64,7 +69,6 @@ impl ParquetWriter {
             regions: HashMap::new(),
         })
     }
-
 }
 
 impl EventWriter for ParquetWriter {
@@ -81,6 +85,7 @@ impl EventWriter for ParquetWriter {
         let size = estimate_event_size(event, payload_json.as_deref());
         let context = file_context_from_event(event);
         let key = RegionKey {
+            source: context.source,
             account_id: context.account_id,
             region: context.region,
         };
@@ -193,10 +198,22 @@ impl EventBatchBuilder {
     fn append_envelope(&mut self, envelope: &crate::core::event::EventEnvelope) {
         let builder = &mut self.envelope;
 
-        append_string(builder.field_builder::<StringBuilder>(0).unwrap(), Some(&envelope.schema_version));
-        append_string(builder.field_builder::<StringBuilder>(1).unwrap(), Some(&envelope.timestamp));
-        append_string(builder.field_builder::<StringBuilder>(2).unwrap(), Some(&envelope.source));
-        append_string(builder.field_builder::<StringBuilder>(3).unwrap(), Some(&envelope.event_type));
+        append_string(
+            builder.field_builder::<StringBuilder>(0).unwrap(),
+            Some(&envelope.schema_version),
+        );
+        append_string(
+            builder.field_builder::<StringBuilder>(1).unwrap(),
+            Some(&envelope.timestamp),
+        );
+        append_string(
+            builder.field_builder::<StringBuilder>(2).unwrap(),
+            Some(&envelope.source),
+        );
+        append_string(
+            builder.field_builder::<StringBuilder>(3).unwrap(),
+            Some(&envelope.event_type),
+        );
 
         let actor_builder = builder.field_builder::<StructBuilder>(4).unwrap();
         append_actor(actor_builder, &envelope.actor);
@@ -212,7 +229,10 @@ impl EventBatchBuilder {
         let geo_builder = builder.field_builder::<StructBuilder>(7).unwrap();
         append_geo(geo_builder, envelope.geo.as_ref());
 
-        append_string(builder.field_builder::<StringBuilder>(8).unwrap(), envelope.ip.as_deref());
+        append_string(
+            builder.field_builder::<StringBuilder>(8).unwrap(),
+            envelope.ip.as_deref(),
+        );
         append_string(
             builder.field_builder::<StringBuilder>(9).unwrap(),
             envelope.user_agent.as_deref(),
@@ -314,6 +334,7 @@ fn build_schema() -> SchemaRef {
 
 fn build_file_path(
     dir: &Path,
+    source: &str,
     account_id: &str,
     region: &str,
     stamp: &str,
@@ -321,12 +342,13 @@ fn build_file_path(
     ext: &str,
 ) -> PathBuf {
     dir.join(format!(
-        "{account_id}_CloudTrail_{region}_{stamp}_{unique}.{ext}"
+        "{account_id}_{source}_{region}_{stamp}_{unique}.{ext}"
     ))
 }
 
 fn open_writer(
     dir: &Path,
+    source: &str,
     account_id: &str,
     region: &str,
     stamp: &str,
@@ -334,7 +356,7 @@ fn open_writer(
     ext: &str,
     schema: SchemaRef,
 ) -> io::Result<(ArrowWriter<File>, PathBuf)> {
-    let path = build_file_path(dir, account_id, region, stamp, unique, ext);
+    let path = build_file_path(dir, source, account_id, region, stamp, unique, ext);
     let file = File::create(&path)?;
     let props = WriterProperties::builder().build();
     let writer = ArrowWriter::try_new(file, schema, Some(props)).map_err(map_parquet_err)?;
@@ -342,8 +364,14 @@ fn open_writer(
 }
 
 fn append_actor(builder: &mut StructBuilder, actor: &Actor) {
-    append_string(builder.field_builder::<StringBuilder>(0).unwrap(), Some(&actor.id));
-    append_string(builder.field_builder::<StringBuilder>(1).unwrap(), Some(&actor.kind));
+    append_string(
+        builder.field_builder::<StringBuilder>(0).unwrap(),
+        Some(&actor.id),
+    );
+    append_string(
+        builder.field_builder::<StringBuilder>(1).unwrap(),
+        Some(&actor.kind),
+    );
     append_string(
         builder.field_builder::<StringBuilder>(2).unwrap(),
         actor.name.as_deref(),
@@ -354,8 +382,14 @@ fn append_actor(builder: &mut StructBuilder, actor: &Actor) {
 fn append_target(builder: &mut StructBuilder, target: Option<&Target>) {
     match target {
         Some(target) => {
-            append_string(builder.field_builder::<StringBuilder>(0).unwrap(), Some(&target.id));
-            append_string(builder.field_builder::<StringBuilder>(1).unwrap(), Some(&target.kind));
+            append_string(
+                builder.field_builder::<StringBuilder>(0).unwrap(),
+                Some(&target.id),
+            );
+            append_string(
+                builder.field_builder::<StringBuilder>(1).unwrap(),
+                Some(&target.kind),
+            );
             append_string(
                 builder.field_builder::<StringBuilder>(2).unwrap(),
                 target.name.as_deref(),
@@ -374,7 +408,10 @@ fn append_target(builder: &mut StructBuilder, target: Option<&Target>) {
 fn append_geo(builder: &mut StructBuilder, geo: Option<&Geo>) {
     match geo {
         Some(geo) => {
-            append_string(builder.field_builder::<StringBuilder>(0).unwrap(), Some(&geo.country));
+            append_string(
+                builder.field_builder::<StringBuilder>(0).unwrap(),
+                Some(&geo.country),
+            );
             append_string(
                 builder.field_builder::<StringBuilder>(1).unwrap(),
                 geo.region.as_deref(),
@@ -711,11 +748,13 @@ fn unique_id() -> String {
 }
 
 struct FileContext {
+    source: String,
     account_id: String,
     region: String,
 }
 
 fn file_context_from_event(event: &Event) -> FileContext {
+    let source = source_file_label(&event.envelope.source);
     let account_id = event
         .envelope
         .tenant_id
@@ -729,11 +768,16 @@ fn file_context_from_event(event: &Event) -> FileContext {
         .unwrap_or("global")
         .to_string();
 
-    FileContext { account_id, region }
+    FileContext {
+        source,
+        account_id,
+        region,
+    }
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 struct RegionKey {
+    source: String,
     account_id: String,
     region: String,
 }
@@ -769,6 +813,7 @@ fn flush_region(
     let unique = unique_id();
     let (mut writer, temp_path) = open_writer(
         dir,
+        &key.source,
         &key.account_id,
         &key.region,
         &stamp,
@@ -778,9 +823,35 @@ fn flush_region(
     )?;
     writer.write(&batch).map_err(map_parquet_err)?;
     writer.close().map_err(map_parquet_err)?;
-    let final_path = build_file_path(dir, &key.account_id, &key.region, &stamp, &unique, "parquet");
+    let final_path = build_file_path(
+        dir,
+        &key.source,
+        &key.account_id,
+        &key.region,
+        &stamp,
+        &unique,
+        "parquet",
+    );
     fs::rename(&temp_path, &final_path)?;
     state.current_size = 0;
     state.first_event_at = None;
     Ok(())
+}
+
+fn source_file_label(source: &str) -> String {
+    match source {
+        "cloudtrail" => "CloudTrail".to_string(),
+        "databricks_audit" => "DatabricksAudit".to_string(),
+        "okta_system_log" => "OktaSystemLog".to_string(),
+        other => other
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
+    }
 }

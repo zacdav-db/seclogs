@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
+use toml::Value as TomlValue;
 
 /// Error while loading or parsing a config file.
 #[derive(Debug)]
@@ -72,7 +73,36 @@ pub struct TimezoneWeight {
 
 /// Output sink configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputConfig {
+#[serde(untagged)]
+pub enum OutputConfig {
+    Zerobus(ZerobusOutputConfig),
+    File(FileOutputConfig),
+}
+
+impl OutputConfig {
+    pub fn as_file(&self) -> Option<&FileOutputConfig> {
+        match self {
+            OutputConfig::File(config) => Some(config),
+            OutputConfig::Zerobus(_) => None,
+        }
+    }
+
+    pub fn override_file_dir(&mut self, dir: String) -> Result<(), String> {
+        match self {
+            OutputConfig::File(config) => {
+                config.dir = dir;
+                Ok(())
+            }
+            OutputConfig::Zerobus(_) => {
+                Err("--output can only override file output directories".to_string())
+            }
+        }
+    }
+}
+
+/// File output sink configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileOutputConfig {
     /// Output directory for generated files.
     pub dir: String,
     /// File write settings.
@@ -104,12 +134,65 @@ pub struct FormatOptions {
     pub compression: Option<String>,
 }
 
+/// Zerobus output sink configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZerobusOutputConfig {
+    #[serde(rename = "type")]
+    pub output_type: ZerobusOutputType,
+    pub workspace_url: String,
+    pub endpoint: String,
+    #[serde(default = "default_zerobus_client_id_env")]
+    pub client_id_env: String,
+    #[serde(default = "default_zerobus_client_secret_env")]
+    pub client_secret_env: String,
+    #[serde(default = "default_zerobus_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_zerobus_max_inflight_requests")]
+    pub max_inflight_requests: usize,
+    #[serde(default = "default_zerobus_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+    pub run_id: Option<String>,
+    pub tables: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZerobusOutputType {
+    Zerobus,
+}
+
+fn default_zerobus_client_id_env() -> String {
+    "DATABRICKS_CLIENT_ID".to_string()
+}
+
+fn default_zerobus_client_secret_env() -> String {
+    "DATABRICKS_CLIENT_SECRET".to_string()
+}
+
+fn default_zerobus_batch_size() -> usize {
+    500
+}
+
+fn default_zerobus_max_inflight_requests() -> usize {
+    10_000
+}
+
+fn default_zerobus_flush_interval_ms() -> u64 {
+    1_000
+}
+
 /// Source configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceConfig {
     #[serde(rename = "cloudtrail", alias = "cloud_trail")]
     CloudTrail(CloudTrailSourceConfig),
+    #[serde(rename = "databricks_audit", alias = "databricks")]
+    DatabricksAudit(DatabricksAuditSourceConfig),
+    #[serde(rename = "okta", alias = "okta_system_log")]
+    OktaSystemLog(OktaSystemLogSourceConfig),
+    #[serde(rename = "multi", alias = "combined")]
+    Multi(MultiSourceConfig),
 }
 
 /// CloudTrail-specific configuration.
@@ -119,10 +202,184 @@ pub struct CloudTrailSourceConfig {
     pub curated: bool,
     /// Optional path to an actor population Parquet file.
     pub actor_population_path: Option<String>,
+    /// Optional path to a shared identity registry TOML file.
+    pub identity_registry_path: Option<String>,
+    /// Optional deterministic source IP pools for registry-backed rows, keyed by actor ID.
+    pub baseline_source_ips: Option<HashMap<String, Vec<String>>>,
     /// Allowed regions.
     pub regions: Option<Vec<String>>,
     /// Optional region weighting for selection.
     pub region_distribution: Option<Vec<f64>>,
+}
+
+/// Composite source configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiSourceConfig {
+    /// Optional shared identity registry inherited by child sources.
+    pub identity_registry_path: Option<String>,
+    /// Child sources to run from one generator loop.
+    #[serde(default, rename = "sources")]
+    pub sources: Vec<SourceConfig>,
+    /// Optional source-specific output sinks keyed by event envelope source.
+    pub outputs: Option<HashMap<String, FileOutputConfig>>,
+}
+
+/// Databricks audit-log generation configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabricksAuditSourceConfig {
+    /// Path to a shared identity registry TOML file.
+    #[serde(default)]
+    pub identity_registry_path: String,
+    /// Databricks account ID to place on generated audit rows.
+    pub account_id: String,
+    /// Workspace ID to place on generated audit rows.
+    pub workspace_id: String,
+    /// Optional finite number of normal baseline rows to emit for each identity.
+    pub baseline_events_per_actor: Option<usize>,
+    /// Optional deterministic source IP pools for baseline rows, keyed by actor ID.
+    pub baseline_source_ips: Option<HashMap<String, Vec<String>>>,
+    /// Deterministic audit events to inject into the stream.
+    #[serde(default, rename = "event")]
+    pub events: Vec<DatabricksAuditEventConfig>,
+}
+
+/// Explicit Databricks audit event injection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabricksAuditEventConfig {
+    pub actor_id: String,
+    pub offset_seconds: Option<i64>,
+    pub event_time: Option<String>,
+    pub source_ip_address: String,
+    pub service_name: String,
+    pub action_name: String,
+    pub request_params: Option<BTreeMap<String, String>>,
+    pub response_status_code: i32,
+    pub response_error_message: Option<String>,
+    pub response_result: Option<String>,
+    pub user_agent: Option<String>,
+    pub session_id: Option<String>,
+    pub audit_level: Option<String>,
+    pub source_geo_country: Option<String>,
+    pub source_geo_region: Option<String>,
+    pub source_geo_city: Option<String>,
+}
+
+/// Okta System Log generation configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OktaSystemLogSourceConfig {
+    /// Path to a shared identity registry TOML file.
+    #[serde(default)]
+    pub identity_registry_path: String,
+    /// Optional Okta organization identifier used in the normalized envelope.
+    pub org_id: Option<String>,
+    /// Optional finite number of normal baseline rows to emit for each identity.
+    pub baseline_events_per_actor: Option<usize>,
+    /// Optional deterministic source IP pools for baseline rows, keyed by actor ID.
+    pub baseline_source_ips: Option<HashMap<String, Vec<String>>>,
+    /// Deterministic System Log events to inject into the stream.
+    #[serde(default, rename = "event")]
+    pub events: Vec<OktaSystemLogEventConfig>,
+}
+
+/// Explicit Okta System Log event injection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OktaSystemLogEventConfig {
+    pub actor_id: String,
+    pub offset_seconds: Option<i64>,
+    pub published: Option<String>,
+    pub event_type: String,
+    pub display_message: String,
+    pub legacy_event_type: Option<String>,
+    pub outcome_result: OktaOutcomeResult,
+    pub outcome_reason: Option<String>,
+    pub severity: Option<OktaSeverity>,
+    pub source_ip_address: String,
+    pub source_geo_country: Option<String>,
+    pub source_geo_region: Option<String>,
+    pub source_geo_city: Option<String>,
+    pub source_geo_postal_code: Option<String>,
+    pub source_geo_lat: Option<f64>,
+    pub source_geo_lon: Option<f64>,
+    pub user_agent: Option<String>,
+    pub user_agent_browser: Option<String>,
+    pub user_agent_os: Option<String>,
+    pub client_device: Option<String>,
+    pub client_id: Option<String>,
+    pub client_zone: Option<String>,
+    pub authentication_provider: Option<String>,
+    pub credential_provider: Option<String>,
+    pub credential_type: Option<String>,
+    pub external_session_id: Option<String>,
+    pub transaction_id: Option<String>,
+    pub transaction_type: Option<OktaTransactionType>,
+    pub transaction_detail: Option<TomlValue>,
+    pub actor_detail_entry: Option<TomlValue>,
+    pub debug_data: Option<BTreeMap<String, TomlValue>>,
+    pub security_context: Option<OktaSecurityContextConfig>,
+    #[serde(default, rename = "target")]
+    pub targets: Vec<OktaTargetConfig>,
+}
+
+/// Dynamic security context overrides for explicit Okta System Log events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OktaSecurityContextConfig {
+    pub as_number: Option<i64>,
+    pub as_org: Option<String>,
+    pub bot_protection: Option<TomlValue>,
+    pub domain: Option<String>,
+    pub ip_details: Option<TomlValue>,
+    pub isp: Option<String>,
+    pub is_proxy: Option<bool>,
+    pub risk: Option<TomlValue>,
+    pub user_behaviors: Option<TomlValue>,
+}
+
+/// Explicit Okta target entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OktaTargetConfig {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub target_type: String,
+    pub alternate_id: Option<String>,
+    pub change_details: Option<TomlValue>,
+    pub detail_entry: Option<TomlValue>,
+    pub display_name: Option<String>,
+}
+
+/// Okta System Log outcome result values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OktaOutcomeResult {
+    Success,
+    Failure,
+    Skipped,
+    Allow,
+    Deny,
+    Challenge,
+    Unknown,
+    RateLimit,
+    Deferred,
+    Scheduled,
+    Abandoned,
+    Unanswered,
+}
+
+/// Okta System Log severity values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OktaSeverity {
+    Debug,
+    Error,
+    Info,
+    Warn,
+}
+
+/// Okta System Log transaction type values used by this generator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OktaTransactionType {
+    Web,
+    Job,
 }
 
 /// Role weight for actor generation.
@@ -239,4 +496,63 @@ pub enum ServicePatternConfig {
     Constant,
     Diurnal,
     Bursty,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_sources_example_uses_shared_registry_and_routed_outputs() {
+        let config = Config::from_path("examples/all_sources.toml").unwrap();
+        assert!(matches!(&config.output, OutputConfig::File(_)));
+
+        let SourceConfig::Multi(source) = config.source else {
+            panic!("expected multi source");
+        };
+
+        assert_eq!(
+            source.identity_registry_path.as_deref(),
+            Some("./examples/identity_registry.toml")
+        );
+        assert_eq!(source.sources.len(), 3);
+
+        let output_keys = source.outputs.unwrap();
+        assert!(output_keys.contains_key("cloudtrail"));
+        assert!(output_keys.contains_key("databricks_audit"));
+        assert!(output_keys.contains_key("okta_system_log"));
+
+        assert!(matches!(&source.sources[0], SourceConfig::CloudTrail(_)));
+        assert!(matches!(
+            &source.sources[1],
+            SourceConfig::DatabricksAudit(_)
+        ));
+        assert!(matches!(&source.sources[2], SourceConfig::OktaSystemLog(_)));
+    }
+
+    #[test]
+    fn zerobus_example_uses_source_table_routes() {
+        let config = Config::from_path("examples/all_sources_zerobus.toml").unwrap();
+        let OutputConfig::Zerobus(output) = config.output else {
+            panic!("expected zerobus output");
+        };
+
+        assert_eq!(output.output_type, ZerobusOutputType::Zerobus);
+        assert_eq!(output.client_id_env, "DATABRICKS_CLIENT_ID");
+        assert_eq!(output.client_secret_env, "DATABRICKS_CLIENT_SECRET");
+        assert_eq!(output.batch_size, 500);
+        assert_eq!(output.max_inflight_requests, 10_000);
+        assert_eq!(
+            output.tables.get("cloudtrail").map(String::as_str),
+            Some("main.seclog.cloudtrail_events")
+        );
+        assert_eq!(
+            output.tables.get("databricks_audit").map(String::as_str),
+            Some("main.seclog.databricks_audit_events")
+        );
+        assert_eq!(
+            output.tables.get("okta_system_log").map(String::as_str),
+            Some("main.seclog.okta_system_log_events")
+        );
+    }
 }

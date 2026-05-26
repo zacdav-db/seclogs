@@ -1,0 +1,53 @@
+seed = 42
+
+[traffic]
+start_time = "2026-01-01T00:00:00Z"
+time_scale = 36000
+
+[output]
+dir = "./out-okta"
+
+[output.files]
+target_size_mb = 50
+max_age_seconds = 10
+
+[output.format]
+type = "parquet"
+compression = "none"
+
+[source]
+type = "okta"
+# Limited-scope source: emits schema-faithful System Log baseline events and
+# explicit injected auth/session/app-access events, not the full Okta catalog.
+identity_registry_path = "./examples/identity_registry.toml"
+org_id = "okta-example-org"
+baseline_events_per_actor = 2
+
+[source.baseline_source_ips]
+user-001 = ["198.51.100.10"]
+user-002 = ["203.0.113.62"]
+user-003 = ["203.0.113.63"]
+svc-001 = ["10.24.1.10"]
+
+[[source.event]]
+actor_id = "user-001"
+offset_seconds = 10
+event_type = "app.generic.unauth_app_access_attempt"
+display_message = "User attempted unauthorized access to app"
+legacy_event_type = "app.generic.unauth_app_access_attempt"
+outcome_result = "FAILURE"
+severity = "WARN"
+source_ip_address = "203.0.113.45"
+source_geo_country = "Example Country"
+source_geo_city = "Example City"
+client_zone = "Untrusted"
+
+[source.event.debug_data]
+requestUri = "/idp/idx/identify"
+
+[[source.event.target]]
+id = "0oa-example-operations"
+type = "AppInstance"
+alternate_id = "Operations Portal"
+display_name = "Operations Portal"
+detail_entry = { signOnModeType = "SAML_2_0" }

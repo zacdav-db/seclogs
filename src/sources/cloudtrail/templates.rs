@@ -127,7 +127,7 @@ fn console_login(base: BaseFields) -> CloudTrailEvent {
 }
 
 fn assume_role(base: BaseFields, rng: &mut impl Rng) -> CloudTrailEvent {
-    let role_name = format!("demo-role-{}", random_alpha(rng, 4));
+    let role_name = format!("workload-role-{}", random_alpha(rng, 4));
     let role_arn = format!("arn:aws:iam::{}:role/{}", base.account_id, role_name);
     let mut event = base_event(base, "sts.amazonaws.com", "AssumeRole", Some(false));
     event.request_parameters = Some(json!({
@@ -136,7 +136,7 @@ fn assume_role(base: BaseFields, rng: &mut impl Rng) -> CloudTrailEvent {
     }));
     event.response_elements = Some(json!({
         "credentials": {
-            "accessKeyId": format!("example-key-{}", random_alpha(rng, 12).to_lowercase()),
+            "accessKeyId": format!("ASIA{}", random_alpha(rng, 16).to_uppercase()),
             "expiration": "2024-01-01T00:00:00Z",
         }
     }));
@@ -152,7 +152,7 @@ fn get_session_token(base: BaseFields, rng: &mut impl Rng) -> CloudTrailEvent {
     }));
     event.response_elements = Some(json!({
         "credentials": {
-            "accessKeyId": format!("example-key-{}", random_alpha(rng, 12).to_lowercase()),
+            "accessKeyId": format!("ASIA{}", random_alpha(rng, 16).to_uppercase()),
             "expiration": "2024-01-01T01:00:00Z",
         }
     }));
@@ -161,7 +161,11 @@ fn get_session_token(base: BaseFields, rng: &mut impl Rng) -> CloudTrailEvent {
 
 fn s3_put_object(base: BaseFields, rng: &mut impl Rng) -> CloudTrailEvent {
     let bucket = random_bucket_name(rng);
-    let key = format!("logs/{}/{}.json", random_alpha(rng, 4), random_alpha(rng, 10));
+    let key = format!(
+        "logs/{}/{}.json",
+        random_alpha(rng, 4),
+        random_alpha(rng, 10)
+    );
     let mut event = base_event(base, "s3.amazonaws.com", "PutObject", Some(false));
     event.request_parameters = Some(json!({
         "bucketName": bucket,
@@ -175,7 +179,11 @@ fn s3_put_object(base: BaseFields, rng: &mut impl Rng) -> CloudTrailEvent {
 
 fn s3_get_object(base: BaseFields, rng: &mut impl Rng) -> CloudTrailEvent {
     let bucket = random_bucket_name(rng);
-    let key = format!("data/{}/{}.parquet", random_alpha(rng, 4), random_alpha(rng, 10));
+    let key = format!(
+        "data/{}/{}.parquet",
+        random_alpha(rng, 4),
+        random_alpha(rng, 10)
+    );
     let mut event = base_event(base, "s3.amazonaws.com", "GetObject", Some(true));
     event.request_parameters = Some(json!({
         "bucketName": bucket,
@@ -289,7 +297,7 @@ fn random_account_id(rng: &mut impl Rng) -> String {
 }
 
 fn random_bucket_name(rng: &mut impl Rng) -> String {
-    format!("demo-bucket-{}", random_alpha(rng, 6).to_lowercase())
+    format!("logs-bucket-{}", random_alpha(rng, 6).to_lowercase())
 }
 
 fn random_alpha(rng: &mut impl Rng, len: usize) -> String {
@@ -323,12 +331,8 @@ fn event_type_for(event_name: &str) -> &'static str {
 
 fn read_only_for(event_name: &str) -> Option<bool> {
     match event_name {
-        "GetObject"
-        | "DescribeInstances"
-        | "GetCallerIdentity"
-        | "DescribeLogStreams"
-        | "GetMetricData"
-        | "ListMetrics" => Some(true),
+        "GetObject" | "DescribeInstances" | "GetCallerIdentity" | "DescribeLogStreams"
+        | "GetMetricData" | "ListMetrics" => Some(true),
         "ConsoleLogin" => Some(true),
         _ => Some(false),
     }
@@ -348,13 +352,8 @@ fn event_source_for(event_name: &str) -> &'static str {
         | "DescribeInstances"
         | "CreateSecurityGroup"
         | "AuthorizeSecurityGroupIngress" => "ec2.amazonaws.com",
-        "CreateUser"
-        | "DeleteUser"
-        | "CreateAccessKey"
-        | "UpdateAccessKey"
-        | "AttachRolePolicy"
-        | "AddUserToGroup"
-        | "CreateRole" => "iam.amazonaws.com",
+        "CreateUser" | "DeleteUser" | "CreateAccessKey" | "UpdateAccessKey"
+        | "AttachRolePolicy" | "AddUserToGroup" | "CreateRole" => "iam.amazonaws.com",
         "CreateLogGroup" | "CreateLogStream" | "DescribeLogStreams" | "PutLogEvents" => {
             "logs.amazonaws.com"
         }
@@ -481,7 +480,7 @@ mod tests {
             None,
             0.0,
         )
-            .expect("event");
+        .expect("event");
         assert_eq!(event.event_source, "signin.amazonaws.com");
         assert_eq!(event.event_name, "ConsoleLogin");
         assert!(event.request_parameters.is_some());

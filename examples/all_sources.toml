@@ -1,0 +1,123 @@
+seed = 42
+
+[traffic]
+start_time = "2026-01-01T00:00:00Z"
+time_scale = 36000
+
+[output]
+dir = "./out-all-sources"
+
+[output.files]
+target_size_mb = 50
+max_age_seconds = 10
+
+[output.format]
+type = "parquet"
+compression = "none"
+
+[source]
+type = "multi"
+identity_registry_path = "./examples/identity_registry.toml"
+
+[source.outputs.cloudtrail]
+dir = "./out-all-sources/cloudtrail"
+
+[source.outputs.cloudtrail.files]
+target_size_mb = 50
+max_age_seconds = 10
+
+[source.outputs.cloudtrail.format]
+type = "jsonl"
+compression = "gzip"
+
+[source.outputs.databricks_audit]
+dir = "./out-all-sources/databricks_audit"
+
+[source.outputs.databricks_audit.files]
+target_size_mb = 50
+max_age_seconds = 10
+
+[source.outputs.databricks_audit.format]
+type = "parquet"
+compression = "none"
+
+[source.outputs.okta_system_log]
+dir = "./out-all-sources/okta_system_log"
+
+[source.outputs.okta_system_log.files]
+target_size_mb = 50
+max_age_seconds = 10
+
+[source.outputs.okta_system_log.format]
+type = "parquet"
+compression = "none"
+
+[[source.sources]]
+type = "cloudtrail"
+curated = true
+regions = ["us-east-1", "us-west-2", "ap-southeast-1"]
+region_distribution = [0.55, 0.25, 0.20]
+
+[source.sources.baseline_source_ips]
+user-001 = ["198.51.100.10"]
+user-002 = ["203.0.113.62"]
+user-003 = ["203.0.113.63"]
+svc-001 = ["10.40.2.10"]
+
+[[source.sources]]
+type = "databricks_audit"
+account_id = "example-account-id"
+workspace_id = "1234567890"
+baseline_events_per_actor = 2
+
+[source.sources.baseline_source_ips]
+user-001 = ["198.51.100.10"]
+user-002 = ["203.0.113.62"]
+user-003 = ["203.0.113.63"]
+svc-001 = ["10.16.0.10"]
+
+[[source.sources.event]]
+actor_id = "user-001"
+offset_seconds = 10
+source_ip_address = "203.0.113.45"
+service_name = "accounts"
+action_name = "IpAccessDenied"
+request_params = { login_type = "browser" }
+response_status_code = 403
+response_error_message = "Current IP is not allowed"
+source_geo_country = "Example Country"
+source_geo_city = "Example City"
+
+[[source.sources]]
+type = "okta"
+org_id = "okta-example-org"
+baseline_events_per_actor = 2
+
+[source.sources.baseline_source_ips]
+user-001 = ["198.51.100.10"]
+user-002 = ["203.0.113.62"]
+user-003 = ["203.0.113.63"]
+svc-001 = ["10.24.1.10"]
+
+[[source.sources.event]]
+actor_id = "user-001"
+offset_seconds = 10
+event_type = "app.generic.unauth_app_access_attempt"
+display_message = "User attempted unauthorized access to app"
+legacy_event_type = "app.generic.unauth_app_access_attempt"
+outcome_result = "FAILURE"
+severity = "WARN"
+source_ip_address = "203.0.113.45"
+source_geo_country = "Example Country"
+source_geo_city = "Example City"
+client_zone = "Untrusted"
+
+[source.sources.event.debug_data]
+requestUri = "/idp/idx/identify"
+
+[[source.sources.event.target]]
+id = "0oa-example-operations"
+type = "AppInstance"
+alternate_id = "Operations Portal"
+display_name = "Operations Portal"
+detail_entry = { signOnModeType = "SAML_2_0" }

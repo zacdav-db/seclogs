@@ -1,21 +1,21 @@
 //! JSON sink for seclog events.
 //!
-//! Writes CloudTrail-style files per account/region and rotates by size or age.
+//! Writes JSON files per source/account/region and rotates by size or age.
 
+use crate::core::event::Event;
+use crate::core::traits::EventWriter;
 use chrono::Utc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
-use crate::core::event::Event;
-use crate::core::traits::EventWriter;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// JSON writer that buffers CloudTrail-style records per account/region.
+/// JSON writer that buffers source-native records per source/account/region.
 pub struct JsonlWriter {
     dir: PathBuf,
     target_size_bytes: u64,
@@ -40,8 +40,13 @@ impl JsonlWriter {
     ) -> io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
-        let max_age = max_age_seconds
-            .and_then(|seconds| if seconds > 0 { Some(Duration::from_secs(seconds)) } else { None });
+        let max_age = max_age_seconds.and_then(|seconds| {
+            if seconds > 0 {
+                Some(Duration::from_secs(seconds))
+            } else {
+                None
+            }
+        });
         let compression = parse_compression(compression)?;
         Ok(Self {
             dir,
@@ -60,6 +65,7 @@ impl EventWriter for JsonlWriter {
 
         let context = file_context_from_event(event);
         let key = RegionKey {
+            source: context.source,
             account_id: context.account_id,
             region: context.region,
         };
@@ -114,12 +120,14 @@ impl EventWriter for JsonlWriter {
 }
 
 struct FileContext {
+    source: String,
     account_id: String,
     region: String,
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 struct RegionKey {
+    source: String,
     account_id: String,
     region: String,
 }
@@ -174,6 +182,7 @@ fn open_region_file(
     };
     let file = open_file(
         dir,
+        &key.source,
         &key.account_id,
         &key.region,
         &stamp,
@@ -185,6 +194,7 @@ fn open_region_file(
 
 fn open_file(
     dir: &Path,
+    source: &str,
     account_id: &str,
     region: &str,
     stamp: &str,
@@ -192,7 +202,7 @@ fn open_file(
     ext: &str,
 ) -> io::Result<File> {
     let path = dir.join(format!(
-        "{account_id}_CloudTrail_{region}_{stamp}_{unique}.{ext}"
+        "{account_id}_{source}_{region}_{stamp}_{unique}.{ext}"
     ));
     File::create(path)
 }
@@ -212,6 +222,7 @@ fn unique_id() -> String {
 }
 
 fn file_context_from_event(event: &Event) -> FileContext {
+    let source = source_file_label(&event.envelope.source);
     let account_id = event
         .envelope
         .tenant_id
@@ -225,7 +236,11 @@ fn file_context_from_event(event: &Event) -> FileContext {
         .unwrap_or("global")
         .to_string();
 
-    FileContext { account_id, region }
+    FileContext {
+        source,
+        account_id,
+        region,
+    }
 }
 
 fn flush_region(
@@ -273,5 +288,23 @@ fn parse_compression(value: Option<&str>) -> io::Result<JsonlCompression> {
             io::ErrorKind::InvalidInput,
             format!("unsupported jsonl compression: {value}"),
         )),
+    }
+}
+
+fn source_file_label(source: &str) -> String {
+    match source {
+        "cloudtrail" => "CloudTrail".to_string(),
+        "databricks_audit" => "DatabricksAudit".to_string(),
+        "okta_system_log" => "OktaSystemLog".to_string(),
+        other => other
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
     }
 }
