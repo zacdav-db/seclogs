@@ -2,6 +2,9 @@
 //!
 //! Stores `ActorSeed` data so sources can reuse a shared population.
 
+use crate::core::actors::{
+    ActorKind, ActorPopulation, ActorRole, ActorSeed, RoleRates, ServicePattern, ServiceProfile,
+};
 use arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int16Builder, Int8Builder, StringBuilder,
 };
@@ -13,9 +16,6 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::errors::ParquetError;
 use parquet::file::properties::WriterProperties;
-use crate::core::actors::{
-    ActorKind, ActorPopulation, ActorRole, ActorSeed, RoleRates, ServicePattern, ServiceProfile,
-};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
@@ -131,8 +131,7 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
 
     let file = File::create(path)?;
     let props = WriterProperties::builder().build();
-    let mut writer =
-        ArrowWriter::try_new(file, schema, Some(props)).map_err(map_parquet_err)?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).map_err(map_parquet_err)?;
     writer.write(&batch).map_err(map_parquet_err)?;
     writer.close().map_err(map_parquet_err)?;
     Ok(())
@@ -461,7 +460,11 @@ fn column_as_string_optional_fallback(
 fn fallback_access_key_id(identity_type: &str, seed: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     seed.hash(&mut hasher);
-    let prefix = if identity_type == "AssumedRole" { "ASIA" } else { "AKIA" };
+    let prefix = if identity_type == "AssumedRole" {
+        "ASIA"
+    } else {
+        "AKIA"
+    };
     format!("{prefix}{:016X}", hasher.finish())
 }
 

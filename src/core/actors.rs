@@ -1,13 +1,13 @@
+use crate::config::{
+    ErrorRateConfig, ErrorRateDistribution, ExplicitActorConfig, PopulationActorsConfig,
+    PopulationConfig, RoleConfig, ServicePatternConfig, ServiceProfileConfig, TimezoneWeight,
+};
 use chrono::{offset::Offset, DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use crate::config::{
-    ErrorRateConfig, ErrorRateDistribution, ExplicitActorConfig, PopulationActorsConfig,
-    PopulationConfig, RoleConfig, ServicePatternConfig, ServiceProfileConfig, TimezoneWeight,
-};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
@@ -296,8 +296,7 @@ impl ActorPopulation {
         if total == 0 {
             return Self { actors: Vec::new() };
         }
-        let service_count =
-            ((total as f64) * spec.service_ratio.clamp(0.0, 1.0)).round() as usize;
+        let service_count = ((total as f64) * spec.service_ratio.clamp(0.0, 1.0)).round() as usize;
         let human_count = total.saturating_sub(service_count);
         let mut actors = Vec::with_capacity(total);
 
@@ -314,7 +313,8 @@ impl ActorPopulation {
         }
         for _ in 0..service_count {
             let account_id = pick_account_id(rng, spec.account_ids);
-            let profile = pick_service_profile(rng, spec.service_profiles, spec.service_rate_per_hour);
+            let profile =
+                pick_service_profile(rng, spec.service_profiles, spec.service_rate_per_hour);
             let error_rate = sample_error_rate(rng, spec.service_error_rate);
             actors.push(ActorSeed::new_service(
                 rng,
@@ -326,7 +326,12 @@ impl ActorPopulation {
             ));
         }
 
-        apply_hot_actor_rates(rng, &mut actors, spec.hot_actor_ratio, spec.hot_actor_multiplier);
+        apply_hot_actor_rates(
+            rng,
+            &mut actors,
+            spec.hot_actor_ratio,
+            spec.hot_actor_multiplier,
+        );
         Self { actors }
     }
 
@@ -341,9 +346,7 @@ impl ActorPopulation {
 }
 
 /// Builds an actor population from the dedicated population config.
-pub fn generate_population(
-    config: &PopulationConfig,
-) -> Result<ActorPopulation, ActorConfigError> {
+pub fn generate_population(config: &PopulationConfig) -> Result<ActorPopulation, ActorConfigError> {
     let mut rng = match config.seed {
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_entropy(),
@@ -354,16 +357,10 @@ pub fn generate_population(
     let hot_actor_multiplier = population.hot_actor_multiplier.unwrap_or(6.0).max(1.0);
     let (role_weights, role_rates) = build_role_config(population.role.as_ref());
     let account_ids = build_account_pool(population);
-    let service_rate = population
-        .service_events_per_hour
-        .unwrap_or(6.0)
-        .max(0.1);
+    let service_rate = population.service_events_per_hour.unwrap_or(6.0).max(0.1);
     let service_profiles =
         build_service_profiles(population.service_profiles.as_ref(), service_rate);
-    let baseline_error = error_rate_spec(
-        population.error_rate.as_ref(),
-        default_error_rate_spec(),
-    );
+    let baseline_error = error_rate_spec(population.error_rate.as_ref(), default_error_rate_spec());
     let human_error = error_rate_spec(population.human_error_rate.as_ref(), baseline_error);
     let service_error = error_rate_spec(population.service_error_rate.as_ref(), baseline_error);
     let start_time = Utc::now();
@@ -474,8 +471,13 @@ fn build_explicit_actors(
                     ActorRole::Auditor => override_rates.auditor = events_per_hour,
                 }
                 let role_weights = vec![(role, 1.0)];
-                let mut seed =
-                    ActorSeed::new_human(rng, &role_weights, &override_rates, &account_id, error_rate);
+                let mut seed = ActorSeed::new_human(
+                    rng,
+                    &role_weights,
+                    &override_rates,
+                    &account_id,
+                    error_rate,
+                );
                 seed.rate_per_hour = events_per_hour;
                 if let Some(identity_type) = &entry.identity_type {
                     seed.identity_type = identity_type.clone();
@@ -519,8 +521,14 @@ fn build_explicit_actors(
                     .as_ref()
                     .map(service_pattern_from_config)
                     .unwrap_or(ServicePattern::Constant);
-                let mut seed =
-                    ActorSeed::new_service(rng, &account_id, profile, pattern, events_per_hour, error_rate);
+                let mut seed = ActorSeed::new_service(
+                    rng,
+                    &account_id,
+                    profile,
+                    pattern,
+                    events_per_hour,
+                    error_rate,
+                );
                 if let Some(identity_type) = &entry.identity_type {
                     seed.identity_type = identity_type.clone();
                 }
@@ -609,14 +617,9 @@ fn parse_service_profile(value: &str, id: &str) -> Result<ServiceProfile, ActorC
     })
 }
 
-fn require_events_per_hour(
-    value: Option<f64>,
-    id: &str,
-) -> Result<f64, ActorConfigError> {
+fn require_events_per_hour(value: Option<f64>, id: &str) -> Result<f64, ActorConfigError> {
     let rate = value.ok_or_else(|| {
-        ActorConfigError(format!(
-            "population.actor {id} is missing events_per_hour"
-        ))
+        ActorConfigError(format!("population.actor {id} is missing events_per_hour"))
     })?;
     if !rate.is_finite() || rate <= 0.0 {
         return Err(ActorConfigError(format!(

@@ -1,0 +1,41 @@
+seed = 42
+
+[traffic]
+start_time = "2026-01-01T00:00:00Z"
+time_scale = 36000
+
+[output]
+dir = "./out-databricks"
+
+[output.files]
+target_size_mb = 50
+max_age_seconds = 10
+
+[output.format]
+type = "parquet"
+compression = "none"
+
+[source]
+type = "databricks_audit"
+# Limited-scope source: emits schema-accurate baseline rows and explicit
+# injected events, not a full Databricks audit service/action catalog.
+identity_registry_path = "./examples/identity_registry.toml"
+account_id = "example-account-id"
+workspace_id = "1234567890"
+baseline_events_per_actor = 2
+
+[source.baseline_source_ips]
+user-001 = ["198.51.100.10"]
+svc-001 = ["10.16.0.10"]
+
+[[source.event]]
+actor_id = "user-001"
+offset_seconds = 10
+source_ip_address = "203.0.113.45"
+service_name = "accounts"
+action_name = "IpAccessDenied"
+request_params = { login_type = "browser" }
+response_status_code = 403
+response_error_message = "Current IP is not allowed"
+source_geo_country = "Example Country"
+source_geo_city = "Example City"

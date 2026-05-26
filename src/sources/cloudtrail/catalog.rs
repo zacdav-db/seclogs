@@ -1,6 +1,6 @@
+use crate::core::config::CloudTrailSourceConfig;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
-use crate::core::config::CloudTrailSourceConfig;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -92,9 +92,7 @@ pub fn resolve_event_weights(
     Ok(resolved)
 }
 
-pub fn resolve_selector(
-    config: &CloudTrailSourceConfig,
-) -> Result<EventSelector, CatalogError> {
+pub fn resolve_selector(config: &CloudTrailSourceConfig) -> Result<EventSelector, CatalogError> {
     let events = resolve_event_weights(config)?;
     EventSelector::new(events)
 }
@@ -145,6 +143,8 @@ mod tests {
         let config = CloudTrailSourceConfig {
             curated: true,
             actor_population_path: None,
+            identity_registry_path: None,
+            baseline_source_ips: None,
             regions: None,
             region_distribution: None,
         };
@@ -152,5 +152,4 @@ mod tests {
         let resolved = resolve_event_weights(&config).expect("curated events");
         assert!(resolved.iter().any(|event| event.name == "ConsoleLogin"));
     }
-
 }

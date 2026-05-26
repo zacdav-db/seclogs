@@ -1,14 +1,15 @@
 use super::catalog::{resolve_event_weights, CatalogError, EventSelector, WeightedEvent};
 use super::templates::{build_cloudtrail_event, default_error_profile, ActorContext};
+use crate::actors_parquet as actor_store;
+use crate::core::actors::{ActorKind, ActorProfile, ActorRole, ServicePattern, ServiceProfile};
+use crate::core::config::CloudTrailSourceConfig;
+use crate::core::event::{Actor, Event, EventEnvelope, Outcome};
+use crate::core::identity::{AwsPrincipal, Identity, IdentityRegistry};
+use crate::core::traits::EventSource;
 use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use crate::core::actors::{ActorKind, ActorProfile, ActorRole, ServicePattern, ServiceProfile};
-use crate::core::config::CloudTrailSourceConfig;
-use crate::core::event::{Actor, Event, EventEnvelope, Outcome};
-use crate::core::traits::EventSource;
-use crate::actors_parquet as actor_store;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -85,22 +86,30 @@ impl EventSource for CloudTrailGenerator {
             let event_time = now.to_rfc3339_opts(SecondsFormat::Millis, true);
 
             let region = self.region_selector.pick(&mut self.rng);
-            let (actor_context, error_rate) = {
+            let (actor_context, error_rate, envelope_actor_id) = {
                 let actor = &mut self.actors[actor_index];
                 let error_rate = actor.seed.error_rate;
-                (actor_context(actor, region, &mut self.rng), error_rate)
+                let envelope_actor_id = actor
+                    .seed
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| actor.seed.principal_id.clone());
+                (
+                    actor_context(actor, region, &mut self.rng),
+                    error_rate,
+                    envelope_actor_id,
+                )
             };
             let error_profile = default_error_profile(&event_name);
-            let cloudtrail =
-                build_cloudtrail_event(
-                    &event_name,
-                    &actor_context,
-                    &mut self.rng,
-                    &event_time,
-                    error_profile,
-                    error_rate,
-                )
-                .ok()?;
+            let cloudtrail = build_cloudtrail_event(
+                &event_name,
+                &actor_context,
+                &mut self.rng,
+                &event_time,
+                error_profile,
+                error_rate,
+            )
+            .ok()?;
 
             {
                 let actor = &mut self.actors[actor_index];
@@ -115,7 +124,7 @@ impl EventSource for CloudTrailGenerator {
                 source: "cloudtrail".to_string(),
                 event_type: cloudtrail.event_name.clone(),
                 actor: Actor {
-                    id: cloudtrail.user_identity.principal_id.clone(),
+                    id: envelope_actor_id,
                     kind: cloudtrail.user_identity.identity_type.clone(),
                     name: cloudtrail.user_identity.user_name.clone(),
                 },
@@ -140,15 +149,226 @@ impl EventSource for CloudTrailGenerator {
     }
 }
 
-fn load_actor_profiles(
+fn load_actor_profiles(config: &CloudTrailSourceConfig) -> Result<Vec<ActorProfile>, CatalogError> {
+    if let Some(path) = config.actor_population_path.as_ref() {
+        let population = actor_store::read_population(path)
+            .map_err(|err| CatalogError::Population(err.to_string()))?;
+        return Ok(population.profiles());
+    }
+
+    if let Some(path) = config.identity_registry_path.as_ref() {
+        let registry = IdentityRegistry::from_path(path)
+            .map_err(|err| CatalogError::Population(err.to_string()))?;
+        return actor_profiles_from_registry(config, &registry);
+    }
+
+    Err(CatalogError::Population(
+        "actor_population_path or identity_registry_path is required".to_string(),
+    ))
+}
+
+fn actor_profiles_from_registry(
     config: &CloudTrailSourceConfig,
+    registry: &IdentityRegistry,
 ) -> Result<Vec<ActorProfile>, CatalogError> {
-    let path = config.actor_population_path.as_ref().ok_or_else(|| {
-        CatalogError::Population("actor_population_path is required".to_string())
-    })?;
-    let population = actor_store::read_population(path)
-        .map_err(|err| CatalogError::Population(err.to_string()))?;
-    Ok(population.profiles())
+    let mut identities: Vec<&Identity> = registry.identities().iter().collect();
+    identities.sort_by(|left, right| left.actor_id.cmp(&right.actor_id));
+
+    let mut actors = Vec::with_capacity(identities.len());
+    for (idx, identity) in identities.iter().enumerate() {
+        let principal = identity.aws_principals.first().ok_or_else(|| {
+            CatalogError::Population(format!(
+                "identity {} has no AWS principal for CloudTrail generation",
+                identity.actor_id
+            ))
+        })?;
+        actors.push(ActorProfile::from_seed(actor_seed_from_identity(
+            config, identity, principal, idx,
+        )));
+    }
+
+    Ok(actors)
+}
+
+fn actor_seed_from_identity(
+    config: &CloudTrailSourceConfig,
+    identity: &Identity,
+    principal: &AwsPrincipal,
+    idx: usize,
+) -> crate::core::actors::ActorSeed {
+    let kind = if identity.service_account {
+        ActorKind::Service
+    } else {
+        ActorKind::Human
+    };
+    let role = if identity.service_account {
+        None
+    } else {
+        Some(role_for_identity(identity))
+    };
+    let service_profile = if identity.service_account {
+        Some(ServiceProfile::Generic)
+    } else {
+        None
+    };
+    let service_pattern = if identity.service_account {
+        Some(ServicePattern::Constant)
+    } else {
+        None
+    };
+    let rate_per_hour = match (&kind, role.as_ref()) {
+        (ActorKind::Human, Some(ActorRole::Admin)) => 18.0,
+        (ActorKind::Human, Some(ActorRole::Developer)) => 14.0,
+        (ActorKind::Human, Some(ActorRole::ReadOnly)) => 8.0,
+        (ActorKind::Human, Some(ActorRole::Auditor)) => 6.0,
+        (ActorKind::Human, None) => 10.0,
+        (ActorKind::Service, _) => 12.0,
+    };
+    let identity_type = if principal.arn.contains(":assumed-role/") {
+        "AssumedRole"
+    } else {
+        "IAMUser"
+    };
+    let user_name = match &kind {
+        ActorKind::Human => Some(user_name_for_identity(identity, principal)),
+        ActorKind::Service => None,
+    };
+
+    crate::core::actors::ActorSeed {
+        kind,
+        role,
+        id: Some(identity.actor_id.clone()),
+        identity_type: identity_type.to_string(),
+        principal_id: principal.principal_id.clone(),
+        arn: principal.arn.clone(),
+        account_id: principal.account_id.clone(),
+        access_key_id: principal
+            .access_key_id
+            .clone()
+            .unwrap_or_else(|| access_key_for(identity_type, &principal.principal_id)),
+        rate_per_hour,
+        error_rate: if identity.service_account { 0.01 } else { 0.03 },
+        tags: identity.tags.clone(),
+        event_bias: HashMap::new(),
+        service_profile,
+        service_pattern,
+        user_name,
+        user_agents: user_agents_for_identity(identity),
+        source_ips: source_ips_for_identity(config, identity, idx),
+        active_start_hour: if identity.service_account { 0 } else { 8 },
+        active_hours: if identity.service_account { 24 } else { 10 },
+        timezone_offset: timezone_offset_for_identity(identity),
+        timezone_fixed: true,
+        weekend_active: identity.service_account,
+    }
+}
+
+fn role_for_identity(identity: &Identity) -> ActorRole {
+    let role = identity.role_persona.to_ascii_lowercase();
+    if role.contains("admin") {
+        ActorRole::Admin
+    } else if role.contains("audit") || role.contains("risk") || role.contains("security") {
+        ActorRole::Auditor
+    } else if role.contains("read") || role.contains("business") || role.contains("support") {
+        ActorRole::ReadOnly
+    } else {
+        ActorRole::Developer
+    }
+}
+
+fn user_name_for_identity(identity: &Identity, principal: &AwsPrincipal) -> String {
+    principal
+        .arn
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty() && !value.contains(':'))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            identity
+                .email
+                .split('@')
+                .next()
+                .unwrap_or(&identity.actor_id)
+                .to_string()
+        })
+}
+
+fn user_agents_for_identity(identity: &Identity) -> Vec<String> {
+    if identity.service_account {
+        vec![
+            "aws-sdk-java/1.12.603".to_string(),
+            "Boto3/1.34.0 Python/3.11".to_string(),
+        ]
+    } else {
+        vec![
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36".to_string(),
+            "aws-cli/2.15.0 Python/3.11 Darwin/23.0 source/x86_64".to_string(),
+        ]
+    }
+}
+
+fn source_ips_for_identity(
+    config: &CloudTrailSourceConfig,
+    identity: &Identity,
+    idx: usize,
+) -> Vec<String> {
+    if let Some(source_ips) = config
+        .baseline_source_ips
+        .as_ref()
+        .and_then(|by_actor| by_actor.get(&identity.actor_id))
+    {
+        if !source_ips.is_empty() {
+            return source_ips.clone();
+        }
+    }
+
+    if identity.service_account {
+        vec![format!("10.40.2.{}", 10 + (idx % 200))]
+    } else if identity
+        .normal_countries_regions
+        .iter()
+        .any(|region| region.contains("Singapore"))
+    {
+        vec![format!("203.0.113.{}", 60 + (idx % 20))]
+    } else {
+        vec![format!("198.51.100.{}", 10 + (idx % 80))]
+    }
+}
+
+fn timezone_offset_for_identity(identity: &Identity) -> i8 {
+    if identity
+        .normal_countries_regions
+        .iter()
+        .any(|region| region.contains("Singapore"))
+    {
+        8
+    } else if identity
+        .normal_countries_regions
+        .iter()
+        .any(|region| region.contains("Australia"))
+    {
+        10
+    } else {
+        0
+    }
+}
+
+fn access_key_for(identity_type: &str, principal_id: &str) -> String {
+    let prefix = if identity_type == "AssumedRole" {
+        "ASIA"
+    } else {
+        "AKIA"
+    };
+    format!("{prefix}{:016X}", stable_hash(principal_id))
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 impl CloudTrailGenerator {
@@ -221,11 +441,7 @@ impl CloudTrailGenerator {
 }
 
 fn actor_role_or_default(actor: &ActorProfile) -> ActorRole {
-    actor
-        .seed
-        .role
-        .clone()
-        .unwrap_or(ActorRole::Developer)
+    actor.seed.role.clone().unwrap_or(ActorRole::Developer)
 }
 
 fn human_candidates(role: ActorRole, last: Option<&str>) -> Vec<(String, f64)> {
@@ -367,11 +583,7 @@ fn metrics_collector_candidates(last: Option<&str>) -> Vec<(String, f64)> {
     }
 }
 
-fn actor_context(
-    actor: &mut ActorProfile,
-    region: String,
-    rng: &mut impl Rng,
-) -> ActorContext {
+fn actor_context(actor: &mut ActorProfile, region: String, rng: &mut impl Rng) -> ActorContext {
     let user_agent = actor.current_user_agent(rng);
     let session_credential_from_console = user_agent.contains("CloudShell")
         || user_agent.starts_with("Mozilla/")
@@ -525,11 +737,7 @@ fn build_schedule(
     heap
 }
 
-fn schedule_after(
-    actor: &ActorProfile,
-    now: DateTime<Utc>,
-    rng: &mut impl Rng,
-) -> DateTime<Utc> {
+fn schedule_after(actor: &ActorProfile, now: DateTime<Utc>, rng: &mut impl Rng) -> DateTime<Utc> {
     let rate = effective_rate(actor, now, rng);
     let mut next = now + sample_interval(rate, rng);
     if let Some(end) = actor.session_end_at {
@@ -540,11 +748,7 @@ fn schedule_after(
     actor.next_available_at(next)
 }
 
-fn schedule_from(
-    actor: &ActorProfile,
-    base: DateTime<Utc>,
-    rng: &mut impl Rng,
-) -> DateTime<Utc> {
+fn schedule_from(actor: &ActorProfile, base: DateTime<Utc>, rng: &mut impl Rng) -> DateTime<Utc> {
     let rate = effective_rate(actor, base, rng);
     let next = base + sample_interval(rate, rng);
     actor.next_available_at(next)
@@ -649,10 +853,7 @@ fn build_region_selector(
     }
 }
 
-fn weights_for_regions(
-    regions: &[String],
-    distribution: Option<&Vec<f64>>,
-) -> Vec<f64> {
+fn weights_for_regions(regions: &[String], distribution: Option<&Vec<f64>>) -> Vec<f64> {
     let Some(distribution) = distribution else {
         return vec![1.0; regions.len()];
     };

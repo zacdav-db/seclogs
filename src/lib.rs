@@ -10,4 +10,5 @@ pub mod sources;
 pub use core::actors;
 pub use core::config;
 pub use core::event;
+pub use core::identity;
 pub use core::traits;

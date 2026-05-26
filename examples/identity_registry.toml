@@ -1,0 +1,83 @@
+name = "example_identity_registry"
+
+[[identity]]
+actor_id = "user-001"
+email = "user.one@example.com"
+employee_id = "E-000001"
+display_name = "User One"
+role_persona = "Business user"
+department = "Business Operations"
+home_location = "Sydney, NSW, Australia"
+normal_countries_regions = ["Australia", "Australia/NSW"]
+okta_user_id = "00u-example-user-001"
+databricks_username = "user.one@example.com"
+service_account = false
+tags = ["human"]
+
+[[identity.aws_principals]]
+account_id = "123456789012"
+principal_id = "AIDAEXAMPLEUSER001"
+arn = "arn:aws:iam::123456789012:user/user.one"
+access_key_id = "AKIAEXAMPLEUSER01"
+
+[[identity]]
+actor_id = "user-002"
+email = "user.two@example.com"
+employee_id = "E-000002"
+display_name = "User Two"
+role_persona = "Regional operations user"
+department = "Business Operations"
+home_location = "Singapore"
+normal_countries_regions = ["Singapore"]
+okta_user_id = "00u-example-user-002"
+databricks_username = "user.two@example.com"
+service_account = false
+tags = ["human", "singapore"]
+
+[[identity.aws_principals]]
+account_id = "123456789012"
+principal_id = "AIDAEXAMPLEUSER002"
+arn = "arn:aws:iam::123456789012:user/user.two"
+access_key_id = "AKIAEXAMPLEUSER02"
+
+[[identity]]
+actor_id = "user-003"
+email = "user.three@example.com"
+employee_id = "E-000003"
+display_name = "User Three"
+role_persona = "Regional support user"
+department = "Customer Operations"
+home_location = "Singapore"
+normal_countries_regions = ["Singapore"]
+okta_user_id = "00u-example-user-003"
+databricks_username = "user.three@example.com"
+service_account = false
+tags = ["human", "singapore"]
+
+[[identity.aws_principals]]
+account_id = "123456789012"
+principal_id = "AIDAEXAMPLEUSER003"
+arn = "arn:aws:iam::123456789012:user/user.three"
+access_key_id = "AKIAEXAMPLEUSER03"
+
+[[identity]]
+actor_id = "svc-001"
+email = "svc-job@example.com"
+employee_id = "SVC-000001"
+display_name = "Example Job Service"
+role_persona = "Workflow service account"
+department = "Platform Engineering"
+home_location = "Databricks workspace service principal"
+normal_countries_regions = ["Australia"]
+okta_user_id = "0oa-example-svc-001"
+databricks_username = "svc-job@example.com"
+service_account = true
+tags = ["service_account"]
+
+[[identity.aws_principals]]
+account_id = "123456789012"
+principal_id = "AROAEXAMPLESVC0001"
+arn = "arn:aws:sts::123456789012:assumed-role/ExampleJobRole/svc-job"
+role_name = "ExampleJobRole"
+role_session_name = "svc-job"
+access_key_id = "ASIAEXAMPLESVC001"
