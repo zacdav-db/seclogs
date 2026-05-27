@@ -554,5 +554,9 @@ mod tests {
             output.tables.get("okta_system_log").map(String::as_str),
             Some("main.seclog.okta_system_log_events")
         );
+        assert_eq!(
+            output.tables.get("actor_population").map(String::as_str),
+            Some("main.seclog.actor_population")
+        );
     }
 }

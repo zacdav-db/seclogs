@@ -18,6 +18,7 @@ flush_interval_ms = 1000
 cloudtrail = "main.seclog.cloudtrail_events"
 databricks_audit = "main.seclog.databricks_audit_events"
 okta_system_log = "main.seclog.okta_system_log_events"
+actor_population = "main.seclog.actor_population"
 
 [source]
 type = "multi"

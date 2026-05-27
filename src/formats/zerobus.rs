@@ -23,6 +23,14 @@ impl ZerobusWriter {
             inner: build_platform_writer(config)?,
         })
     }
+
+    pub fn run_id(&self) -> &str {
+        self.inner.run_id()
+    }
+
+    pub fn write_json_record(&mut self, source: &str, row: String) -> io::Result<u64> {
+        self.inner.write_json_record(source, row)
+    }
 }
 
 impl EventWriter for ZerobusWriter {
@@ -70,6 +78,17 @@ impl PlatformZerobusWriter {
             io::ErrorKind::Unsupported,
             "zerobus output requires building with --features zerobus",
         ))
+    }
+
+    fn write_json_record(&mut self, _source: &str, _row: String) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "zerobus output requires building with --features zerobus",
+        ))
+    }
+
+    fn run_id(&self) -> &str {
+        ""
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -135,13 +154,21 @@ impl<F: ZerobusStreamFactory> ZerobusBatchWriter<F> {
     fn write_event(&mut self, event: &Event) -> io::Result<u64> {
         let source = event.envelope.source.clone();
         let row = event_to_row_json(event, &self.run_id, Utc::now())?;
+        self.write_json_record(&source, row)
+    }
+
+    fn write_json_record(&mut self, source: &str, row: String) -> io::Result<u64> {
         let size = row.len() as u64;
-        let route = self.route_mut(&source)?;
+        let route = self.route_mut(source)?;
         route.batch.push(row);
         if route.batch.len() >= self.batch_size {
-            self.send_source_batch(&source)?;
+            self.send_source_batch(source)?;
         }
         Ok(size)
+    }
+
+    fn run_id(&self) -> &str {
+        &self.run_id
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -245,12 +272,14 @@ fn event_to_row_json(
         .as_ref()
         .map(|value| value.format("%Y-%m-%d").to_string());
     let event_ts_ms = parsed_time.as_ref().map(|value| value.timestamp_millis());
+    let time = parsed_time.as_ref().map(|value| value.timestamp_micros());
     let envelope_json = serde_json::to_string(&event.envelope)
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
     let payload_json = serde_json::to_string(&event.payload)
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
 
     let row = json!({
+        "time": time.map(Number::from).map(Value::Number),
         "event_time": event.envelope.timestamp.clone(),
         "event_date": event_date,
         "event_ts_ms": event_ts_ms.map(Number::from).map(Value::Number),
@@ -484,6 +513,7 @@ mod tests {
         let row: Value = serde_json::from_str(&row).unwrap();
 
         assert_eq!(row["source"], "okta_system_log");
+        assert_eq!(row["time"], 1767225600000000_i64);
         assert_eq!(row["event_date"], "2026-01-01");
         assert_eq!(row["event_ts_ms"], 1767225600000_i64);
         assert_eq!(row["run_id"], "run-1");
@@ -548,6 +578,38 @@ mod tests {
     }
 
     #[test]
+    fn raw_json_records_route_to_non_event_tables() {
+        let state = FakeState::default();
+        let config = test_config(1);
+        let factory = FakeFactory {
+            state: state.clone(),
+        };
+        let mut writer = ZerobusBatchWriter::new(&config, factory).unwrap();
+
+        assert_eq!(writer.run_id(), "run-1");
+        writer
+            .write_json_record(
+                "actor_population",
+                json!({"actor_id": "user-001"}).to_string(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+
+        let opened = state.opened.borrow();
+        assert!(opened.contains(&(
+            "actor_population".to_string(),
+            "main.seclog.actor_population".to_string()
+        )));
+
+        let ingested = state.ingested.borrow();
+        assert_eq!(ingested["actor_population"][0].len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&ingested["actor_population"][0][0]).unwrap(),
+            json!({"actor_id": "user-001"})
+        );
+    }
+
+    #[test]
     fn missing_credential_env_var_is_redacted() {
         env::remove_var("SECLOG_TEST_MISSING_ZEROBUS_CLIENT_ID");
         let err =
@@ -577,6 +639,10 @@ mod tests {
                 (
                     "okta_system_log".to_string(),
                     "main.seclog.okta_system_log_events".to_string(),
+                ),
+                (
+                    "actor_population".to_string(),
+                    "main.seclog.actor_population".to_string(),
                 ),
             ]),
         }
