@@ -1,6 +1,7 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use seclog::actors_parquet::write_population;
+use seclog::api::build_event_source;
 use seclog::core::actors::generate_population;
 use seclog::core::config::{
     Config, DatabricksVolumeOutputConfig, FileOutputConfig, FormatConfig, MultiSourceConfig,
@@ -13,10 +14,6 @@ use seclog::formats::databricks_volume::DatabricksVolumeWriter;
 use seclog::formats::json::JsonlWriter;
 use seclog::formats::parquet::ParquetWriter;
 use seclog::formats::zerobus::ZerobusWriter;
-use seclog::sources::cloudtrail::CloudTrailGenerator;
-use seclog::sources::composite::CompositeEventSource;
-use seclog::sources::databricks::DatabricksAuditGenerator;
-use seclog::sources::okta::OktaSystemLogGenerator;
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap};
@@ -206,121 +203,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn build_event_source(
-    config: &SourceConfig,
-    seed: Option<u64>,
-    start_sim_time: DateTime<Utc>,
-) -> Result<Box<dyn EventSource>, Box<dyn std::error::Error>> {
-    build_event_source_with_registry(config, seed, start_sim_time, None)
-}
-
-fn build_event_source_with_registry(
-    config: &SourceConfig,
-    seed: Option<u64>,
-    start_sim_time: DateTime<Utc>,
-    inherited_registry: Option<&IdentityRegistry>,
-) -> Result<Box<dyn EventSource>, Box<dyn std::error::Error>> {
-    match config {
-        SourceConfig::CloudTrail(config) => {
-            if let Some(registry) = inherited_registry {
-                if config.actor_population_path.is_none() && config.identity_registry_path.is_none()
-                {
-                    return Ok(Box::new(CloudTrailGenerator::from_registry(
-                        config,
-                        registry.clone(),
-                        seed,
-                        start_sim_time,
-                    )?));
-                }
-            }
-            Ok(Box::new(CloudTrailGenerator::from_config(
-                config,
-                seed,
-                start_sim_time,
-            )?))
-        }
-        SourceConfig::DatabricksAudit(config) => {
-            if let Some(registry) = inherited_registry {
-                if config.identity_registry_path.trim().is_empty() {
-                    return Ok(Box::new(DatabricksAuditGenerator::from_registry(
-                        config,
-                        registry.clone(),
-                        start_sim_time,
-                    )?));
-                }
-            }
-            Ok(Box::new(DatabricksAuditGenerator::from_config(
-                config,
-                start_sim_time,
-            )?))
-        }
-        SourceConfig::OktaSystemLog(config) => {
-            if let Some(registry) = inherited_registry {
-                if config.identity_registry_path.trim().is_empty() {
-                    return Ok(Box::new(OktaSystemLogGenerator::from_registry(
-                        config,
-                        registry.clone(),
-                        start_sim_time,
-                    )?));
-                }
-            }
-            Ok(Box::new(OktaSystemLogGenerator::from_config(
-                config,
-                start_sim_time,
-            )?))
-        }
-        SourceConfig::Multi(config) => {
-            if config.sources.is_empty() {
-                return Err("multi source requires at least one child source".into());
-            }
-            let identity_registry_path = config
-                .identity_registry_path
-                .as_deref()
-                .and_then(non_empty_str);
-            let population_config_path = config
-                .population_config_path
-                .as_deref()
-                .and_then(non_empty_str);
-            if identity_registry_path.is_some() && population_config_path.is_some() {
-                return Err(
-                    "multi source cannot set both identity_registry_path and population_config_path"
-                        .into(),
-                );
-            }
-            if population_config_path.is_some() {
-                let mut child_registry_paths = BTreeSet::new();
-                for source in &config.sources {
-                    collect_identity_registry_paths(source, None, &mut child_registry_paths)?;
-                }
-                if !child_registry_paths.is_empty() {
-                    return Err(format!(
-                        "multi source with population_config_path cannot also set child identity_registry_path values: {}",
-                        child_registry_paths.into_iter().collect::<Vec<_>>().join(", ")
-                    )
-                    .into());
-                }
-            }
-            let generated_registry = match population_config_path {
-                Some(path) => Some(identity_registry_from_population_config_path(path)?),
-                None => None,
-            };
-            let registry = generated_registry.as_ref().or(inherited_registry);
-            let mut sources = Vec::with_capacity(config.sources.len());
-            for (idx, source) in config.sources.iter().enumerate() {
-                let source = inherit_identity_registry(source, identity_registry_path);
-                let child_seed = seed.map(|seed| seed.wrapping_add(idx as u64));
-                sources.push(build_event_source_with_registry(
-                    &source,
-                    child_seed,
-                    start_sim_time,
-                    registry,
-                )?);
-            }
-            Ok(Box::new(CompositeEventSource::new(sources)))
-        }
-    }
-}
-
 fn identity_registry_from_population_config_path(
     path: &str,
 ) -> Result<IdentityRegistry, Box<dyn std::error::Error>> {
@@ -330,38 +212,6 @@ fn identity_registry_from_population_config_path(
         "generated_identity_registry",
         &population,
     )?)
-}
-
-fn inherit_identity_registry(config: &SourceConfig, path: Option<&str>) -> SourceConfig {
-    let mut inherited = config.clone();
-    let Some(path) = path else {
-        return inherited;
-    };
-
-    match &mut inherited {
-        SourceConfig::CloudTrail(config) => {
-            if config.actor_population_path.is_none() && config.identity_registry_path.is_none() {
-                config.identity_registry_path = Some(path.to_string());
-            }
-        }
-        SourceConfig::DatabricksAudit(config) => {
-            if config.identity_registry_path.trim().is_empty() {
-                config.identity_registry_path = path.to_string();
-            }
-        }
-        SourceConfig::OktaSystemLog(config) => {
-            if config.identity_registry_path.trim().is_empty() {
-                config.identity_registry_path = path.to_string();
-            }
-        }
-        SourceConfig::Multi(config) => {
-            if config.identity_registry_path.is_none() {
-                config.identity_registry_path = Some(path.to_string());
-            }
-        }
-    }
-
-    inherited
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -666,7 +516,7 @@ fn persist_zerobus_actor_population_if_configured(
 
     let registry = identity_registry_for_actor_population(source_config)?.ok_or_else(|| {
         format!(
-            "zerobus table {ACTOR_POPULATION_SOURCE} requires an identity_registry_path or population_config_path source"
+            "zerobus table {ACTOR_POPULATION_SOURCE} requires an identity_registry_path, population_config_path, or population_config source"
         )
     })?;
     let generated_at = Utc::now();
@@ -683,19 +533,27 @@ fn persist_zerobus_actor_population_if_configured(
 fn identity_registry_for_actor_population(
     config: &SourceConfig,
 ) -> Result<Option<IdentityRegistry>, Box<dyn std::error::Error>> {
-    let population_path = population_config_path(config)?;
+    let population_config = population_config_source(config)?;
     let registry_path = identity_registry_path(config)?;
-    match (population_path, registry_path) {
-        (Some(population_path), Some(_)) => Err(format!(
-            "zerobus table {ACTOR_POPULATION_SOURCE} cannot use both identity_registry_path and population_config_path"
+    match (population_config, registry_path) {
+        (Some(_), Some(_)) => Err(format!(
+            "zerobus table {ACTOR_POPULATION_SOURCE} cannot use both identity_registry_path and population_config"
         )
         .into()),
-        (Some(population_path), None) => {
-            Ok(Some(identity_registry_from_population_config_path(&population_path)?))
-        }
+        (Some(PopulationConfigSource::Path(population_path)), None) => Ok(Some(
+            identity_registry_from_population_config_path(&population_path)?,
+        )),
+        (Some(PopulationConfigSource::Inline(population_config)), None) => Ok(Some(
+            identity_registry_from_population_config(&population_config)?,
+        )),
         (None, Some(registry_path)) => Ok(Some(IdentityRegistry::from_path(&registry_path)?)),
         (None, None) => Ok(None),
     }
+}
+
+enum PopulationConfigSource {
+    Path(String),
+    Inline(PopulationConfig),
 }
 
 fn identity_registry_path(
@@ -725,6 +583,27 @@ fn population_config_path(
         _ => Err(format!(
             "zerobus table {ACTOR_POPULATION_SOURCE} requires a single shared population_config_path, found: {}",
             paths.into_iter().collect::<Vec<_>>().join(", ")
+        )
+        .into()),
+    }
+}
+
+fn population_config_source(
+    config: &SourceConfig,
+) -> Result<Option<PopulationConfigSource>, Box<dyn std::error::Error>> {
+    let mut paths = BTreeSet::new();
+    let mut inline_configs = Vec::new();
+    collect_population_configs(config, &mut paths, &mut inline_configs)?;
+
+    let configured_count = paths.len() + inline_configs.len();
+    match configured_count {
+        0 => Ok(None),
+        1 if paths.len() == 1 => Ok(paths.into_iter().next().map(PopulationConfigSource::Path)),
+        1 => Ok(inline_configs.pop().map(PopulationConfigSource::Inline)),
+        _ => Err(format!(
+            "zerobus table {ACTOR_POPULATION_SOURCE} requires a single shared population_config, found {} path(s) and {} inline config(s)",
+            paths.len(),
+            inline_configs.len()
         )
         .into()),
     }
@@ -785,6 +664,23 @@ fn collect_population_config_paths(
     Ok(())
 }
 
+fn collect_population_configs(
+    config: &SourceConfig,
+    paths: &mut BTreeSet<String>,
+    inline_configs: &mut Vec<PopulationConfig>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let SourceConfig::Multi(config) = config {
+        insert_optional_path(paths, config.population_config_path.as_deref());
+        if let Some(population_config) = &config.population_config {
+            inline_configs.push(population_config.clone());
+        }
+        for source in &config.sources {
+            collect_population_configs(source, paths, inline_configs)?;
+        }
+    }
+    Ok(())
+}
+
 fn insert_optional_path(paths: &mut BTreeSet<String>, value: Option<&str>) {
     if let Some(value) = value.and_then(non_empty_str) {
         paths.insert(value.to_string());
@@ -829,6 +725,16 @@ fn identity_population_row_json(
         "generated_at": generated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
     });
     Ok(serde_json::to_string(&row)?)
+}
+
+fn identity_registry_from_population_config(
+    config: &PopulationConfig,
+) -> Result<IdentityRegistry, Box<dyn std::error::Error>> {
+    let population = generate_population(config)?;
+    Ok(IdentityRegistry::from_population(
+        "generated_identity_registry",
+        &population,
+    )?)
 }
 
 struct RoutedWriters {
@@ -1208,6 +1114,7 @@ mod tests {
         let config = SourceConfig::Multi(MultiSourceConfig {
             identity_registry_path: Some("./examples/identity_registry.toml".to_string()),
             population_config_path: None,
+            population_config: None,
             sources: vec![
                 SourceConfig::CloudTrail(cloudtrail(None)),
                 SourceConfig::CloudTrail(cloudtrail(None)),
@@ -1226,6 +1133,7 @@ mod tests {
         let config = SourceConfig::Multi(MultiSourceConfig {
             identity_registry_path: None,
             population_config_path: None,
+            population_config: None,
             sources: vec![
                 SourceConfig::CloudTrail(cloudtrail(Some("./registry-a.toml"))),
                 SourceConfig::CloudTrail(cloudtrail(Some("./registry-b.toml"))),
@@ -1244,6 +1152,7 @@ mod tests {
         let config = SourceConfig::Multi(MultiSourceConfig {
             identity_registry_path: None,
             population_config_path: Some("./examples/actors.toml".to_string()),
+            population_config: None,
             sources: vec![SourceConfig::CloudTrail(cloudtrail(None))],
             outputs: None,
         });
@@ -1259,6 +1168,7 @@ mod tests {
         let config = SourceConfig::Multi(MultiSourceConfig {
             identity_registry_path: Some("./examples/identity_registry.toml".to_string()),
             population_config_path: Some("./examples/actors.toml".to_string()),
+            population_config: None,
             sources: vec![SourceConfig::CloudTrail(cloudtrail(None))],
             outputs: None,
         });
@@ -1266,7 +1176,7 @@ mod tests {
         let err = identity_registry_for_actor_population(&config)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("cannot use both identity_registry_path and population_config_path"));
+        assert!(err.contains("cannot use both identity_registry_path and population_config"));
     }
 
     #[test]
@@ -1274,6 +1184,7 @@ mod tests {
         let config = SourceConfig::Multi(MultiSourceConfig {
             identity_registry_path: None,
             population_config_path: Some("./examples/actors.toml".to_string()),
+            population_config: None,
             sources: vec![SourceConfig::CloudTrail(cloudtrail(Some(
                 "./examples/identity_registry.toml",
             )))],
