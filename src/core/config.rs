@@ -76,6 +76,7 @@ pub struct TimezoneWeight {
 #[serde(untagged)]
 pub enum OutputConfig {
     Zerobus(ZerobusOutputConfig),
+    DatabricksVolume(DatabricksVolumeOutputConfig),
     File(FileOutputConfig),
 }
 
@@ -84,6 +85,7 @@ impl OutputConfig {
         match self {
             OutputConfig::File(config) => Some(config),
             OutputConfig::Zerobus(_) => None,
+            OutputConfig::DatabricksVolume(_) => None,
         }
     }
 
@@ -94,6 +96,9 @@ impl OutputConfig {
                 Ok(())
             }
             OutputConfig::Zerobus(_) => {
+                Err("--output can only override file output directories".to_string())
+            }
+            OutputConfig::DatabricksVolume(_) => {
                 Err("--output can only override file output directories".to_string())
             }
         }
@@ -161,6 +166,44 @@ pub enum ZerobusOutputType {
     Zerobus,
 }
 
+/// Databricks Unity Catalog volume output sink configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabricksVolumeOutputConfig {
+    #[serde(rename = "type")]
+    pub output_type: DatabricksVolumeOutputType,
+    /// Databricks workspace URL, for example `https://dbc-...cloud.databricks.com`.
+    pub workspace_url: String,
+    /// Base UC volume directory, for example `/Volumes/main/seclog/raw/seclog`.
+    pub volume_path: String,
+    /// Environment variable containing a Databricks bearer token.
+    #[serde(default = "default_databricks_volume_token_env")]
+    pub token_env: String,
+    /// Target uncompressed file size before upload.
+    #[serde(default = "default_databricks_volume_target_size_mb")]
+    pub target_size_mb: u64,
+    /// Maximum buffered age before upload.
+    #[serde(default = "default_databricks_volume_max_age_seconds")]
+    pub max_age_seconds: u64,
+    /// Periodic flush cadence used by the generator loop.
+    #[serde(default = "default_databricks_volume_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+    /// Optional compression for uploaded JSON files. Supported: `gzip`, `gz`.
+    pub compression: Option<String>,
+    /// Files API overwrite flag. Generated names are unique, so false is the safer default.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DatabricksVolumeOutputType {
+    #[serde(
+        rename = "databricks_volume",
+        alias = "databricks_files",
+        alias = "volume"
+    )]
+    DatabricksVolume,
+}
+
 fn default_zerobus_client_id_env() -> String {
     "DATABRICKS_CLIENT_ID".to_string()
 }
@@ -178,6 +221,22 @@ fn default_zerobus_max_inflight_requests() -> usize {
 }
 
 fn default_zerobus_flush_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_databricks_volume_token_env() -> String {
+    "DATABRICKS_TOKEN".to_string()
+}
+
+fn default_databricks_volume_target_size_mb() -> u64 {
+    50
+}
+
+fn default_databricks_volume_max_age_seconds() -> u64 {
+    30
+}
+
+fn default_databricks_volume_flush_interval_ms() -> u64 {
     1_000
 }
 
@@ -558,5 +617,29 @@ mod tests {
             output.tables.get("actor_population").map(String::as_str),
             Some("main.seclog.actor_population")
         );
+    }
+
+    #[test]
+    fn databricks_volume_example_uses_files_api_output() {
+        let config = Config::from_path("examples/all_sources_volume.toml").unwrap();
+        let OutputConfig::DatabricksVolume(output) = config.output else {
+            panic!("expected databricks volume output");
+        };
+
+        assert_eq!(
+            output.output_type,
+            DatabricksVolumeOutputType::DatabricksVolume
+        );
+        assert_eq!(
+            output.workspace_url,
+            "https://dbc-example.cloud.databricks.com"
+        );
+        assert_eq!(output.volume_path, "/Volumes/main/seclog/raw/seclog");
+        assert_eq!(output.token_env, "DATABRICKS_TOKEN");
+        assert_eq!(output.target_size_mb, 50);
+        assert_eq!(output.max_age_seconds, 30);
+        assert_eq!(output.flush_interval_ms, 1_000);
+        assert_eq!(output.compression.as_deref(), Some("gzip"));
+        assert!(!output.overwrite);
     }
 }

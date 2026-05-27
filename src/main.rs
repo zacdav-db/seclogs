@@ -3,12 +3,13 @@ use clap::{Parser, Subcommand};
 use seclog::actors_parquet::write_population;
 use seclog::core::actors::generate_population;
 use seclog::core::config::{
-    Config, FileOutputConfig, FormatConfig, MultiSourceConfig, OutputConfig, PopulationConfig,
-    SourceConfig, ZerobusOutputConfig,
+    Config, DatabricksVolumeOutputConfig, FileOutputConfig, FormatConfig, MultiSourceConfig,
+    OutputConfig, PopulationConfig, SourceConfig, ZerobusOutputConfig,
 };
 use seclog::core::event::Event;
 use seclog::core::identity::{Identity, IdentityRegistry};
 use seclog::core::traits::{EventSource, EventWriter};
+use seclog::formats::databricks_volume::DatabricksVolumeWriter;
 use seclog::formats::json::JsonlWriter;
 use seclog::formats::parquet::ParquetWriter;
 use seclog::formats::zerobus::ZerobusWriter;
@@ -164,6 +165,25 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     run_zerobus_generation(
                         generator,
                         &loaded.source,
+                        output,
+                        time_scale,
+                        start_sim_time,
+                        start_time,
+                        max_events,
+                        max_duration,
+                        Duration::from_millis(metrics_interval_ms),
+                    )?;
+                }
+                OutputConfig::DatabricksVolume(output) => {
+                    if requested_writer_shards > 1 {
+                        eprintln!(
+                            "warning: databricks_volume output uploads rotated files from one writer; forcing writer-shards=1"
+                        );
+                    }
+                    let generator =
+                        build_event_source(&loaded.source, loaded.seed, start_sim_time)?;
+                    run_databricks_volume_generation(
+                        generator,
                         output,
                         time_scale,
                         start_sim_time,
@@ -431,6 +451,68 @@ fn run_zerobus_generation(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = ZerobusWriter::new(output)?;
     persist_zerobus_actor_population_if_configured(source_config, output, &mut writer)?;
+    let flush_interval = Some(Duration::from_millis(output.flush_interval_ms.max(1)));
+    let mut next_flush = flush_interval.map(|interval| Instant::now() + interval);
+    let mut metrics = Metrics::new(metrics_interval);
+    let mut total_dispatched = 0_u64;
+    let mut loop_bytes = 0_u64;
+    let mut last_sim_time = start_sim_time;
+    let mut last_wall = Instant::now();
+
+    loop {
+        let loop_start = Instant::now();
+        if let Some(limit) = max_duration {
+            if loop_start.duration_since(start_time) >= limit {
+                break;
+            }
+        }
+        if let Some(max) = max_events {
+            if total_dispatched >= max {
+                break;
+            }
+        }
+
+        let Some(event) = generator.next_event() else {
+            break;
+        };
+
+        if let Some(event_time) = parse_event_time(&event) {
+            if let Some(scale) = time_scale {
+                throttle_to_sim_time(event_time, last_sim_time, scale, &mut last_wall);
+            }
+            last_sim_time = event_time;
+        }
+
+        loop_bytes += writer.write_event(&event)?;
+        total_dispatched += 1;
+
+        if let (Some(interval), Some(next)) = (flush_interval, next_flush) {
+            if loop_start >= next {
+                writer.flush()?;
+                next_flush = Some(loop_start + interval);
+            }
+        }
+
+        metrics.record(1, loop_bytes, Duration::ZERO, 0);
+        loop_bytes = 0;
+    }
+
+    writer.close()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_databricks_volume_generation(
+    mut generator: Box<dyn EventSource>,
+    output: &DatabricksVolumeOutputConfig,
+    time_scale: Option<f64>,
+    start_sim_time: DateTime<Utc>,
+    start_time: Instant,
+    max_events: Option<u64>,
+    max_duration: Option<Duration>,
+    metrics_interval: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = DatabricksVolumeWriter::new(output)?;
     let flush_interval = Some(Duration::from_millis(output.flush_interval_ms.max(1)));
     let mut next_flush = flush_interval.map(|interval| Instant::now() + interval);
     let mut metrics = Metrics::new(metrics_interval);
