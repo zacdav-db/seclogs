@@ -33,8 +33,8 @@ To generate Okta System Log events from a shared identity registry:
 cargo run --bin seclog -- gen --config examples/okta_system_log.toml --output ./out-okta
 ```
 
-To generate CloudTrail, Databricks audit, and Okta System Log from one shared
-identity registry in a single run:
+To generate CloudTrail, Databricks audit, and Okta System Log from one
+synthesized actor population in a single run:
 ```bash
 cargo run --bin seclog -- gen --config examples/all_sources.toml --max-events 100
 ```
@@ -82,27 +82,32 @@ name = "example_identity_registry"
 
 [[identity]]
 actor_id = "user-001"
-email = "user.one@example.com"
+email = "amelia.chen@example.com.au"
 employee_id = "E-000001"
-display_name = "User One"
-role_persona = "Business user"
+display_name = "Amelia Chen"
+role_persona = "Finance operations analyst"
 department = "Business Operations"
 home_location = "Sydney, NSW, Australia"
 normal_countries_regions = ["Australia", "Australia/NSW"]
 okta_user_id = "00u-example-user-001"
-databricks_username = "user.one@example.com"
+databricks_username = "amelia.chen@example.com.au"
 service_account = false
 tags = ["human"]
 
 [[identity.aws_principals]]
 account_id = "123456789012"
 principal_id = "AIDAEXAMPLEUSER001"
-arn = "arn:aws:iam::123456789012:user/user.one"
+arn = "arn:aws:iam::123456789012:user/amelia.chen"
 access_key_id = "AKIAEXAMPLEUSER01"
 ```
 
 ## actors.toml reference (population generation)
 `actors.toml` controls how the actor population is built and stored as Parquet.
+Generated human actors get locale-aware display names, usernames, email
+domains, home locations, and normal country/region baselines from
+`timezone_distribution` or an explicit actor `timezone`. Exact IANA timezone
+names are used before falling back to UTC offset, so `Australia/Perth` remains
+an Australian population instead of being treated like another UTC+8 region.
 Error rates are sampled per actor and applied at generation time; error codes and
 messages come from built-in CloudTrail defaults per event.
 
@@ -159,7 +164,6 @@ timezone = "Europe/London"
 active_start_hour = 8
 active_hours = 10
 weekend_active = false
-user_name = "n.rogue"
 account_id = "123456789012"
 user_agents = ["Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36", "curl/8.5.0"]
 source_ips = ["203.0.113.45", "198.51.100.23"]
@@ -232,6 +236,10 @@ explicit list size, Seclog keeps all explicit actors and skips generating additi
 | `population.actor.error_rate` | float | no | Overrides sampled error rate (0.0–1.0). |
 | `population.actor.account_id` | string | no | Overrides the AWS account ID (12 digits). |
 | `population.actor.user_name` | string | no | Overrides IAM username for human actors. |
+| `population.actor.display_name` | string | no | Overrides the actor display name. Missing human names are generated from the actor timezone locale. |
+| `population.actor.email` | string | no | Overrides actor email. Missing human emails use the actor username and locale email domain. |
+| `population.actor.home_location` | string | no | Overrides the actor home location used by source generators. |
+| `population.actor.normal_countries_regions` | string[] | no | Overrides normal country/region baselines used by source generators. |
 | `population.actor.principal_id` | string | no | Overrides the principal ID. |
 | `population.actor.arn` | string | no | Overrides the full ARN. |
 | `population.actor.access_key_id` | string | no | Overrides the access key ID. |
@@ -362,11 +370,11 @@ loads the shared identity registry, maps generated actors to Okta user/client
 IDs, emits deterministic baseline auth/session/app-access activity, and can
 inject explicit System Log events.
 
-This source is intentionally limited today. It preserves the real root
-`LogEvent` shape and selected nested objects, including `actor`,
-`authenticationContext`, `client`, `debugContext`, `outcome`, `request`,
-`securityContext`, `target`, and `transaction`, but it is not a full
-implementation of the Okta event-type catalog.
+This source is intentionally limited today. It preserves the raw Okta
+System Log landing shape and selected nested objects, including `actor`,
+`authenticationContext`, `client`, `device`, `debugContext`, `outcome`,
+`request`, `securityContext`, `target`, and `transaction`, but it is not a
+full implementation of the Okta event-type catalog.
 
 ```toml
 [source]
@@ -398,8 +406,11 @@ display_name = "Operations Portal"
 detail_entry = { signOnModeType = "SAML_2_0" }
 ```
 
-Okta payloads use Okta camelCase field names. `client.ipAddress` is mirrored to
-`request.ipChain[0].ip`, `debugContext.debugData` remains a dynamic JSON object,
+Okta payloads use Okta camelCase field names plus Okta device posture field
+names such as `os_platform`, `disk_encryption_type`, and
+`secure_hardware_present`. `client.ipAddress` is mirrored to
+`request.ipChain[0].ip`, `authenticationContext.rootSessionId` mirrors
+`externalSessionId`, `debugContext.debugData` remains a dynamic JSON object,
 and `target` entries carry typed `type` values such as `AppInstance` and
 `AppUser`; consumers should search targets by type rather than array position.
 
@@ -411,7 +422,7 @@ file output, `source.outputs` routes events by normalized source name.
 ```toml
 [source]
 type = "multi"
-identity_registry_path = "./examples/identity_registry.toml"
+population_config_path = "./examples/actors.toml"
 
 [source.outputs.cloudtrail]
 dir = "./out-all-sources/cloudtrail"
@@ -437,6 +448,12 @@ workspace_id = "1234567890"
 type = "okta"
 org_id = "okta-example-org"
 ```
+
+`population_config_path` points to the same population config used by
+`seclog actors`. Seclog synthesizes a shared identity registry in memory, so
+CloudTrail, Databricks audit, and Okta events share the same realistic actor
+population without requiring one hand-written registry entry per user. Use
+`identity_registry_path` instead when you need a fully curated registry.
 
 The built-in route keys are `cloudtrail`, `databricks_audit`, and
 `okta_system_log`. If a file route is not listed under `source.outputs`, the
@@ -485,10 +502,10 @@ Each destination table uses the common seclog row shape:
 `time` must be a target table `TIMESTAMP` column and is emitted on the JSON path
 as epoch microseconds for Zerobus. `payload_json` preserves the exact
 CloudTrail, Databricks audit, or Okta payload. When an `actor_population` table
-route is present and the source configuration uses an `identity_registry_path`,
-`seclog gen` writes the identity population to that table before event
-generation. The actor population table uses `time`, `registry_name`, `actor_id`,
-`actor_kind`, identity fields,
+route is present and the source configuration uses an `identity_registry_path`
+or `population_config_path`, `seclog gen` writes the identity population to that
+table before event generation. The actor population table uses `time`,
+`registry_name`, `actor_id`, `actor_kind`, identity fields,
 `normal_countries_regions_json`, `tags_json`, `aws_principals_json`,
 `identity_json`, `run_id`, and `generated_at`.
 

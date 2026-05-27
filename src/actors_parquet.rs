@@ -34,6 +34,10 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
     let mut arn_builder = StringBuilder::new();
     let mut account_id_builder = StringBuilder::new();
     let mut user_name_builder = StringBuilder::new();
+    let mut display_name_builder = StringBuilder::new();
+    let mut email_builder = StringBuilder::new();
+    let mut home_location_builder = StringBuilder::new();
+    let mut normal_regions_builder = StringBuilder::new();
     let mut user_agent_builder = StringBuilder::new();
     let mut source_ip_builder = StringBuilder::new();
     let mut active_start_builder = Int16Builder::new();
@@ -65,6 +69,27 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
             user_name_builder.append_value(name);
         } else {
             user_name_builder.append_null();
+        }
+        if let Some(display_name) = &actor.display_name {
+            display_name_builder.append_value(display_name);
+        } else {
+            display_name_builder.append_null();
+        }
+        if let Some(email) = &actor.email {
+            email_builder.append_value(email);
+        } else {
+            email_builder.append_null();
+        }
+        if let Some(home_location) = &actor.home_location {
+            home_location_builder.append_value(home_location);
+        } else {
+            home_location_builder.append_null();
+        }
+        if actor.normal_countries_regions.is_empty() {
+            normal_regions_builder.append_null();
+        } else {
+            normal_regions_builder
+                .append_value(encode_string_list(&actor.normal_countries_regions));
         }
         user_agent_builder.append_value(encode_string_list(&actor.user_agents));
         source_ip_builder.append_value(encode_string_list(&actor.source_ips));
@@ -125,6 +150,10 @@ pub fn write_population(path: impl AsRef<Path>, population: &ActorPopulation) ->
             Arc::new(actor_id_builder.finish()),
             Arc::new(tags_builder.finish()),
             Arc::new(event_bias_builder.finish()),
+            Arc::new(display_name_builder.finish()),
+            Arc::new(email_builder.finish()),
+            Arc::new(home_location_builder.finish()),
+            Arc::new(normal_regions_builder.finish()),
         ],
     )
     .map_err(map_arrow_err)?;
@@ -174,6 +203,10 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
     let actor_id = column_as_string_optional_fallback(batch, 18)?;
     let tags = column_as_string_optional_fallback(batch, 19)?;
     let event_bias = column_as_string_optional_fallback(batch, 20)?;
+    let display_name = column_as_string_optional_fallback(batch, 21)?;
+    let email = column_as_string_optional_fallback(batch, 22)?;
+    let home_location = column_as_string_optional_fallback(batch, 23)?;
+    let normal_regions = column_as_string_optional_fallback(batch, 24)?;
 
     let mut actors = Vec::with_capacity(batch.num_rows());
     for idx in 0..batch.num_rows() {
@@ -243,6 +276,14 @@ fn read_batch(batch: &RecordBatch) -> io::Result<Vec<ActorSeed>> {
             service_profile: resolved_profile,
             service_pattern: resolved_pattern,
             user_name: user_name.get(idx).cloned().flatten(),
+            display_name: display_name.get(idx).cloned().flatten(),
+            email: email.get(idx).cloned().flatten(),
+            home_location: home_location.get(idx).cloned().flatten(),
+            normal_countries_regions: normal_regions
+                .get(idx)
+                .and_then(|value| value.as_deref())
+                .map(parse_optional_string_list)
+                .unwrap_or_default(),
             user_agents: parse_string_list(&user_agent[idx], "user_agent")?,
             source_ips: parse_string_list(&source_ip[idx], "source_ip")?,
             active_start_hour: i16_to_u8(active_start[idx], "active_start_hour")?,
@@ -280,6 +321,10 @@ fn build_schema() -> SchemaRef {
         Field::new("actor_id", DataType::Utf8, true),
         Field::new("tags", DataType::Utf8, true),
         Field::new("event_bias", DataType::Utf8, true),
+        Field::new("display_name", DataType::Utf8, true),
+        Field::new("email", DataType::Utf8, true),
+        Field::new("home_location", DataType::Utf8, true),
+        Field::new("normal_countries_regions", DataType::Utf8, true),
     ];
 
     Arc::new(Schema::new(fields))

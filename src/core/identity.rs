@@ -4,6 +4,7 @@
 //! service accounts, and platform identifiers should live in registry files,
 //! while generators consume the normalized identities through this module.
 
+use super::actors::{ActorKind, ActorPopulation, ActorRole, ActorSeed, ServiceProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -139,6 +140,33 @@ impl IdentityRegistry {
         Ok(registry)
     }
 
+    pub fn from_population(
+        name: impl Into<String>,
+        population: &ActorPopulation,
+    ) -> Result<Self, IdentityRegistryError> {
+        let mut human_index = 0_usize;
+        let mut service_index = 0_usize;
+        let identities = population
+            .actors
+            .iter()
+            .enumerate()
+            .map(|(idx, actor)| {
+                let ordinal = match actor.kind {
+                    ActorKind::Human => {
+                        human_index += 1;
+                        human_index
+                    }
+                    ActorKind::Service => {
+                        service_index += 1;
+                        service_index
+                    }
+                };
+                identity_from_actor_seed(actor, idx, ordinal)
+            })
+            .collect();
+        Self::new(name, identities)
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -252,6 +280,272 @@ impl IdentityRegistry {
     }
 }
 
+fn identity_from_actor_seed(actor: &ActorSeed, idx: usize, ordinal: usize) -> Identity {
+    let service_account = matches!(actor.kind, ActorKind::Service);
+    let actor_id = actor.id.clone().unwrap_or_else(|| {
+        if service_account {
+            format!("svc-{ordinal:04}")
+        } else {
+            format!("human-{ordinal:04}")
+        }
+    });
+    let user_name = actor
+        .user_name
+        .as_deref()
+        .and_then(non_empty)
+        .map(str::to_string)
+        .unwrap_or_else(|| username_from_actor(actor, &actor_id, ordinal));
+    let display_name = actor
+        .display_name
+        .as_deref()
+        .and_then(non_empty)
+        .map(str::to_string)
+        .unwrap_or_else(|| display_name_from_actor(actor, &user_name, ordinal));
+    let email = actor
+        .email
+        .as_deref()
+        .and_then(non_empty)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if service_account {
+                format!(
+                    "{}.{ordinal:04}@example.internal",
+                    service_email_local_part(&display_name, ordinal)
+                )
+            } else {
+                format!("{user_name}@example.com")
+            }
+        });
+    let normal_countries_regions = if actor.normal_countries_regions.is_empty() {
+        actor
+            .home_location
+            .as_deref()
+            .and_then(non_empty)
+            .map(|location| vec![location.to_string()])
+            .unwrap_or_default()
+    } else {
+        actor.normal_countries_regions.clone()
+    };
+    let home_location = actor
+        .home_location
+        .as_deref()
+        .and_then(non_empty)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if service_account {
+                "Cloud service account".to_string()
+            } else {
+                "Unassigned location".to_string()
+            }
+        });
+    let employee_id = if service_account {
+        format!("SVC-{:06}", 100000 + ordinal)
+    } else {
+        format!("E-{:06}", 100000 + ordinal)
+    };
+    let okta_user_id = if service_account {
+        format!("0oa{}", stable_token(&actor_id, idx, 17))
+    } else {
+        format!("00u{}", stable_token(&actor_id, idx, 17))
+    };
+    let databricks_username = email.clone();
+
+    Identity {
+        actor_id: actor_id.clone(),
+        email,
+        employee_id,
+        display_name,
+        role_persona: role_persona(actor),
+        department: department(actor),
+        home_location,
+        normal_countries_regions,
+        okta_user_id,
+        databricks_username,
+        aws_principals: vec![aws_principal_from_actor(actor)],
+        service_account,
+        tags: actor.tags.clone(),
+    }
+}
+
+fn aws_principal_from_actor(actor: &ActorSeed) -> AwsPrincipal {
+    let (role_name, role_session_name) = assumed_role_parts(&actor.arn);
+    AwsPrincipal {
+        account_id: actor.account_id.clone(),
+        principal_id: actor.principal_id.clone(),
+        arn: actor.arn.clone(),
+        role_name,
+        role_session_name,
+        access_key_id: Some(actor.access_key_id.clone()),
+    }
+}
+
+fn assumed_role_parts(arn: &str) -> (Option<String>, Option<String>) {
+    let Some((_, tail)) = arn.split_once(":assumed-role/") else {
+        return (None, None);
+    };
+    let mut parts = tail.split('/');
+    let role_name = parts.next().and_then(non_empty).map(str::to_string);
+    let role_session_name = parts.next().and_then(non_empty).map(str::to_string);
+    (role_name, role_session_name)
+}
+
+fn username_from_actor(actor: &ActorSeed, actor_id: &str, ordinal: usize) -> String {
+    if let Some(email) = actor.email.as_deref().and_then(non_empty) {
+        if let Some((local, _)) = email.split_once('@') {
+            let slug = slug(local);
+            if !slug.is_empty() {
+                return slug;
+            }
+        }
+    }
+    if let Some(display_name) = actor.display_name.as_deref().and_then(non_empty) {
+        let slug = slug(display_name);
+        if !slug.is_empty() {
+            return slug;
+        }
+    }
+    let slug = slug(actor_id);
+    if slug.is_empty() {
+        format!("actor{ordinal:04}")
+    } else {
+        slug
+    }
+}
+
+fn display_name_from_actor(actor: &ActorSeed, user_name: &str, ordinal: usize) -> String {
+    if matches!(actor.kind, ActorKind::Service) {
+        return actor
+            .service_profile
+            .as_ref()
+            .map(service_display_name)
+            .unwrap_or("Automation Service")
+            .to_string();
+    }
+    let parts: Vec<String> = user_name
+        .split(|ch: char| ch == '.' || ch == '_' || ch == '-' || ch.is_ascii_digit())
+        .filter_map(non_empty)
+        .map(title_ascii)
+        .collect();
+    if parts.len() >= 2 {
+        parts.join(" ")
+    } else {
+        format!("Generated User {ordinal:04}")
+    }
+}
+
+fn role_persona(actor: &ActorSeed) -> String {
+    match actor.kind {
+        ActorKind::Human => match actor.role.as_ref().unwrap_or(&ActorRole::Developer) {
+            ActorRole::Admin => "Cloud platform administrator",
+            ActorRole::Developer => "Data engineering developer",
+            ActorRole::ReadOnly => "Business analytics viewer",
+            ActorRole::Auditor => "Security and compliance auditor",
+        },
+        ActorKind::Service => match actor
+            .service_profile
+            .as_ref()
+            .unwrap_or(&ServiceProfile::Generic)
+        {
+            ServiceProfile::Generic => "Automation service account",
+            ServiceProfile::Ec2Reaper => "Compute lifecycle service account",
+            ServiceProfile::DataLakeBot => "Data lake automation service account",
+            ServiceProfile::LogsShipper => "Log shipping service account",
+            ServiceProfile::MetricsCollector => "Metrics collection service account",
+        },
+    }
+    .to_string()
+}
+
+fn department(actor: &ActorSeed) -> String {
+    match actor.kind {
+        ActorKind::Human => match actor.role.as_ref().unwrap_or(&ActorRole::Developer) {
+            ActorRole::Admin => "Platform Engineering",
+            ActorRole::Developer => "Data Engineering",
+            ActorRole::ReadOnly => "Business Operations",
+            ActorRole::Auditor => "Security",
+        },
+        ActorKind::Service => "Platform Engineering",
+    }
+    .to_string()
+}
+
+fn service_display_name(profile: &ServiceProfile) -> &'static str {
+    match profile {
+        ServiceProfile::Generic => "Automation Service",
+        ServiceProfile::Ec2Reaper => "EC2 Reaper Service",
+        ServiceProfile::DataLakeBot => "Data Lake Bot Service",
+        ServiceProfile::LogsShipper => "Logs Shipper Service",
+        ServiceProfile::MetricsCollector => "Metrics Collector Service",
+    }
+}
+
+fn service_email_local_part(display_name: &str, ordinal: usize) -> String {
+    let slug = slug(display_name);
+    if slug.is_empty() {
+        format!("svc{ordinal:04}")
+    } else if slug.starts_with("svc.") {
+        slug
+    } else {
+        format!("svc.{slug}")
+    }
+}
+
+fn slug(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_dot = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            previous_dot = false;
+        } else if !previous_dot {
+            out.push('.');
+            previous_dot = true;
+        }
+    }
+    out.trim_matches('.').to_string()
+}
+
+fn title_ascii(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut result = String::new();
+    result.push(first.to_ascii_uppercase());
+    result.push_str(chars.as_str().to_ascii_lowercase().as_str());
+    result
+}
+
+fn stable_token(actor_id: &str, idx: usize, len: usize) -> String {
+    const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut hash = stable_hash(&format!("{actor_id}:{idx}"));
+    let mut token = String::with_capacity(len);
+    for _ in 0..len {
+        let alphabet_idx = (hash % ALPHABET.len() as u64) as usize;
+        token.push(ALPHABET[alphabet_idx] as char);
+        hash = hash.rotate_left(7).wrapping_mul(0x9E3779B185EBCA87);
+    }
+    token
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn insert_unique(
     index: &mut HashMap<String, usize>,
     field: &'static str,
@@ -286,6 +580,8 @@ fn normalize_key(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::actors::generate_population;
+    use crate::core::config::{PopulationActorsConfig, PopulationConfig, TimezoneWeight};
 
     #[test]
     fn registry_resolves_cross_system_identity_keys() {
@@ -333,6 +629,53 @@ mod tests {
             err,
             IdentityRegistryError::DuplicateKey { field: "email", .. }
         ));
+    }
+
+    #[test]
+    fn registry_can_be_synthesized_from_actor_population() {
+        let population = generate_population(&PopulationConfig {
+            seed: Some(17),
+            timezone_distribution: Some(vec![TimezoneWeight {
+                name: "Asia/Singapore".to_string(),
+                weight: 1.0,
+            }]),
+            population: PopulationActorsConfig {
+                actor_count: Some(6),
+                service_ratio: Some(0.0),
+                hot_actor_ratio: Some(0.0),
+                hot_actor_multiplier: Some(1.0),
+                account_ids: Some(vec!["123456789012".to_string()]),
+                account_count: None,
+                error_rate: None,
+                human_error_rate: None,
+                service_error_rate: None,
+                role: None,
+                service_events_per_hour: None,
+                service_profiles: None,
+                actor: None,
+            },
+        })
+        .unwrap();
+        let registry = IdentityRegistry::from_population("generated", &population).unwrap();
+
+        assert_eq!(registry.identities().len(), 6);
+        for identity in registry.identities() {
+            assert!(identity.actor_id.starts_with("human-"));
+            assert!(!identity.display_name.starts_with("Generated User"));
+            assert!(identity.email.ends_with("@example.sg"));
+            assert_eq!(identity.home_location, "Singapore");
+            assert_eq!(
+                identity.normal_countries_regions,
+                vec!["Singapore".to_string()]
+            );
+            assert!(registry.resolve_email(&identity.email).is_some());
+            assert!(registry
+                .resolve_okta_user_id(&identity.okta_user_id)
+                .is_some());
+            assert!(registry
+                .resolve_aws_arn(&identity.aws_principals[0].arn)
+                .is_some());
+        }
     }
 
     fn test_registry() -> IdentityRegistry {

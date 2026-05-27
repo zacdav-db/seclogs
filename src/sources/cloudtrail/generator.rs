@@ -36,6 +36,19 @@ impl CloudTrailGenerator {
         Self::new(selector, events, config, seed, start_time)
     }
 
+    /// Builds a generator from an in-memory shared identity registry.
+    pub fn from_registry(
+        config: &CloudTrailSourceConfig,
+        registry: IdentityRegistry,
+        seed: Option<u64>,
+        start_time: DateTime<Utc>,
+    ) -> Result<Self, CatalogError> {
+        let events = resolve_event_weights(config)?;
+        let selector = EventSelector::new(events.clone())?;
+        let actors = actor_profiles_from_registry(config, &registry)?;
+        Self::new_with_actor_profiles(selector, events, config, seed, start_time, actors)
+    }
+
     /// Builds a generator from a prepared selector and event list.
     pub fn new(
         selector: EventSelector,
@@ -43,6 +56,18 @@ impl CloudTrailGenerator {
         config: &CloudTrailSourceConfig,
         seed: Option<u64>,
         start_time: DateTime<Utc>,
+    ) -> Result<Self, CatalogError> {
+        let actors = load_actor_profiles(config)?;
+        Self::new_with_actor_profiles(selector, events, config, seed, start_time, actors)
+    }
+
+    fn new_with_actor_profiles(
+        selector: EventSelector,
+        events: Vec<WeightedEvent>,
+        config: &CloudTrailSourceConfig,
+        seed: Option<u64>,
+        start_time: DateTime<Utc>,
+        mut actors: Vec<ActorProfile>,
     ) -> Result<Self, CatalogError> {
         let mut rng = match seed {
             Some(seed) => StdRng::seed_from_u64(seed),
@@ -57,7 +82,6 @@ impl CloudTrailGenerator {
 
         let region_selector =
             build_region_selector(config.regions.as_ref(), config.region_distribution.as_ref());
-        let mut actors = load_actor_profiles(config)?;
         shuffle_actors(&mut actors, &mut rng);
         let schedule = build_schedule(&actors, start_time, &mut rng);
         Ok(Self {
@@ -253,6 +277,10 @@ fn actor_seed_from_identity(
         service_profile,
         service_pattern,
         user_name,
+        display_name: Some(identity.display_name.clone()),
+        email: Some(identity.email.clone()),
+        home_location: Some(identity.home_location.clone()),
+        normal_countries_regions: identity.normal_countries_regions.clone(),
         user_agents: user_agents_for_identity(identity),
         source_ips: source_ips_for_identity(config, identity, idx),
         active_start_hour: if identity.service_account { 0 } else { 8 },

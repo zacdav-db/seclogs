@@ -2,82 +2,82 @@ name = "example_identity_registry"
 
 [[identity]]
 actor_id = "user-001"
-email = "user.one@example.com"
+email = "amelia.chen@example.com.au"
 employee_id = "E-000001"
-display_name = "User One"
-role_persona = "Business user"
+display_name = "Amelia Chen"
+role_persona = "Finance operations analyst"
 department = "Business Operations"
 home_location = "Sydney, NSW, Australia"
 normal_countries_regions = ["Australia", "Australia/NSW"]
 okta_user_id = "00u-example-user-001"
-databricks_username = "user.one@example.com"
+databricks_username = "amelia.chen@example.com.au"
 service_account = false
 tags = ["human"]
 
 [[identity.aws_principals]]
 account_id = "123456789012"
 principal_id = "AIDAEXAMPLEUSER001"
-arn = "arn:aws:iam::123456789012:user/user.one"
+arn = "arn:aws:iam::123456789012:user/amelia.chen"
 access_key_id = "AKIAEXAMPLEUSER01"
 
 [[identity]]
 actor_id = "user-002"
-email = "user.two@example.com"
+email = "wei.ming.tan@example.sg"
 employee_id = "E-000002"
-display_name = "User Two"
+display_name = "Wei Ming Tan"
 role_persona = "Regional operations user"
 department = "Business Operations"
 home_location = "Singapore"
 normal_countries_regions = ["Singapore"]
 okta_user_id = "00u-example-user-002"
-databricks_username = "user.two@example.com"
+databricks_username = "wei.ming.tan@example.sg"
 service_account = false
 tags = ["human", "singapore"]
 
 [[identity.aws_principals]]
 account_id = "123456789012"
 principal_id = "AIDAEXAMPLEUSER002"
-arn = "arn:aws:iam::123456789012:user/user.two"
+arn = "arn:aws:iam::123456789012:user/wei.ming.tan"
 access_key_id = "AKIAEXAMPLEUSER02"
 
 [[identity]]
 actor_id = "user-003"
-email = "user.three@example.com"
+email = "priya.kumar@example.sg"
 employee_id = "E-000003"
-display_name = "User Three"
+display_name = "Priya Kumar"
 role_persona = "Regional support user"
 department = "Customer Operations"
 home_location = "Singapore"
 normal_countries_regions = ["Singapore"]
 okta_user_id = "00u-example-user-003"
-databricks_username = "user.three@example.com"
+databricks_username = "priya.kumar@example.sg"
 service_account = false
 tags = ["human", "singapore"]
 
 [[identity.aws_principals]]
 account_id = "123456789012"
 principal_id = "AIDAEXAMPLEUSER003"
-arn = "arn:aws:iam::123456789012:user/user.three"
+arn = "arn:aws:iam::123456789012:user/priya.kumar"
 access_key_id = "AKIAEXAMPLEUSER03"
 
 [[identity]]
 actor_id = "svc-001"
-email = "svc-job@example.com"
+email = "svc-lakehouse-jobs@example.com.au"
 employee_id = "SVC-000001"
-display_name = "Example Job Service"
+display_name = "Lakehouse Jobs Service"
 role_persona = "Workflow service account"
 department = "Platform Engineering"
 home_location = "Databricks workspace service principal"
 normal_countries_regions = ["Australia"]
 okta_user_id = "0oa-example-svc-001"
-databricks_username = "svc-job@example.com"
+databricks_username = "svc-lakehouse-jobs@example.com.au"
 service_account = true
 tags = ["service_account"]
 
 [[identity.aws_principals]]
 account_id = "123456789012"
 principal_id = "AROAEXAMPLESVC0001"
-arn = "arn:aws:sts::123456789012:assumed-role/ExampleJobRole/svc-job"
-role_name = "ExampleJobRole"
-role_session_name = "svc-job"
+arn = "arn:aws:sts::123456789012:assumed-role/LakehouseJobsRole/svc-lakehouse-jobs"
+role_name = "LakehouseJobsRole"
+role_session_name = "svc-lakehouse-jobs"
 access_key_id = "ASIAEXAMPLESVC001"

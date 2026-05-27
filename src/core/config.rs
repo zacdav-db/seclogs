@@ -276,6 +276,8 @@ pub struct CloudTrailSourceConfig {
 pub struct MultiSourceConfig {
     /// Optional shared identity registry inherited by child sources.
     pub identity_registry_path: Option<String>,
+    /// Optional actor population config used to synthesize a shared identity registry.
+    pub population_config_path: Option<String>,
     /// Child sources to run from one generator loop.
     #[serde(default, rename = "sources")]
     pub sources: Vec<SourceConfig>,
@@ -365,6 +367,7 @@ pub struct OktaSystemLogEventConfig {
     pub client_device: Option<String>,
     pub client_id: Option<String>,
     pub client_zone: Option<String>,
+    pub device: Option<OktaDeviceConfig>,
     pub authentication_provider: Option<String>,
     pub credential_provider: Option<String>,
     pub credential_type: Option<String>,
@@ -391,6 +394,22 @@ pub struct OktaSecurityContextConfig {
     pub is_proxy: Option<bool>,
     pub risk: Option<TomlValue>,
     pub user_behaviors: Option<TomlValue>,
+}
+
+/// Explicit Okta device object overrides for System Log events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OktaDeviceConfig {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub os_platform: Option<String>,
+    pub os_version: Option<String>,
+    pub managed: Option<bool>,
+    pub registered: Option<bool>,
+    pub device_integrator: Option<String>,
+    pub disk_encryption_type: Option<String>,
+    pub screen_lock_type: Option<String>,
+    pub jailbreak: Option<bool>,
+    pub secure_hardware_present: Option<bool>,
 }
 
 /// Explicit Okta target entry.
@@ -506,6 +525,10 @@ pub struct ExplicitActorConfig {
     pub error_rate: Option<f64>,
     pub account_id: Option<String>,
     pub user_name: Option<String>,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub home_location: Option<String>,
+    pub normal_countries_regions: Option<Vec<String>>,
     pub principal_id: Option<String>,
     pub arn: Option<String>,
     pub access_key_id: Option<String>,
@@ -562,7 +585,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_sources_example_uses_shared_registry_and_routed_outputs() {
+    fn all_sources_example_uses_generated_population_and_routed_outputs() {
         let config = Config::from_path("examples/all_sources.toml").unwrap();
         assert!(matches!(&config.output, OutputConfig::File(_)));
 
@@ -570,9 +593,10 @@ mod tests {
             panic!("expected multi source");
         };
 
+        assert_eq!(source.identity_registry_path.as_deref(), None);
         assert_eq!(
-            source.identity_registry_path.as_deref(),
-            Some("./examples/identity_registry.toml")
+            source.population_config_path.as_deref(),
+            Some("./examples/actors.toml")
         );
         assert_eq!(source.sources.len(), 3);
 

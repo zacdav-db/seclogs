@@ -72,6 +72,10 @@ pub struct ActorSeed {
     pub service_profile: Option<ServiceProfile>,
     pub service_pattern: Option<ServicePattern>,
     pub user_name: Option<String>,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub home_location: Option<String>,
+    pub normal_countries_regions: Vec<String>,
     pub user_agents: Vec<String>,
     pub source_ips: Vec<String>,
     pub active_start_hour: u8,
@@ -292,46 +296,8 @@ pub struct PopulationSpec<'a> {
 impl ActorPopulation {
     /// Generates a mixed population of human and service actors.
     pub fn generate(rng: &mut impl Rng, spec: &PopulationSpec<'_>) -> Self {
-        let total = spec.total;
-        if total == 0 {
-            return Self { actors: Vec::new() };
-        }
-        let service_count = ((total as f64) * spec.service_ratio.clamp(0.0, 1.0)).round() as usize;
-        let human_count = total.saturating_sub(service_count);
-        let mut actors = Vec::with_capacity(total);
-
-        for _ in 0..human_count {
-            let account_id = pick_account_id(rng, spec.account_ids);
-            let error_rate = sample_error_rate(rng, spec.human_error_rate);
-            actors.push(ActorSeed::new_human(
-                rng,
-                spec.role_weights,
-                spec.role_rates,
-                &account_id,
-                error_rate,
-            ));
-        }
-        for _ in 0..service_count {
-            let account_id = pick_account_id(rng, spec.account_ids);
-            let profile =
-                pick_service_profile(rng, spec.service_profiles, spec.service_rate_per_hour);
-            let error_rate = sample_error_rate(rng, spec.service_error_rate);
-            actors.push(ActorSeed::new_service(
-                rng,
-                &account_id,
-                profile.profile,
-                profile.pattern,
-                profile.rate_per_hour,
-                error_rate,
-            ));
-        }
-
-        apply_hot_actor_rates(
-            rng,
-            &mut actors,
-            spec.hot_actor_ratio,
-            spec.hot_actor_multiplier,
-        );
+        let mut actors = generate_actor_seeds(rng, spec);
+        apply_generated_human_identity_defaults(&mut actors, rng);
         Self { actors }
     }
 
@@ -393,7 +359,9 @@ pub fn generate_population(config: &PopulationConfig) -> Result<ActorPopulation,
         account_ids: &account_ids,
     };
 
-    let mut population = ActorPopulation::generate(&mut rng, &spec);
+    let mut population = ActorPopulation {
+        actors: generate_actor_seeds(&mut rng, &spec),
+    };
     population.actors.extend(explicit);
     apply_timezone_distribution(
         &mut population,
@@ -401,6 +369,7 @@ pub fn generate_population(config: &PopulationConfig) -> Result<ActorPopulation,
         start_time,
         &mut rng,
     );
+    apply_generated_human_identity_defaults(&mut population.actors, &mut rng);
     Ok(population)
 }
 
@@ -479,6 +448,9 @@ fn build_explicit_actors(
                     error_rate,
                 );
                 seed.rate_per_hour = events_per_hour;
+                if entry.user_name.is_none() {
+                    seed.user_name = None;
+                }
                 if let Some(identity_type) = &entry.identity_type {
                     seed.identity_type = identity_type.clone();
                 }
@@ -490,6 +462,19 @@ fn build_explicit_actors(
                     if entry.arn.is_none() {
                         seed.arn = format!("arn:aws:iam::{}:user/{}", account_id, name);
                     }
+                }
+                if let Some(display_name) = &entry.display_name {
+                    seed.display_name = Some(display_name.clone());
+                }
+                if let Some(email) = &entry.email {
+                    seed.email = Some(email.clone());
+                }
+                if let Some(home_location) = &entry.home_location {
+                    seed.home_location = Some(home_location.clone());
+                }
+                if let Some(regions) = &entry.normal_countries_regions {
+                    seed.normal_countries_regions =
+                        normalize_string_list(regions, id, "normal_countries_regions")?;
                 }
                 if let Some(arn) = &entry.arn {
                     seed.arn = arn.clone();
@@ -541,6 +526,19 @@ fn build_explicit_actors(
                 if let Some(access_key_id) = &entry.access_key_id {
                     seed.access_key_id = access_key_id.clone();
                 }
+                if let Some(display_name) = &entry.display_name {
+                    seed.display_name = Some(display_name.clone());
+                }
+                if let Some(email) = &entry.email {
+                    seed.email = Some(email.clone());
+                }
+                if let Some(home_location) = &entry.home_location {
+                    seed.home_location = Some(home_location.clone());
+                }
+                if let Some(regions) = &entry.normal_countries_regions {
+                    seed.normal_countries_regions =
+                        normalize_string_list(regions, id, "normal_countries_regions")?;
+                }
                 seed
             }
         };
@@ -576,6 +574,12 @@ fn build_explicit_actors(
             let offset = timezone_offset_for_name(timezone, start_time, id)?;
             actor.timezone_offset = offset;
             actor.timezone_fixed = true;
+            if matches!(actor.kind, ActorKind::Human) {
+                apply_locale_location_defaults(
+                    &mut actor,
+                    locale_for_timezone_name(timezone, offset),
+                );
+            }
         }
 
         actor.id = Some(id.to_string());
@@ -585,6 +589,50 @@ fn build_explicit_actors(
     }
 
     Ok(actors)
+}
+
+fn generate_actor_seeds(rng: &mut impl Rng, spec: &PopulationSpec<'_>) -> Vec<ActorSeed> {
+    let total = spec.total;
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let service_count = ((total as f64) * spec.service_ratio.clamp(0.0, 1.0)).round() as usize;
+    let human_count = total.saturating_sub(service_count);
+    let mut actors = Vec::with_capacity(total);
+
+    for _ in 0..human_count {
+        let account_id = pick_account_id(rng, spec.account_ids);
+        let error_rate = sample_error_rate(rng, spec.human_error_rate);
+        actors.push(ActorSeed::new_human(
+            rng,
+            spec.role_weights,
+            spec.role_rates,
+            &account_id,
+            error_rate,
+        ));
+    }
+    for _ in 0..service_count {
+        let account_id = pick_account_id(rng, spec.account_ids);
+        let profile = pick_service_profile(rng, spec.service_profiles, spec.service_rate_per_hour);
+        let error_rate = sample_error_rate(rng, spec.service_error_rate);
+        actors.push(ActorSeed::new_service(
+            rng,
+            &account_id,
+            profile.profile,
+            profile.pattern,
+            profile.rate_per_hour,
+            error_rate,
+        ));
+    }
+
+    apply_hot_actor_rates(
+        rng,
+        &mut actors,
+        spec.hot_actor_ratio,
+        spec.hot_actor_multiplier,
+    );
+    actors
 }
 
 fn parse_actor_kind(value: &str, id: &str) -> Result<ActorKind, ActorConfigError> {
@@ -709,9 +757,9 @@ impl ActorSeed {
         account_id: &str,
         error_rate: f64,
     ) -> Self {
-        let user_name = format!("user-{}", random_alpha(rng, 6).to_lowercase());
         let principal_id = format!("AIDA{}", random_alpha(rng, 16));
-        let arn = format!("arn:aws:iam::{}:user/{}", account_id, user_name);
+        let placeholder_user_name = format!("user-{}", random_alpha(rng, 6).to_lowercase());
+        let arn = format!("arn:aws:iam::{}:user/{}", account_id, placeholder_user_name);
         let access_key_id = random_access_key(rng, "AKIA");
         let user_agents = human_user_agents(rng);
         let role = pick_human_role(rng, role_weights);
@@ -735,7 +783,11 @@ impl ActorSeed {
             event_bias: HashMap::new(),
             service_profile: None,
             service_pattern: None,
-            user_name: Some(user_name),
+            user_name: Some(placeholder_user_name),
+            display_name: None,
+            email: None,
+            home_location: None,
+            normal_countries_regions: Vec::new(),
             user_agents,
             source_ips: human_source_ips(rng),
             active_start_hour,
@@ -756,6 +808,7 @@ impl ActorSeed {
     ) -> Self {
         let role_name = format!("svc-role-{}", random_alpha(rng, 4).to_lowercase());
         let session_name = format!("svc-{}", random_alpha(rng, 8));
+        let display_name = service_display_name(&profile).to_string();
         let principal_id = format!("AROA{}", random_alpha(rng, 16));
         let arn = format!(
             "arn:aws:sts::{}:assumed-role/{}/{}",
@@ -781,6 +834,10 @@ impl ActorSeed {
             service_profile: Some(profile),
             service_pattern: Some(pattern),
             user_name: None,
+            display_name: Some(display_name),
+            email: None,
+            home_location: Some("Cloud service account".to_string()),
+            normal_countries_regions: Vec::new(),
             user_agents,
             source_ips: service_source_ips(rng),
             active_start_hour,
@@ -1018,6 +1075,16 @@ fn normalize_profile_name(name: &str) -> Option<ServiceProfile> {
     }
 }
 
+fn service_display_name(profile: &ServiceProfile) -> &'static str {
+    match profile {
+        ServiceProfile::Generic => "Automation Service",
+        ServiceProfile::Ec2Reaper => "EC2 Reaper Service",
+        ServiceProfile::DataLakeBot => "Data Lake Bot Service",
+        ServiceProfile::LogsShipper => "Logs Shipper Service",
+        ServiceProfile::MetricsCollector => "Metrics Collector Service",
+    }
+}
+
 fn service_pattern_from_config(value: &ServicePatternConfig) -> ServicePattern {
     match value {
         ServicePatternConfig::Constant => ServicePattern::Constant,
@@ -1068,7 +1135,7 @@ fn apply_timezone_distribution(
         _ => return,
     };
 
-    let mut offsets = Vec::new();
+    let mut choices = Vec::new();
     let mut weights = Vec::new();
     for entry in entries {
         if !entry.weight.is_finite() || entry.weight <= 0.0 {
@@ -1083,11 +1150,15 @@ fn apply_timezone_distribution(
             .fix()
             .local_minus_utc();
         let offset_hours = (offset_seconds as f64 / 3600.0).round() as i8;
-        offsets.push(offset_hours);
+        let locale = locale_for_timezone_name(&entry.name, offset_hours);
+        choices.push(TimezoneChoice {
+            offset_hours,
+            locale,
+        });
         weights.push(entry.weight);
     }
 
-    if offsets.is_empty() {
+    if choices.is_empty() {
         return;
     }
 
@@ -1101,8 +1172,581 @@ fn apply_timezone_distribution(
             continue;
         }
         let choice = index.sample(rng);
-        actor.timezone_offset = offsets[choice];
+        actor.timezone_offset = choices[choice].offset_hours;
+        if matches!(actor.kind, ActorKind::Human) {
+            apply_locale_location_defaults(actor, choices[choice].locale);
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocaleProfile {
+    home_location: &'static str,
+    normal_regions: &'static [&'static str],
+    email_domain: &'static str,
+    first_names: &'static [&'static str],
+    last_names: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimezoneChoice {
+    offset_hours: i8,
+    locale: &'static LocaleProfile,
+}
+
+const US_WEST_FIRST_NAMES: &[&str] = &[
+    "Avery", "Maya", "Sophia", "Emma", "Olivia", "Mia", "Ethan", "Noah", "Lucas", "Logan", "Caleb",
+    "Nolan", "Priya", "Anika", "Daniel", "Grace",
+];
+const US_WEST_LAST_NAMES: &[&str] = &[
+    "Nguyen",
+    "Kim",
+    "Patel",
+    "Garcia",
+    "Chen",
+    "Rivera",
+    "Lee",
+    "Martinez",
+    "Davis",
+    "Thompson",
+    "Hernandez",
+    "Miller",
+    "Singh",
+    "Wong",
+];
+const US_EAST_FIRST_NAMES: &[&str] = &[
+    "Amelia",
+    "Charlotte",
+    "Elizabeth",
+    "Harper",
+    "Evelyn",
+    "James",
+    "Benjamin",
+    "William",
+    "Henry",
+    "Theodore",
+    "Aisha",
+    "Nadia",
+    "Marcus",
+    "Gabriel",
+];
+const US_EAST_LAST_NAMES: &[&str] = &[
+    "Smith",
+    "Johnson",
+    "Brown",
+    "Williams",
+    "Jones",
+    "Rodriguez",
+    "Wilson",
+    "Anderson",
+    "Thomas",
+    "Moore",
+    "Jackson",
+    "White",
+    "Clark",
+];
+const UK_FIRST_NAMES: &[&str] = &[
+    "Oliver", "George", "Arthur", "Harry", "Freddie", "Isla", "Ava", "Freya", "Amelia", "Sienna",
+    "Muhammad", "Imogen", "Theo", "Poppy",
+];
+const UK_LAST_NAMES: &[&str] = &[
+    "Smith", "Jones", "Taylor", "Brown", "Williams", "Wilson", "Evans", "Thomas", "Roberts",
+    "Walker", "Wright", "Thompson",
+];
+const SINGAPORE_FIRST_NAMES: &[&str] = &[
+    "Wei Ming", "Jia Hao", "Ethan", "Darren", "Alicia", "Chloe", "Mei Lin", "Siti", "Nurul",
+    "Ahmad", "Priya", "Arjun", "Rachel", "Sheryl", "Hui Min",
+];
+const SINGAPORE_LAST_NAMES: &[&str] = &[
+    "Tan", "Lim", "Lee", "Ng", "Goh", "Wong", "Chan", "Chua", "Koh", "Teo", "Rahman", "Abdullah",
+    "Kumar", "Singh",
+];
+const AUSTRALIA_FIRST_NAMES: &[&str] = &[
+    "Charlotte",
+    "Olivia",
+    "Amelia",
+    "Isla",
+    "Ava",
+    "Matilda",
+    "Noah",
+    "Oliver",
+    "Henry",
+    "Leo",
+    "Jack",
+    "Lachlan",
+    "Grace",
+    "Zoe",
+];
+const AUSTRALIA_LAST_NAMES: &[&str] = &[
+    "Smith", "Jones", "Williams", "Brown", "Wilson", "Taylor", "Nguyen", "Lee", "Singh", "Patel",
+    "Chen", "Thompson", "Martin",
+];
+const INDIA_FIRST_NAMES: &[&str] = &[
+    "Aarav", "Vihaan", "Aditya", "Arjun", "Anaya", "Anika", "Isha", "Priya", "Nisha", "Rohan",
+    "Neha", "Kavya", "Dev", "Mira",
+];
+const INDIA_LAST_NAMES: &[&str] = &[
+    "Sharma",
+    "Patel",
+    "Singh",
+    "Gupta",
+    "Iyer",
+    "Nair",
+    "Rao",
+    "Mehta",
+    "Reddy",
+    "Khan",
+    "Das",
+    "Chatterjee",
+];
+const JAPAN_FIRST_NAMES: &[&str] = &[
+    "Haruto", "Yuto", "Ren", "Sota", "Yui", "Aoi", "Sakura", "Hina", "Mei", "Riku", "Daiki", "Mio",
+];
+const JAPAN_LAST_NAMES: &[&str] = &[
+    "Sato",
+    "Suzuki",
+    "Takahashi",
+    "Tanaka",
+    "Watanabe",
+    "Ito",
+    "Yamamoto",
+    "Nakamura",
+    "Kobayashi",
+    "Kato",
+];
+const EUROPE_FIRST_NAMES: &[&str] = &[
+    "Anna", "Lena", "Mila", "Clara", "Sofia", "Noah", "Leon", "Felix", "Luca", "Elias", "Camille",
+    "Lucas", "Emma", "Louis",
+];
+const EUROPE_LAST_NAMES: &[&str] = &[
+    "Muller",
+    "Schmidt",
+    "Schneider",
+    "Fischer",
+    "Weber",
+    "Dubois",
+    "Martin",
+    "Bernard",
+    "Moreau",
+    "Lefevre",
+    "Rossi",
+    "Bianchi",
+];
+
+const LOCALE_US_WEST: LocaleProfile = LocaleProfile {
+    home_location: "San Francisco, CA, United States",
+    normal_regions: &["United States", "United States/California"],
+    email_domain: "example.com",
+    first_names: US_WEST_FIRST_NAMES,
+    last_names: US_WEST_LAST_NAMES,
+};
+const LOCALE_US_EAST: LocaleProfile = LocaleProfile {
+    home_location: "New York, NY, United States",
+    normal_regions: &["United States", "United States/New York"],
+    email_domain: "example.com",
+    first_names: US_EAST_FIRST_NAMES,
+    last_names: US_EAST_LAST_NAMES,
+};
+const LOCALE_UK: LocaleProfile = LocaleProfile {
+    home_location: "London, England, United Kingdom",
+    normal_regions: &["United Kingdom", "United Kingdom/England"],
+    email_domain: "example.co.uk",
+    first_names: UK_FIRST_NAMES,
+    last_names: UK_LAST_NAMES,
+};
+const LOCALE_SINGAPORE: LocaleProfile = LocaleProfile {
+    home_location: "Singapore",
+    normal_regions: &["Singapore"],
+    email_domain: "example.sg",
+    first_names: SINGAPORE_FIRST_NAMES,
+    last_names: SINGAPORE_LAST_NAMES,
+};
+const LOCALE_AUSTRALIA: LocaleProfile = LocaleProfile {
+    home_location: "Sydney, NSW, Australia",
+    normal_regions: &["Australia", "Australia/NSW"],
+    email_domain: "example.com.au",
+    first_names: AUSTRALIA_FIRST_NAMES,
+    last_names: AUSTRALIA_LAST_NAMES,
+};
+const LOCALE_AUSTRALIA_WEST: LocaleProfile = LocaleProfile {
+    home_location: "Perth, WA, Australia",
+    normal_regions: &["Australia", "Australia/WA"],
+    email_domain: "example.com.au",
+    first_names: AUSTRALIA_FIRST_NAMES,
+    last_names: AUSTRALIA_LAST_NAMES,
+};
+const LOCALE_INDIA: LocaleProfile = LocaleProfile {
+    home_location: "Bengaluru, Karnataka, India",
+    normal_regions: &["India", "India/Karnataka"],
+    email_domain: "example.co.in",
+    first_names: INDIA_FIRST_NAMES,
+    last_names: INDIA_LAST_NAMES,
+};
+const LOCALE_JAPAN: LocaleProfile = LocaleProfile {
+    home_location: "Tokyo, Japan",
+    normal_regions: &["Japan", "Japan/Tokyo"],
+    email_domain: "example.co.jp",
+    first_names: JAPAN_FIRST_NAMES,
+    last_names: JAPAN_LAST_NAMES,
+};
+const LOCALE_EUROPE: LocaleProfile = LocaleProfile {
+    home_location: "Berlin, Germany",
+    normal_regions: &["Germany", "Germany/Berlin"],
+    email_domain: "example.de",
+    first_names: EUROPE_FIRST_NAMES,
+    last_names: EUROPE_LAST_NAMES,
+};
+
+fn apply_generated_human_identity_defaults(actors: &mut [ActorSeed], rng: &mut impl Rng) {
+    let mut used_user_names = HashSet::new();
+    for actor in actors.iter() {
+        if let Some(user_name) = actor.user_name.as_deref().and_then(non_empty_trimmed) {
+            used_user_names.insert(user_name.to_ascii_lowercase());
+        }
+    }
+
+    for actor in actors.iter_mut() {
+        if !matches!(actor.kind, ActorKind::Human) {
+            continue;
+        }
+
+        let locale = locale_for_actor(actor);
+        apply_locale_location_defaults(actor, locale);
+
+        let generated_actor = actor.id.is_none();
+        let prior_user_name = actor.user_name.clone();
+        let user_name_was_placeholder = prior_user_name
+            .as_deref()
+            .map(|value| generated_actor && value.starts_with("user-"))
+            .unwrap_or(false);
+        let existing_user_name = if user_name_was_placeholder {
+            None
+        } else {
+            prior_user_name.as_deref().and_then(non_empty_trimmed)
+        };
+
+        let fallback_first_name = pick_static(locale.first_names, rng);
+        let fallback_last_name = pick_static(locale.last_names, rng);
+        let display_name = match actor.display_name.as_deref().and_then(non_empty_trimmed) {
+            Some(value) => value.to_string(),
+            None if !user_name_was_placeholder => {
+                if let Some(value) = actor
+                    .user_name
+                    .as_deref()
+                    .and_then(display_name_from_user_name)
+                {
+                    value
+                } else if let Some(value) = actor
+                    .email
+                    .as_deref()
+                    .and_then(user_name_from_email)
+                    .and_then(|user_name| display_name_from_user_name(&user_name))
+                {
+                    value
+                } else {
+                    format!("{fallback_first_name} {fallback_last_name}")
+                }
+            }
+            None => format!("{fallback_first_name} {fallback_last_name}"),
+        };
+        let (first_for_user_name, last_for_user_name) = display_name_components(&display_name)
+            .unwrap_or_else(|| {
+                (
+                    fallback_first_name.to_string(),
+                    fallback_last_name.to_string(),
+                )
+            });
+
+        let user_name = match existing_user_name {
+            Some(value) => value.to_string(),
+            None => actor
+                .email
+                .as_deref()
+                .and_then(user_name_from_email)
+                .filter(|candidate| used_user_names.insert(candidate.to_ascii_lowercase()))
+                .unwrap_or_else(|| {
+                    unique_user_name(
+                        &first_for_user_name,
+                        &last_for_user_name,
+                        rng,
+                        &mut used_user_names,
+                    )
+                }),
+        };
+
+        actor.user_name = Some(user_name.clone());
+        actor.display_name = Some(display_name);
+        if actor.email.as_deref().and_then(non_empty_trimmed).is_none() {
+            actor.email = Some(format!("{user_name}@{}", locale.email_domain));
+        }
+        if should_update_human_arn(actor, prior_user_name.as_deref(), generated_actor) {
+            actor.arn = format!("arn:aws:iam::{}:user/{}", actor.account_id, user_name);
+        }
+    }
+}
+
+fn apply_locale_location_defaults(actor: &mut ActorSeed, locale: &'static LocaleProfile) {
+    if actor
+        .home_location
+        .as_deref()
+        .and_then(non_empty_trimmed)
+        .is_none()
+    {
+        actor.home_location = Some(locale.home_location.to_string());
+    }
+    if actor.normal_countries_regions.is_empty() {
+        actor.normal_countries_regions = locale
+            .normal_regions
+            .iter()
+            .map(|region| (*region).to_string())
+            .collect();
+    }
+}
+
+fn locale_for_actor(actor: &ActorSeed) -> &'static LocaleProfile {
+    if let Some(location) = actor.home_location.as_deref() {
+        if let Some(locale) = locale_for_location_value(location) {
+            return locale;
+        }
+    }
+    for region in &actor.normal_countries_regions {
+        if let Some(locale) = locale_for_location_value(region) {
+            return locale;
+        }
+    }
+    locale_for_timezone_offset(actor.timezone_offset)
+}
+
+fn locale_for_timezone_name(name: &str, offset: i8) -> &'static LocaleProfile {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "america/los_angeles" | "america/vancouver" | "america/seattle" => &LOCALE_US_WEST,
+        "america/denver" | "america/phoenix" => &LOCALE_US_WEST,
+        "america/new_york" | "america/detroit" | "america/toronto" | "america/montreal" => {
+            &LOCALE_US_EAST
+        }
+        "europe/london" => &LOCALE_UK,
+        "europe/berlin" | "europe/paris" | "europe/amsterdam" | "europe/madrid" | "europe/rome"
+        | "europe/zurich" | "europe/stockholm" | "europe/dublin" => &LOCALE_EUROPE,
+        "asia/singapore" => &LOCALE_SINGAPORE,
+        "asia/kolkata" | "asia/calcutta" => &LOCALE_INDIA,
+        "asia/tokyo" => &LOCALE_JAPAN,
+        "australia/sydney" | "australia/melbourne" | "australia/brisbane" => &LOCALE_AUSTRALIA,
+        "australia/perth" => &LOCALE_AUSTRALIA_WEST,
+        _ => locale_for_timezone_offset(offset),
+    }
+}
+
+fn locale_for_location_value(value: &str) -> Option<&'static LocaleProfile> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("singapore") {
+        return Some(&LOCALE_SINGAPORE);
+    }
+    if normalized.contains("perth") || normalized.contains("western australia") {
+        return Some(&LOCALE_AUSTRALIA_WEST);
+    }
+    if normalized.contains("australia")
+        || normalized.contains("sydney")
+        || normalized.contains("melbourne")
+    {
+        return Some(&LOCALE_AUSTRALIA);
+    }
+    if normalized.contains("india")
+        || normalized.contains("bengaluru")
+        || normalized.contains("bangalore")
+    {
+        return Some(&LOCALE_INDIA);
+    }
+    if normalized.contains("japan") || normalized.contains("tokyo") {
+        return Some(&LOCALE_JAPAN);
+    }
+    if normalized.contains("united kingdom")
+        || normalized.contains("london")
+        || normalized.contains("england")
+    {
+        return Some(&LOCALE_UK);
+    }
+    if normalized.contains("germany")
+        || normalized.contains("berlin")
+        || normalized.contains("france")
+        || normalized.contains("paris")
+        || normalized.contains("netherlands")
+        || normalized.contains("amsterdam")
+        || normalized.contains("europe")
+    {
+        return Some(&LOCALE_EUROPE);
+    }
+    if normalized.contains("california")
+        || normalized.contains("san francisco")
+        || normalized.contains("los angeles")
+        || normalized.contains("washington")
+        || normalized.contains("seattle")
+    {
+        return Some(&LOCALE_US_WEST);
+    }
+    if normalized.contains("new york")
+        || normalized.contains("boston")
+        || normalized.contains("toronto")
+        || normalized.contains("eastern")
+    {
+        return Some(&LOCALE_US_EAST);
+    }
+    None
+}
+
+fn locale_for_timezone_offset(offset: i8) -> &'static LocaleProfile {
+    match offset {
+        -10..=-6 => &LOCALE_US_WEST,
+        -5..=-3 => &LOCALE_US_EAST,
+        0 => &LOCALE_UK,
+        1..=2 => &LOCALE_EUROPE,
+        5..=6 => &LOCALE_INDIA,
+        8 => &LOCALE_SINGAPORE,
+        9 => &LOCALE_JAPAN,
+        10..=12 => &LOCALE_AUSTRALIA,
+        _ => &LOCALE_US_EAST,
+    }
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn display_name_components(display_name: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = display_name
+        .split_whitespace()
+        .filter_map(non_empty_trimmed)
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let first = parts.first()?;
+    let last = parts.last()?;
+    Some(((*first).to_string(), (*last).to_string()))
+}
+
+fn display_name_from_user_name(user_name: &str) -> Option<String> {
+    let parts: Vec<String> = user_name
+        .split(|ch: char| ch == '.' || ch == '_' || ch == '-' || ch.is_ascii_digit())
+        .filter_map(non_empty_trimmed)
+        .map(title_ascii)
+        .collect();
+    if parts.len() >= 2 {
+        Some(parts.join(" "))
+    } else {
+        None
+    }
+}
+
+fn title_ascii(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut result = String::new();
+    result.push(first.to_ascii_uppercase());
+    result.push_str(chars.as_str().to_ascii_lowercase().as_str());
+    result
+}
+
+fn user_name_from_email(email: &str) -> Option<String> {
+    let local = email.split_once('@')?.0.trim();
+    if local.is_empty() {
+        return None;
+    }
+    let user_name = local
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                Some(ch.to_ascii_lowercase())
+            } else if ch == '.' || ch == '_' || ch == '-' {
+                Some(ch)
+            } else {
+                None
+            }
+        })
+        .collect::<String>();
+    if user_name.is_empty() {
+        None
+    } else {
+        Some(user_name)
+    }
+}
+
+fn should_update_human_arn(
+    actor: &ActorSeed,
+    prior_user_name: Option<&str>,
+    generated_actor: bool,
+) -> bool {
+    if !actor.arn.contains(":user/") {
+        return false;
+    }
+    if generated_actor {
+        return true;
+    }
+    let Some(prior_user_name) = prior_user_name else {
+        return actor.arn.contains(":user/user-");
+    };
+    prior_user_name.starts_with("user-") && arn_leaf_matches(&actor.arn, prior_user_name)
+}
+
+fn arn_leaf_matches(arn: &str, user_name: &str) -> bool {
+    arn.rsplit('/').next() == Some(user_name)
+}
+
+fn pick_static<'a>(values: &'a [&'a str], rng: &mut impl Rng) -> &'a str {
+    let idx = rng.gen_range(0..values.len());
+    values[idx]
+}
+
+fn unique_user_name(
+    first_name: &str,
+    last_name: &str,
+    rng: &mut impl Rng,
+    used: &mut HashSet<String>,
+) -> String {
+    let first = slug_name_component(first_name);
+    let last = slug_name_component(last_name);
+    let candidates = [
+        format!("{first}.{last}"),
+        format!("{}{}", first.chars().next().unwrap_or('u'), last),
+        format!("{first}{last}"),
+    ];
+
+    for candidate in candidates {
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+
+    loop {
+        let candidate = format!("{first}.{last}{:03}", rng.gen_range(10..1000));
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+}
+
+fn slug_name_component(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                Some(ch.to_ascii_lowercase())
+            } else if ch == '\'' || ch == '-' || ch.is_whitespace() {
+                None
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
 }
 
 fn pick_sticky(values: &[String], primary_weight: f64, rng: &mut impl Rng) -> String {
@@ -1339,4 +1983,209 @@ fn service_source_ips(rng: &mut impl Rng) -> Vec<String> {
         }
     }
     list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_human_names_are_locale_aware_for_singapore() {
+        let population =
+            generate_population(&population_config("Asia/Singapore", 12, 0.0, Vec::new())).unwrap();
+
+        let mut user_names = HashSet::new();
+        for actor in population.actors {
+            assert!(matches!(actor.kind, ActorKind::Human));
+            let user_name = actor.user_name.as_deref().unwrap();
+            assert!(!user_name.starts_with("user-"));
+            assert!(user_name.contains('.') || user_name.chars().all(|ch| ch.is_ascii_lowercase()));
+            assert!(user_names.insert(user_name.to_string()));
+            assert_eq!(actor.home_location.as_deref(), Some("Singapore"));
+            let expected_email = format!("{user_name}@example.sg");
+            assert_eq!(actor.email.as_deref(), Some(expected_email.as_str()));
+            assert!(
+                actor
+                    .display_name
+                    .as_deref()
+                    .unwrap()
+                    .split_whitespace()
+                    .count()
+                    >= 2
+            );
+            assert_eq!(
+                actor.normal_countries_regions,
+                vec!["Singapore".to_string()]
+            );
+            assert!(actor.arn.ends_with(&format!(":user/{user_name}")));
+        }
+    }
+
+    #[test]
+    fn generated_human_names_follow_configured_timezone_distribution() {
+        let population =
+            generate_population(&population_config("Australia/Sydney", 8, 0.0, Vec::new()))
+                .unwrap();
+
+        for actor in population.actors {
+            assert_eq!(
+                actor.home_location.as_deref(),
+                Some("Sydney, NSW, Australia")
+            );
+            assert_eq!(
+                actor.normal_countries_regions,
+                vec!["Australia".to_string(), "Australia/NSW".to_string()]
+            );
+            assert!(actor.email.as_deref().unwrap().ends_with("@example.com.au"));
+        }
+    }
+
+    #[test]
+    fn generated_human_names_use_iana_timezone_not_only_offset() {
+        let population =
+            generate_population(&population_config("Australia/Perth", 8, 0.0, Vec::new())).unwrap();
+
+        for actor in population.actors {
+            assert_eq!(actor.home_location.as_deref(), Some("Perth, WA, Australia"));
+            assert_eq!(
+                actor.normal_countries_regions,
+                vec!["Australia".to_string(), "Australia/WA".to_string()]
+            );
+            assert!(actor.email.as_deref().unwrap().ends_with("@example.com.au"));
+            assert_ne!(actor.home_location.as_deref(), Some("Singapore"));
+        }
+    }
+
+    #[test]
+    fn explicit_human_identity_overrides_are_preserved() {
+        let explicit = ExplicitActorConfig {
+            id: "human-explicit-001".to_string(),
+            kind: "human".to_string(),
+            role: Some("developer".to_string()),
+            service_profile: None,
+            service_pattern: None,
+            events_per_hour: Some(12.0),
+            error_rate: Some(0.02),
+            account_id: Some("123456789012".to_string()),
+            user_name: Some("mika.tan".to_string()),
+            display_name: Some("Mika Tan".to_string()),
+            email: Some("mika.tan@example.sg".to_string()),
+            home_location: Some("Singapore".to_string()),
+            normal_countries_regions: Some(vec!["Singapore".to_string()]),
+            principal_id: None,
+            arn: None,
+            access_key_id: None,
+            identity_type: None,
+            timezone: Some("Asia/Singapore".to_string()),
+            active_start_hour: None,
+            active_hours: None,
+            weekend_active: None,
+            user_agents: None,
+            source_ips: None,
+            tags: Vec::new(),
+            event_bias: HashMap::new(),
+        };
+        let population =
+            generate_population(&population_config("Europe/London", 1, 0.0, vec![explicit]))
+                .unwrap();
+        let actor = population.actors.first().unwrap();
+
+        assert_eq!(actor.user_name.as_deref(), Some("mika.tan"));
+        assert_eq!(actor.display_name.as_deref(), Some("Mika Tan"));
+        assert_eq!(actor.email.as_deref(), Some("mika.tan@example.sg"));
+        assert_eq!(actor.home_location.as_deref(), Some("Singapore"));
+        assert_eq!(
+            actor.normal_countries_regions,
+            vec!["Singapore".to_string()]
+        );
+        assert!(actor.arn.ends_with(":user/mika.tan"));
+    }
+
+    #[test]
+    fn explicit_human_missing_identity_uses_timezone_locale() {
+        let explicit = ExplicitActorConfig {
+            id: "human-explicit-002".to_string(),
+            kind: "human".to_string(),
+            role: Some("developer".to_string()),
+            service_profile: None,
+            service_pattern: None,
+            events_per_hour: Some(12.0),
+            error_rate: Some(0.02),
+            account_id: Some("123456789012".to_string()),
+            user_name: None,
+            display_name: None,
+            email: None,
+            home_location: None,
+            normal_countries_regions: None,
+            principal_id: None,
+            arn: None,
+            access_key_id: None,
+            identity_type: None,
+            timezone: Some("Asia/Singapore".to_string()),
+            active_start_hour: None,
+            active_hours: None,
+            weekend_active: None,
+            user_agents: None,
+            source_ips: None,
+            tags: Vec::new(),
+            event_bias: HashMap::new(),
+        };
+        let population =
+            generate_population(&population_config("Europe/London", 1, 0.0, vec![explicit]))
+                .unwrap();
+        let actor = population.actors.first().unwrap();
+        let user_name = actor.user_name.as_deref().unwrap();
+
+        assert!(!user_name.starts_with("user-"));
+        assert_eq!(actor.home_location.as_deref(), Some("Singapore"));
+        assert!(actor.email.as_deref().unwrap().ends_with("@example.sg"));
+        assert_eq!(
+            actor.normal_countries_regions,
+            vec!["Singapore".to_string()]
+        );
+        assert!(
+            actor
+                .display_name
+                .as_deref()
+                .unwrap()
+                .split_whitespace()
+                .count()
+                >= 2
+        );
+        assert!(actor.arn.ends_with(&format!(":user/{user_name}")));
+    }
+
+    fn population_config(
+        timezone: &str,
+        actor_count: usize,
+        service_ratio: f64,
+        explicit: Vec<ExplicitActorConfig>,
+    ) -> PopulationConfig {
+        PopulationConfig {
+            seed: Some(7),
+            timezone_distribution: Some(vec![TimezoneWeight {
+                name: timezone.to_string(),
+                weight: 1.0,
+            }]),
+            population: PopulationActorsConfig {
+                actor_count: Some(actor_count),
+                service_ratio: Some(service_ratio),
+                hot_actor_ratio: Some(0.0),
+                hot_actor_multiplier: Some(1.0),
+                account_ids: Some(vec!["123456789012".to_string()]),
+                account_count: None,
+                error_rate: None,
+                human_error_rate: None,
+                service_error_rate: None,
+                role: None,
+                service_events_per_hour: None,
+                service_profiles: None,
+                actor: if explicit.is_empty() {
+                    None
+                } else {
+                    Some(explicit)
+                },
+            },
+        }
+    }
 }
