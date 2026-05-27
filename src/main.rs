@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use seclog::actors_parquet::write_population;
 use seclog::core::actors::generate_population;
@@ -7,6 +7,7 @@ use seclog::core::config::{
     SourceConfig, ZerobusOutputConfig,
 };
 use seclog::core::event::Event;
+use seclog::core::identity::{Identity, IdentityRegistry};
 use seclog::core::traits::{EventSource, EventWriter};
 use seclog::formats::json::JsonlWriter;
 use seclog::formats::parquet::ParquetWriter;
@@ -15,8 +16,9 @@ use seclog::sources::cloudtrail::CloudTrailGenerator;
 use seclog::sources::composite::CompositeEventSource;
 use seclog::sources::databricks::DatabricksAuditGenerator;
 use seclog::sources::okta::OktaSystemLogGenerator;
+use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +26,8 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+const ACTOR_POPULATION_SOURCE: &str = "actor_population";
 
 #[derive(Debug, Parser)]
 #[command(name = "seclog")]
@@ -159,6 +163,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         build_event_source(&loaded.source, loaded.seed, start_sim_time)?;
                     run_zerobus_generation(
                         generator,
+                        &loaded.source,
                         output,
                         time_scale,
                         start_sim_time,
@@ -415,6 +420,7 @@ fn run_multi_file_generation(
 #[allow(clippy::too_many_arguments)]
 fn run_zerobus_generation(
     mut generator: Box<dyn EventSource>,
+    source_config: &SourceConfig,
     output: &ZerobusOutputConfig,
     time_scale: Option<f64>,
     start_sim_time: DateTime<Utc>,
@@ -424,6 +430,7 @@ fn run_zerobus_generation(
     metrics_interval: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = ZerobusWriter::new(output)?;
+    persist_zerobus_actor_population_if_configured(source_config, output, &mut writer)?;
     let flush_interval = Some(Duration::from_millis(output.flush_interval_ms.max(1)));
     let mut next_flush = flush_interval.map(|interval| Instant::now() + interval);
     let mut metrics = Metrics::new(metrics_interval);
@@ -472,6 +479,134 @@ fn run_zerobus_generation(
 
     writer.close()?;
     Ok(())
+}
+
+fn persist_zerobus_actor_population_if_configured(
+    source_config: &SourceConfig,
+    output: &ZerobusOutputConfig,
+    writer: &mut ZerobusWriter,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !output.tables.contains_key(ACTOR_POPULATION_SOURCE) {
+        return Ok(());
+    }
+
+    let path = identity_registry_path(source_config)?.ok_or_else(|| {
+        format!("zerobus table {ACTOR_POPULATION_SOURCE} requires an identity_registry_path source")
+    })?;
+    let registry = IdentityRegistry::from_path(&path)?;
+    let generated_at = Utc::now();
+
+    for identity in registry.identities() {
+        let row =
+            identity_population_row_json(registry.name(), identity, writer.run_id(), generated_at)?;
+        writer.write_json_record(ACTOR_POPULATION_SOURCE, row)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn identity_registry_path(
+    config: &SourceConfig,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut paths = BTreeSet::new();
+    collect_identity_registry_paths(config, None, &mut paths)?;
+    match paths.len() {
+        0 => Ok(None),
+        1 => Ok(paths.into_iter().next()),
+        _ => Err(format!(
+            "zerobus table {ACTOR_POPULATION_SOURCE} requires a single shared identity_registry_path, found: {}",
+            paths.into_iter().collect::<Vec<_>>().join(", ")
+        )
+        .into()),
+    }
+}
+
+fn collect_identity_registry_paths(
+    config: &SourceConfig,
+    inherited_path: Option<&str>,
+    paths: &mut BTreeSet<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match config {
+        SourceConfig::CloudTrail(config) => {
+            insert_optional_path(
+                paths,
+                config
+                    .identity_registry_path
+                    .as_deref()
+                    .and_then(non_empty_str)
+                    .or(inherited_path),
+            );
+        }
+        SourceConfig::DatabricksAudit(config) => {
+            insert_optional_path(
+                paths,
+                non_empty_str(&config.identity_registry_path).or(inherited_path),
+            );
+        }
+        SourceConfig::OktaSystemLog(config) => {
+            insert_optional_path(
+                paths,
+                non_empty_str(&config.identity_registry_path).or(inherited_path),
+            );
+        }
+        SourceConfig::Multi(config) => {
+            let next_inherited = config
+                .identity_registry_path
+                .as_deref()
+                .and_then(non_empty_str)
+                .or(inherited_path);
+            for source in &config.sources {
+                collect_identity_registry_paths(source, next_inherited, paths)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_optional_path(paths: &mut BTreeSet<String>, value: Option<&str>) {
+    if let Some(value) = value.and_then(non_empty_str) {
+        paths.insert(value.to_string());
+    }
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn identity_population_row_json(
+    registry_name: &str,
+    identity: &Identity,
+    run_id: &str,
+    generated_at: DateTime<Utc>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let identity_json = serde_json::to_string(identity)?;
+    let row = json!({
+        "time": generated_at.timestamp_micros(),
+        "registry_name": registry_name,
+        "actor_id": &identity.actor_id,
+        "actor_kind": if identity.service_account { "service" } else { "human" },
+        "email": &identity.email,
+        "employee_id": &identity.employee_id,
+        "display_name": &identity.display_name,
+        "role_persona": &identity.role_persona,
+        "department": &identity.department,
+        "home_location": &identity.home_location,
+        "normal_countries_regions_json": serde_json::to_string(&identity.normal_countries_regions)?,
+        "okta_user_id": &identity.okta_user_id,
+        "databricks_username": &identity.databricks_username,
+        "service_account": identity.service_account,
+        "tags_json": serde_json::to_string(&identity.tags)?,
+        "aws_principals_json": serde_json::to_string(&identity.aws_principals)?,
+        "identity_json": identity_json,
+        "run_id": run_id,
+        "generated_at": generated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+    Ok(serde_json::to_string(&row)?)
 }
 
 struct RoutedWriters {
@@ -809,6 +944,110 @@ impl Metrics {
             self.bytes = 0;
             self.overruns = Duration::ZERO;
             self.missed_events = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seclog::core::config::{CloudTrailSourceConfig, MultiSourceConfig};
+    use seclog::core::identity::AwsPrincipal;
+    use serde_json::Value;
+
+    #[test]
+    fn identity_population_row_has_required_timestamp_column() {
+        let generated_at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let row = identity_population_row_json(
+            "registry-1",
+            &identity("user-001", false),
+            "run-1",
+            generated_at,
+        )
+        .unwrap();
+        let row: Value = serde_json::from_str(&row).unwrap();
+
+        assert_eq!(row["time"], 1767225600000000_i64);
+        assert_eq!(row["registry_name"], "registry-1");
+        assert_eq!(row["actor_id"], "user-001");
+        assert_eq!(row["actor_kind"], "human");
+        assert_eq!(row["generated_at"], "2026-01-01T00:00:00.000Z");
+        assert_eq!(
+            serde_json::from_str::<Value>(row["identity_json"].as_str().unwrap()).unwrap()
+                ["actor_id"],
+            "user-001"
+        );
+    }
+
+    #[test]
+    fn multi_source_population_uses_inherited_registry_path() {
+        let config = SourceConfig::Multi(MultiSourceConfig {
+            identity_registry_path: Some("./examples/identity_registry.toml".to_string()),
+            sources: vec![
+                SourceConfig::CloudTrail(cloudtrail(None)),
+                SourceConfig::CloudTrail(cloudtrail(None)),
+            ],
+            outputs: None,
+        });
+
+        assert_eq!(
+            identity_registry_path(&config).unwrap().as_deref(),
+            Some("./examples/identity_registry.toml")
+        );
+    }
+
+    #[test]
+    fn multi_source_population_rejects_multiple_registry_paths() {
+        let config = SourceConfig::Multi(MultiSourceConfig {
+            identity_registry_path: None,
+            sources: vec![
+                SourceConfig::CloudTrail(cloudtrail(Some("./registry-a.toml"))),
+                SourceConfig::CloudTrail(cloudtrail(Some("./registry-b.toml"))),
+            ],
+            outputs: None,
+        });
+
+        let err = identity_registry_path(&config).unwrap_err().to_string();
+        assert!(err.contains("requires a single shared identity_registry_path"));
+        assert!(err.contains("./registry-a.toml"));
+        assert!(err.contains("./registry-b.toml"));
+    }
+
+    fn cloudtrail(identity_registry_path: Option<&str>) -> CloudTrailSourceConfig {
+        CloudTrailSourceConfig {
+            curated: true,
+            actor_population_path: None,
+            identity_registry_path: identity_registry_path.map(str::to_string),
+            baseline_source_ips: None,
+            regions: None,
+            region_distribution: None,
+        }
+    }
+
+    fn identity(actor_id: &str, service_account: bool) -> Identity {
+        Identity {
+            actor_id: actor_id.to_string(),
+            email: format!("{actor_id}@example.com"),
+            employee_id: format!("E-{actor_id}"),
+            display_name: "Test User".to_string(),
+            role_persona: "Test persona".to_string(),
+            department: "Test department".to_string(),
+            home_location: "Sydney, NSW, Australia".to_string(),
+            normal_countries_regions: vec!["Australia".to_string()],
+            okta_user_id: format!("00u-{actor_id}"),
+            databricks_username: format!("{actor_id}@example.com"),
+            aws_principals: vec![AwsPrincipal {
+                account_id: "123456789012".to_string(),
+                principal_id: format!("AIDA{actor_id}"),
+                arn: format!("arn:aws:iam::123456789012:user/{actor_id}"),
+                role_name: None,
+                role_session_name: None,
+                access_key_id: Some(format!("AKIA{actor_id}")),
+            }],
+            service_account,
+            tags: Vec::new(),
         }
     }
 }

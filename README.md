@@ -449,6 +449,7 @@ flush_interval_ms = 1000
 cloudtrail = "main.seclog.cloudtrail_events"
 databricks_audit = "main.seclog.databricks_audit_events"
 okta_system_log = "main.seclog.okta_system_log_events"
+actor_population = "main.seclog.actor_population"
 ```
 
 Build with the optional feature:
@@ -463,12 +464,19 @@ region as the Zerobus endpoint. The service principal needs `USE CATALOG`,
 template is available at `scripts/databricks/zerobus/create_seclog_tables.sql`.
 
 Each destination table uses the common seclog row shape:
-`event_time`, `event_date`, `event_ts_ms`, `source`, `event_type`,
+`time`, `event_time`, `event_date`, `event_ts_ms`, `source`, `event_type`,
 `actor_id`, `actor_kind`, `actor_name`, `target_id`, `target_kind`,
 `target_name`, `outcome`, `ip`, `user_agent`, `session_id`, `tenant_id`,
 `envelope_json`, `payload_json`, `run_id`, and `generated_at`.
-`payload_json` preserves the exact CloudTrail, Databricks audit, or Okta
-payload emitted by the source generator.
+`time` must be a target table `TIMESTAMP` column and is emitted on the JSON path
+as epoch microseconds for Zerobus. `payload_json` preserves the exact
+CloudTrail, Databricks audit, or Okta payload. When an `actor_population` table
+route is present and the source configuration uses an `identity_registry_path`,
+`seclog gen` writes the identity population to that table before event
+generation. The actor population table uses `time`, `registry_name`, `actor_id`,
+`actor_kind`, identity fields,
+`normal_countries_regions_json`, `tags_json`, `aws_principals_json`,
+`identity_json`, `run_id`, and `generated_at`.
 
 ### Region distribution (array form)
 Provide weights aligned with the `regions` list:
