@@ -278,6 +278,8 @@ pub struct MultiSourceConfig {
     pub identity_registry_path: Option<String>,
     /// Optional actor population config used to synthesize a shared identity registry.
     pub population_config_path: Option<String>,
+    /// Optional inline actor population config used to synthesize a shared identity registry.
+    pub population_config: Option<PopulationConfig>,
     /// Child sources to run from one generator loop.
     #[serde(default, rename = "sources")]
     pub sources: Vec<SourceConfig>,

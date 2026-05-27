@@ -4,9 +4,13 @@
 *.swo
 *.tmp
 *.log
+*.pyc
+__pycache__/
 .DS_Store
 .idea/
 .vscode/
+.venv/
+*.egg-info/
 .env
 .env.*
 /out/
