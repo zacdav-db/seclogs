@@ -813,7 +813,7 @@ mod tests {
                 actor: Actor {
                     id: "user-001".to_string(),
                     kind: "human".to_string(),
-                    name: Some("User One".to_string()),
+                    name: Some("Amelia Chen".to_string()),
                 },
                 target: None,
                 outcome: Outcome::Success,

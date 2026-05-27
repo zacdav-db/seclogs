@@ -82,27 +82,32 @@ name = "example_identity_registry"
 
 [[identity]]
 actor_id = "user-001"
-email = "user.one@example.com"
+email = "amelia.chen@example.com.au"
 employee_id = "E-000001"
-display_name = "User One"
-role_persona = "Business user"
+display_name = "Amelia Chen"
+role_persona = "Finance operations analyst"
 department = "Business Operations"
 home_location = "Sydney, NSW, Australia"
 normal_countries_regions = ["Australia", "Australia/NSW"]
 okta_user_id = "00u-example-user-001"
-databricks_username = "user.one@example.com"
+databricks_username = "amelia.chen@example.com.au"
 service_account = false
 tags = ["human"]
 
 [[identity.aws_principals]]
 account_id = "123456789012"
 principal_id = "AIDAEXAMPLEUSER001"
-arn = "arn:aws:iam::123456789012:user/user.one"
+arn = "arn:aws:iam::123456789012:user/amelia.chen"
 access_key_id = "AKIAEXAMPLEUSER01"
 ```
 
 ## actors.toml reference (population generation)
 `actors.toml` controls how the actor population is built and stored as Parquet.
+Generated human actors get locale-aware display names, usernames, email
+domains, home locations, and normal country/region baselines from
+`timezone_distribution` or an explicit actor `timezone`. Exact IANA timezone
+names are used before falling back to UTC offset, so `Australia/Perth` remains
+an Australian population instead of being treated like another UTC+8 region.
 Error rates are sampled per actor and applied at generation time; error codes and
 messages come from built-in CloudTrail defaults per event.
 
@@ -159,7 +164,11 @@ timezone = "Europe/London"
 active_start_hour = 8
 active_hours = 10
 weekend_active = false
-user_name = "n.rogue"
+user_name = "nadia.wright"
+display_name = "Nadia Wright"
+email = "nadia.wright@example.co.uk"
+home_location = "London, England, United Kingdom"
+normal_countries_regions = ["United Kingdom", "United Kingdom/England"]
 account_id = "123456789012"
 user_agents = ["Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36", "curl/8.5.0"]
 source_ips = ["203.0.113.45", "198.51.100.23"]
@@ -232,6 +241,10 @@ explicit list size, Seclog keeps all explicit actors and skips generating additi
 | `population.actor.error_rate` | float | no | Overrides sampled error rate (0.0–1.0). |
 | `population.actor.account_id` | string | no | Overrides the AWS account ID (12 digits). |
 | `population.actor.user_name` | string | no | Overrides IAM username for human actors. |
+| `population.actor.display_name` | string | no | Overrides the actor display name. Missing human names are generated from the actor timezone locale. |
+| `population.actor.email` | string | no | Overrides actor email. Missing human emails use the actor username and locale email domain. |
+| `population.actor.home_location` | string | no | Overrides the actor home location used by source generators. |
+| `population.actor.normal_countries_regions` | string[] | no | Overrides normal country/region baselines used by source generators. |
 | `population.actor.principal_id` | string | no | Overrides the principal ID. |
 | `population.actor.arn` | string | no | Overrides the full ARN. |
 | `population.actor.access_key_id` | string | no | Overrides the access key ID. |
