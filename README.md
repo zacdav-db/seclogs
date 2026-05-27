@@ -33,8 +33,8 @@ To generate Okta System Log events from a shared identity registry:
 cargo run --bin seclog -- gen --config examples/okta_system_log.toml --output ./out-okta
 ```
 
-To generate CloudTrail, Databricks audit, and Okta System Log from one shared
-identity registry in a single run:
+To generate CloudTrail, Databricks audit, and Okta System Log from one
+synthesized actor population in a single run:
 ```bash
 cargo run --bin seclog -- gen --config examples/all_sources.toml --max-events 100
 ```
@@ -164,11 +164,6 @@ timezone = "Europe/London"
 active_start_hour = 8
 active_hours = 10
 weekend_active = false
-user_name = "nadia.wright"
-display_name = "Nadia Wright"
-email = "nadia.wright@example.co.uk"
-home_location = "London, England, United Kingdom"
-normal_countries_regions = ["United Kingdom", "United Kingdom/England"]
 account_id = "123456789012"
 user_agents = ["Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36", "curl/8.5.0"]
 source_ips = ["203.0.113.45", "198.51.100.23"]
@@ -427,7 +422,7 @@ file output, `source.outputs` routes events by normalized source name.
 ```toml
 [source]
 type = "multi"
-identity_registry_path = "./examples/identity_registry.toml"
+population_config_path = "./examples/actors.toml"
 
 [source.outputs.cloudtrail]
 dir = "./out-all-sources/cloudtrail"
@@ -453,6 +448,12 @@ workspace_id = "1234567890"
 type = "okta"
 org_id = "okta-example-org"
 ```
+
+`population_config_path` points to the same population config used by
+`seclog actors`. Seclog synthesizes a shared identity registry in memory, so
+CloudTrail, Databricks audit, and Okta events share the same realistic actor
+population without requiring one hand-written registry entry per user. Use
+`identity_registry_path` instead when you need a fully curated registry.
 
 The built-in route keys are `cloudtrail`, `databricks_audit`, and
 `okta_system_log`. If a file route is not listed under `source.outputs`, the
@@ -501,10 +502,10 @@ Each destination table uses the common seclog row shape:
 `time` must be a target table `TIMESTAMP` column and is emitted on the JSON path
 as epoch microseconds for Zerobus. `payload_json` preserves the exact
 CloudTrail, Databricks audit, or Okta payload. When an `actor_population` table
-route is present and the source configuration uses an `identity_registry_path`,
-`seclog gen` writes the identity population to that table before event
-generation. The actor population table uses `time`, `registry_name`, `actor_id`,
-`actor_kind`, identity fields,
+route is present and the source configuration uses an `identity_registry_path`
+or `population_config_path`, `seclog gen` writes the identity population to that
+table before event generation. The actor population table uses `time`,
+`registry_name`, `actor_id`, `actor_kind`, identity fields,
 `normal_countries_regions_json`, `tags_json`, `aws_principals_json`,
 `identity_json`, `run_id`, and `generated_at`.
 

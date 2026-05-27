@@ -17,7 +17,7 @@ overwrite = false
 
 [source]
 type = "multi"
-identity_registry_path = "./examples/identity_registry.toml"
+population_config_path = "./examples/actors.toml"
 
 [[source.sources]]
 type = "cloudtrail"
@@ -26,10 +26,8 @@ regions = ["us-east-1", "us-west-2", "ap-southeast-1"]
 region_distribution = [0.55, 0.25, 0.20]
 
 [source.sources.baseline_source_ips]
-user-001 = ["198.51.100.10"]
-user-002 = ["203.0.113.62"]
-user-003 = ["203.0.113.63"]
-svc-001 = ["10.40.2.10"]
+human-mal-001 = ["198.51.100.10"]
+svc-exfil-01 = ["10.40.2.10"]
 
 [[source.sources]]
 type = "databricks_audit"
@@ -38,13 +36,11 @@ workspace_id = "1234567890"
 baseline_events_per_actor = 2
 
 [source.sources.baseline_source_ips]
-user-001 = ["198.51.100.10"]
-user-002 = ["203.0.113.62"]
-user-003 = ["203.0.113.63"]
-svc-001 = ["10.16.0.10"]
+human-mal-001 = ["198.51.100.10"]
+svc-exfil-01 = ["10.16.0.10"]
 
 [[source.sources.event]]
-actor_id = "user-001"
+actor_id = "human-mal-001"
 offset_seconds = 10
 source_ip_address = "203.0.113.45"
 service_name = "accounts"
@@ -61,13 +57,11 @@ org_id = "okta-example-org"
 baseline_events_per_actor = 2
 
 [source.sources.baseline_source_ips]
-user-001 = ["198.51.100.10"]
-user-002 = ["203.0.113.62"]
-user-003 = ["203.0.113.63"]
-svc-001 = ["10.24.1.10"]
+human-mal-001 = ["198.51.100.10"]
+svc-exfil-01 = ["10.24.1.10"]
 
 [[source.sources.event]]
-actor_id = "user-001"
+actor_id = "human-mal-001"
 offset_seconds = 10
 event_type = "app.generic.unauth_app_access_attempt"
 display_message = "User attempted unauthorized access to app"
