@@ -362,11 +362,11 @@ loads the shared identity registry, maps generated actors to Okta user/client
 IDs, emits deterministic baseline auth/session/app-access activity, and can
 inject explicit System Log events.
 
-This source is intentionally limited today. It preserves the real root
-`LogEvent` shape and selected nested objects, including `actor`,
-`authenticationContext`, `client`, `debugContext`, `outcome`, `request`,
-`securityContext`, `target`, and `transaction`, but it is not a full
-implementation of the Okta event-type catalog.
+This source is intentionally limited today. It preserves the raw Okta
+System Log landing shape and selected nested objects, including `actor`,
+`authenticationContext`, `client`, `device`, `debugContext`, `outcome`,
+`request`, `securityContext`, `target`, and `transaction`, but it is not a
+full implementation of the Okta event-type catalog.
 
 ```toml
 [source]
@@ -398,8 +398,11 @@ display_name = "Operations Portal"
 detail_entry = { signOnModeType = "SAML_2_0" }
 ```
 
-Okta payloads use Okta camelCase field names. `client.ipAddress` is mirrored to
-`request.ipChain[0].ip`, `debugContext.debugData` remains a dynamic JSON object,
+Okta payloads use Okta camelCase field names plus Okta device posture field
+names such as `os_platform`, `disk_encryption_type`, and
+`secure_hardware_present`. `client.ipAddress` is mirrored to
+`request.ipChain[0].ip`, `authenticationContext.rootSessionId` mirrors
+`externalSessionId`, `debugContext.debugData` remains a dynamic JSON object,
 and `target` entries carry typed `type` values such as `AppInstance` and
 `AppUser`; consumers should search targets by type rather than array position.
 

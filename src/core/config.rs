@@ -365,6 +365,7 @@ pub struct OktaSystemLogEventConfig {
     pub client_device: Option<String>,
     pub client_id: Option<String>,
     pub client_zone: Option<String>,
+    pub device: Option<OktaDeviceConfig>,
     pub authentication_provider: Option<String>,
     pub credential_provider: Option<String>,
     pub credential_type: Option<String>,
@@ -391,6 +392,22 @@ pub struct OktaSecurityContextConfig {
     pub is_proxy: Option<bool>,
     pub risk: Option<TomlValue>,
     pub user_behaviors: Option<TomlValue>,
+}
+
+/// Explicit Okta device object overrides for System Log events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OktaDeviceConfig {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub os_platform: Option<String>,
+    pub os_version: Option<String>,
+    pub managed: Option<bool>,
+    pub registered: Option<bool>,
+    pub device_integrator: Option<String>,
+    pub disk_encryption_type: Option<String>,
+    pub screen_lock_type: Option<String>,
+    pub jailbreak: Option<bool>,
+    pub secure_hardware_present: Option<bool>,
 }
 
 /// Explicit Okta target entry.

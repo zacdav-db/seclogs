@@ -10,6 +10,7 @@ pub struct OktaLogEvent {
     pub authentication_context: OktaAuthenticationContext,
     pub client: OktaClient,
     pub debug_context: OktaDebugContext,
+    pub device: Option<OktaDevice>,
     pub display_message: String,
     pub event_type: String,
     pub legacy_event_type: Option<String>,
@@ -21,7 +22,7 @@ pub struct OktaLogEvent {
     pub target: Vec<OktaTarget>,
     pub transaction: OktaTransaction,
     pub uuid: String,
-    pub version: String,
+    pub version: u8,
 }
 
 impl OktaLogEvent {
@@ -52,6 +53,7 @@ pub struct OktaAuthenticationContext {
     #[serde(rename = "interface")]
     pub interface_name: Option<String>,
     pub issuer: Value,
+    pub root_session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,7 +79,7 @@ pub struct OktaGeographicalContext {
     pub city: Option<String>,
     pub country: Option<String>,
     pub geolocation: Value,
-    pub postal_code: Option<String>,
+    pub postal_code: Value,
     pub state: Option<String>,
 }
 
@@ -86,7 +88,8 @@ pub struct OktaGeographicalContext {
 pub struct OktaIpChainEntry {
     pub geographical_context: OktaGeographicalContext,
     pub ip: String,
-    pub ip_details: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_details: Option<Value>,
     pub source: Option<String>,
     pub version: String,
 }
@@ -109,20 +112,25 @@ pub struct OktaRequest {
 pub struct OktaSecurityContext {
     pub as_number: Option<i64>,
     pub as_org: Option<String>,
-    pub bot_protection: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_protection: Option<Value>,
     pub domain: Option<String>,
-    pub ip_details: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_details: Option<Value>,
     pub isp: Option<String>,
     pub is_proxy: Option<bool>,
-    pub risk: Value,
-    pub user_behaviors: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk: Option<Value>,
+    #[serde(rename = "UserBehaviours", skip_serializing_if = "Option::is_none")]
+    pub user_behaviours: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OktaTarget {
     pub alternate_id: Option<String>,
-    pub change_details: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_details: Option<Value>,
     pub detail_entry: Value,
     pub display_name: Option<String>,
     pub id: String,
@@ -145,4 +153,19 @@ pub struct OktaUserAgent {
     pub browser: Option<String>,
     pub os: Option<String>,
     pub raw_user_agent: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OktaDevice {
+    pub id: String,
+    pub name: String,
+    pub os_platform: String,
+    pub os_version: String,
+    pub managed: bool,
+    pub registered: bool,
+    pub device_integrator: Option<String>,
+    pub disk_encryption_type: Option<String>,
+    pub screen_lock_type: Option<String>,
+    pub jailbreak: Option<bool>,
+    pub secure_hardware_present: Option<bool>,
 }
