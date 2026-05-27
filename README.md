@@ -46,12 +46,18 @@ export DATABRICKS_CLIENT_SECRET="..."
 cargo run --features zerobus --bin seclog -- gen --config examples/all_sources_zerobus.toml --max-events 100
 ```
 
+To upload source-native files to a Unity Catalog volume through the Databricks Files API:
+```bash
+export DATABRICKS_TOKEN="..."
+cargo run --features databricks_volume --bin seclog -- gen --config examples/all_sources_volume.toml --max-events 100
+```
+
 ## CLI usage
 ### `seclog gen`
 | Flag | Required | Default | Effect |
 | --- | --- | --- | --- |
 | `--config` | yes | - | Path to `config.toml`. |
-| `--output` | no | from config | Overrides file-output `output.dir`. Not valid for Zerobus output. |
+| `--output` | no | from config | Overrides file-output `output.dir`. Not valid for Zerobus or Databricks volume output. |
 | `--dry-run` | no | false | Prints the loaded config and exits. |
 | `--max-events` | no | none | Stops after emitting this many events. |
 | `--max-seconds` | no | none | Stops after this many **wall‑clock seconds** (e.g. `300` for 5 minutes). |
@@ -284,7 +290,7 @@ region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
 | `traffic.start_time` | string | no | now | Shifts event timestamps; use for backfill windows. |
 | `traffic.time_scale` | float | no | 1.0 | Increases/decreases how fast simulated time advances. |
 | `[output]` | table | yes | - | Output sink configuration. |
-| `output.type` | string | no | file | Set to `zerobus` for Databricks Zerobus output; omit for file output. |
+| `output.type` | string | no | file | Set to `zerobus` for Databricks Zerobus output or `databricks_volume` for Databricks Files API volume uploads; omit for file output. |
 | `output.dir` | string | file only | - | Output directory for generated files. |
 | `[output.files]` | table | file only | - | File output controls. |
 | `output.files.target_size_mb` | int | file only | - | Lower values create more, smaller files. |
@@ -292,6 +298,14 @@ region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
 | `[output.format]` | table | file only | - | Output format selection. |
 | `output.format.type` | string | file only | - | `parquet` (structured) or `jsonl` (CloudTrail Records JSON). |
 | `output.format.compression` | string | no | none | `jsonl` supports `gzip` to write `.json.gz`. |
+| `output.workspace_url` | string | Zerobus/volume | - | Databricks workspace URL. |
+| `output.volume_path` | string | volume only | - | UC volume landing directory, `/Volumes/<catalog>/<schema>/<volume>/<path>` or `dbfs:/Volumes/...`. |
+| `output.token_env` | string | volume only | `DATABRICKS_TOKEN` | Environment variable containing the Databricks bearer token for Files API uploads. |
+| `output.target_size_mb` | int | volume only | 50 | Uploads a new volume file when the buffered source partition reaches this uncompressed size; must be no more than 5120. |
+| `output.max_age_seconds` | int | volume only | 30 | Uploads buffered volume files after this age under low volume. |
+| `output.flush_interval_ms` | int | Zerobus/volume | 1000 | Periodic flush cadence for streaming or remote sinks. |
+| `output.compression` | string | volume only | none | `gzip` writes `.json.gz` files to the volume. |
+| `output.overwrite` | bool | volume only | false | Files API overwrite flag for generated file names. |
 | `[source]` | table | yes | - | Source configuration. |
 | `source.type` | string | yes | - | Source generator: `cloudtrail`, `databricks_audit`, `okta`, or `multi`. |
 | `source.curated` | bool | yes | - | Enables curated event set and weights. |
@@ -477,6 +491,45 @@ generation. The actor population table uses `time`, `registry_name`, `actor_id`,
 `actor_kind`, identity fields,
 `normal_countries_regions_json`, `tags_json`, `aws_principals_json`,
 `identity_json`, `run_id`, and `generated_at`.
+
+### Databricks volume output
+Use `[output] type = "databricks_volume"` to upload rotated source-native JSON
+files directly to a Unity Catalog volume through the Databricks Files API. This
+is an output sink, not a source or table writer. It writes one file stream per
+`event.envelope.source`, partitioned under the configured volume directory:
+`source=<source>/tenant_id=<tenant>/region=<region>/...json[.gz]`.
+
+```toml
+[output]
+type = "databricks_volume"
+workspace_url = "https://dbc-example.cloud.databricks.com"
+volume_path = "/Volumes/main/seclog/raw/seclog"
+token_env = "DATABRICKS_TOKEN"
+target_size_mb = 50
+max_age_seconds = 30
+flush_interval_ms = 1000
+compression = "gzip"
+overwrite = false
+```
+
+Build with the optional feature:
+```bash
+cargo run --features databricks_volume --bin seclog -- gen --config examples/all_sources_volume.toml
+```
+
+The Files API upload path sends raw bytes with `PUT /api/2.0/fs/files{file_path}`;
+`file_path` must be an absolute UC volume path such as
+`/Volumes/<catalog>/<schema>/<volume>/<path>`. `dbfs:/Volumes/...` is accepted
+in config and normalized before upload. The writer enforces the Files API 5 GiB
+upload limit for `target_size_mb` and calls the Files API directory endpoint to
+ensure the generated partition directory exists.
+
+Secrets are read from the configured token environment variable and are never
+stored in TOML. The caller needs `USE CATALOG`, `USE SCHEMA`, `READ VOLUME`,
+and `WRITE VOLUME` on the destination volume. The sink currently writes
+CloudTrail-style `{"Records":[...]}` JSON bundles containing the exact
+source-native payload for CloudTrail, Databricks audit, and Okta events;
+optional gzip compression writes `.json.gz` files.
 
 ### Region distribution (array form)
 Provide weights aligned with the `regions` list:
