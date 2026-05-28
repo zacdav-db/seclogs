@@ -131,6 +131,8 @@ count = seclog.write_events_jsonl(
     population=population,
     sources=["cloudtrail", "databricks_audit", "okta"],
     max_events=50_000,
+    progress=True,
+    progress_interval_seconds=10.0,
 )
 ```
 
@@ -165,6 +167,51 @@ seclog.sink_jsonl(
 needs to be selected dynamically, but application code should usually prefer
 `write_events_jsonl` or `write_payloads_jsonl` because the output row shape is
 clear from the function name.
+
+## Progress Reporting
+
+Long-running writes can emit progress snapshots while they run. `progress=True`
+prints a compact line with total events, current rate, and per-source/per-sink
+counts and rates.
+
+```python
+population = seclog.Population(size=1000, seed=42)
+
+count = seclog.write_payloads_jsonl(
+    "out/seclog/okta_payloads.jsonl",
+    population=population,
+    sources=["okta"],
+    max_events=100_000,
+    progress=True,
+    progress_interval_seconds=5.0,
+)
+```
+
+Pass a callback when progress should be handled by application code:
+
+```python
+def report(snapshot: seclog.ProgressSnapshot) -> None:
+    for source, counter in snapshot.sources.items():
+        print(source, counter.events, counter.events_per_second)
+
+
+population = seclog.Population(size=1000, seed=42)
+
+count = seclog.sink_jsonl(
+    {
+        "cloudtrail": "out/seclog/cloudtrail.jsonl",
+        "databricks_audit": "out/seclog/databricks_audit.jsonl",
+        "okta": "out/seclog/okta_system_log.jsonl",
+    },
+    population=population,
+    max_events=100_000,
+    progress=report,
+)
+```
+
+The callback receives a `ProgressSnapshot`. It includes total and interval event
+counts, overall rates, `sources`, `sinks`, and a `finished` flag on the final
+snapshot.
 
 ## Identity Population
 

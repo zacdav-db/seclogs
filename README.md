@@ -95,6 +95,7 @@ count = seclog.write_payloads_jsonl(
     population=seclog.Population(size=1000, seed=42),
     sources=["okta"],
     max_events=10_000,
+    progress=True,
 )
 ```
 

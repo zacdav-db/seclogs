@@ -27,7 +27,16 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import time
-from typing import Any, Iterator, Mapping, MutableMapping, Optional, Sequence, Union
+from typing import (
+    Any,
+    Callable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Union,
+)
 
 try:
     from . import _native
@@ -45,6 +54,70 @@ DEFAULT_TIMEZONES = (
     ("Asia/Singapore", 0.20),
 )
 JsonlDestination = Union[str, Path, Mapping[str, Union[str, Path]]]
+
+
+@dataclass(frozen=True)
+class ProgressCounter:
+    """Event count and rates for one source or sink."""
+
+    name: str
+    events: int
+    events_per_second: float
+    interval_events: int
+    interval_events_per_second: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "events": self.events,
+            "events_per_second": self.events_per_second,
+            "interval_events": self.interval_events,
+            "interval_events_per_second": self.interval_events_per_second,
+        }
+
+
+@dataclass(frozen=True)
+class ProgressSnapshot:
+    """Progress snapshot emitted while a stream sink is running."""
+
+    events: int
+    elapsed_seconds: float
+    events_per_second: float
+    interval_events: int
+    interval_seconds: float
+    interval_events_per_second: float
+    sources: Mapping[str, ProgressCounter]
+    sinks: Mapping[str, ProgressCounter]
+    finished: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "events": self.events,
+            "elapsed_seconds": self.elapsed_seconds,
+            "events_per_second": self.events_per_second,
+            "interval_events": self.interval_events,
+            "interval_seconds": self.interval_seconds,
+            "interval_events_per_second": self.interval_events_per_second,
+            "sources": {
+                name: counter.to_dict() for name, counter in self.sources.items()
+            },
+            "sinks": {name: counter.to_dict() for name, counter in self.sinks.items()},
+            "finished": self.finished,
+        }
+
+    def format(self) -> str:
+        status = "complete" if self.finished else "running"
+        sources = _format_progress_counters(self.sources)
+        sinks = _format_progress_counters(self.sinks)
+        return (
+            f"seclog progress status={status} events={self.events} "
+            f"rate={self.events_per_second:.1f}/s "
+            f"interval_rate={self.interval_events_per_second:.1f}/s "
+            f"sources=[{sources}] sinks=[{sinks}]"
+        )
+
+
+ProgressReporter = Union[bool, Callable[[ProgressSnapshot], None]]
 
 
 @dataclass(frozen=True)
@@ -330,6 +403,8 @@ class EventStream:
         payload_only: bool = True,
         flush_every: int = 1000,
         events_per_second: Optional[float] = None,
+        progress: Optional[ProgressReporter] = None,
+        progress_interval_seconds: float = 5.0,
     ) -> int:
         """Write this stream to one JSONL destination or per-source destinations."""
 
@@ -340,6 +415,8 @@ class EventStream:
             payload_only=payload_only,
             flush_every=flush_every,
             events_per_second=events_per_second,
+            progress=progress,
+            progress_interval_seconds=progress_interval_seconds,
         )
 
 
@@ -475,6 +552,8 @@ def sink_jsonl(
     payload_only: bool = True,
     flush_every: int = 1000,
     events_per_second: Optional[float] = None,
+    progress: Optional[ProgressReporter] = None,
+    progress_interval_seconds: float = 5.0,
     sources: Optional[Sequence[str]] = None,
     population: Optional[Union[Population, Mapping[str, Any]]] = None,
     config: Optional[Mapping[str, Any]] = None,
@@ -508,6 +587,8 @@ def sink_jsonl(
         payload_only=payload_only,
         flush_every=flush_every,
         events_per_second=events_per_second,
+        progress=progress,
+        progress_interval_seconds=progress_interval_seconds,
     )
 
 
@@ -545,6 +626,8 @@ def write_jsonl(
     config_toml: Optional[str] = None,
     flush_every: int = 1000,
     events_per_second: Optional[float] = None,
+    progress: Optional[ProgressReporter] = None,
+    progress_interval_seconds: float = 5.0,
     **config_kwargs: Any,
 ) -> int:
     """Write generated events or source-native payloads to a JSONL file.
@@ -559,6 +642,8 @@ def write_jsonl(
         payload_only=payload_only,
         flush_every=flush_every,
         events_per_second=events_per_second,
+        progress=progress,
+        progress_interval_seconds=progress_interval_seconds,
         sources=sources,
         population=population,
         config=config,
@@ -579,6 +664,8 @@ def write_events_jsonl(
     config_toml: Optional[str] = None,
     flush_every: int = 1000,
     events_per_second: Optional[float] = None,
+    progress: Optional[ProgressReporter] = None,
+    progress_interval_seconds: float = 5.0,
     **config_kwargs: Any,
 ) -> int:
     """Write normalized seclog events with ``envelope`` and ``payload`` fields."""
@@ -589,6 +676,8 @@ def write_events_jsonl(
         payload_only=False,
         flush_every=flush_every,
         events_per_second=events_per_second,
+        progress=progress,
+        progress_interval_seconds=progress_interval_seconds,
         sources=sources,
         population=population,
         config=config,
@@ -609,6 +698,8 @@ def write_payloads_jsonl(
     config_toml: Optional[str] = None,
     flush_every: int = 1000,
     events_per_second: Optional[float] = None,
+    progress: Optional[ProgressReporter] = None,
+    progress_interval_seconds: float = 5.0,
     **config_kwargs: Any,
 ) -> int:
     """Write source-native CloudTrail, Databricks audit, or Okta JSON payloads."""
@@ -619,6 +710,8 @@ def write_payloads_jsonl(
         payload_only=True,
         flush_every=flush_every,
         events_per_second=events_per_second,
+        progress=progress,
+        progress_interval_seconds=progress_interval_seconds,
         sources=sources,
         population=population,
         config=config,
@@ -712,6 +805,118 @@ def _config_input(
     )
 
 
+class _ProgressTracker:
+    def __init__(
+        self,
+        progress: Optional[ProgressReporter],
+        progress_interval_seconds: float,
+    ) -> None:
+        self._reporter = _progress_reporter(progress)
+        self._progress_interval_seconds = progress_interval_seconds
+        self._started_at = time.monotonic()
+        self._last_report_at = self._started_at
+        self._events = 0
+        self._interval_events = 0
+        self._source_events: dict[str, int] = {}
+        self._sink_events: dict[str, int] = {}
+        self._interval_source_events: dict[str, int] = {}
+        self._interval_sink_events: dict[str, int] = {}
+
+    def record(self, source: str, sink: str) -> None:
+        if self._reporter is None:
+            return
+
+        self._events += 1
+        self._interval_events += 1
+        _increment_counter(self._source_events, source)
+        _increment_counter(self._sink_events, sink)
+        _increment_counter(self._interval_source_events, source)
+        _increment_counter(self._interval_sink_events, sink)
+
+        now = time.monotonic()
+        if now - self._last_report_at >= self._progress_interval_seconds:
+            self._emit(now, finished=False)
+
+    def finish(self) -> None:
+        if self._reporter is None:
+            return
+        self._emit(time.monotonic(), finished=True)
+
+    def _emit(self, now: float, *, finished: bool) -> None:
+        elapsed = max(now - self._started_at, 0.000_001)
+        interval_elapsed = max(now - self._last_report_at, 0.000_001)
+        snapshot = ProgressSnapshot(
+            events=self._events,
+            elapsed_seconds=elapsed,
+            events_per_second=self._events / elapsed,
+            interval_events=self._interval_events,
+            interval_seconds=interval_elapsed,
+            interval_events_per_second=self._interval_events / interval_elapsed,
+            sources=_progress_counters(
+                totals=self._source_events,
+                intervals=self._interval_source_events,
+                elapsed_seconds=elapsed,
+                interval_seconds=interval_elapsed,
+            ),
+            sinks=_progress_counters(
+                totals=self._sink_events,
+                intervals=self._interval_sink_events,
+                elapsed_seconds=elapsed,
+                interval_seconds=interval_elapsed,
+            ),
+            finished=finished,
+        )
+        self._reporter(snapshot)
+        self._last_report_at = now
+        self._interval_events = 0
+        self._interval_source_events.clear()
+        self._interval_sink_events.clear()
+
+
+def _progress_reporter(
+    progress: Optional[ProgressReporter],
+) -> Optional[Callable[[ProgressSnapshot], None]]:
+    if progress is None or progress is False:
+        return None
+    if progress is True:
+        return lambda snapshot: print(snapshot.format(), flush=True)
+    if callable(progress):
+        return progress
+    raise ValueError("progress must be True, False, None, or a callable")
+
+
+def _increment_counter(counters: MutableMapping[str, int], key: str) -> None:
+    counters[key] = counters.get(key, 0) + 1
+
+
+def _progress_counters(
+    *,
+    totals: Mapping[str, int],
+    intervals: Mapping[str, int],
+    elapsed_seconds: float,
+    interval_seconds: float,
+) -> dict[str, ProgressCounter]:
+    return {
+        name: ProgressCounter(
+            name=name,
+            events=events,
+            events_per_second=events / elapsed_seconds,
+            interval_events=intervals.get(name, 0),
+            interval_events_per_second=intervals.get(name, 0) / interval_seconds,
+        )
+        for name, events in totals.items()
+    }
+
+
+def _format_progress_counters(counters: Mapping[str, ProgressCounter]) -> str:
+    if not counters:
+        return "-"
+    return ", ".join(
+        f"{name}:{counter.events}@{counter.interval_events_per_second:.1f}/s"
+        for name, counter in counters.items()
+    )
+
+
 def _sink_stream_jsonl(
     event_stream: EventStream,
     destinations: JsonlDestination,
@@ -720,6 +925,8 @@ def _sink_stream_jsonl(
     payload_only: bool,
     flush_every: int,
     events_per_second: Optional[float],
+    progress: Optional[ProgressReporter],
+    progress_interval_seconds: float,
 ) -> int:
     if max_events is not None and max_events < 0:
         raise ValueError("max_events must be non-negative or None")
@@ -727,46 +934,62 @@ def _sink_stream_jsonl(
         raise ValueError("flush_every must be non-negative")
     if events_per_second is not None and events_per_second <= 0:
         raise ValueError("events_per_second must be greater than zero")
+    if progress_interval_seconds <= 0:
+        raise ValueError("progress_interval_seconds must be greater than zero")
 
     count = 0
     interval = 1.0 / events_per_second if events_per_second else None
     next_deadline = time.monotonic()
+    progress_tracker = _ProgressTracker(progress, progress_interval_seconds)
 
     with ExitStack() as stack:
-        default_handle, route_handles = _open_jsonl_destinations(destinations, stack)
-        while max_events is None or count < max_events:
-            try:
-                event = next(event_stream)
-            except StopIteration:
-                break
+        default_destination, route_destinations = _open_jsonl_destinations(
+            destinations, stack
+        )
+        try:
+            while max_events is None or count < max_events:
+                try:
+                    event = next(event_stream)
+                except StopIteration:
+                    break
 
-            source = event["envelope"]["source"]
-            handle = default_handle or route_handles.get(source)
-            if handle is None:
-                raise ValueError(f"no JSONL destination configured for source {source}")
+                source = event["envelope"]["source"]
+                destination = default_destination or route_destinations.get(source)
+                if destination is None:
+                    raise ValueError(
+                        f"no JSONL destination configured for source {source}"
+                    )
 
-            row = event["payload"] if payload_only else event
-            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
-            count += 1
+                row = event["payload"] if payload_only else event
+                destination.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+                count += 1
+                progress_tracker.record(source, destination.label)
 
-            if flush_every and count % flush_every == 0:
-                _flush_handles(default_handle, route_handles)
+                if flush_every and count % flush_every == 0:
+                    _flush_handles(default_destination, route_destinations)
 
-            if interval is not None:
-                next_deadline += interval
-                sleep_seconds = next_deadline - time.monotonic()
-                if sleep_seconds > 0:
-                    time.sleep(sleep_seconds)
-
-        _flush_handles(default_handle, route_handles)
+                if interval is not None:
+                    next_deadline += interval
+                    sleep_seconds = next_deadline - time.monotonic()
+                    if sleep_seconds > 0:
+                        time.sleep(sleep_seconds)
+        finally:
+            _flush_handles(default_destination, route_destinations)
+            progress_tracker.finish()
 
     return count
+
+
+@dataclass(frozen=True)
+class _JsonlDestination:
+    handle: Any
+    label: str
 
 
 def _open_jsonl_destinations(
     destinations: JsonlDestination,
     stack: ExitStack,
-) -> tuple[Optional[Any], dict[str, Any]]:
+) -> tuple[Optional[_JsonlDestination], dict[str, _JsonlDestination]]:
     if isinstance(destinations, Mapping):
         route_handles = {}
         for source, path in destinations.items():
@@ -777,17 +1000,21 @@ def _open_jsonl_destinations(
     return _open_jsonl_path(destinations, stack), {}
 
 
-def _open_jsonl_path(path: Union[str, Path], stack: ExitStack) -> Any:
+def _open_jsonl_path(path: Union[str, Path], stack: ExitStack) -> _JsonlDestination:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    return stack.enter_context(output_path.open("w", encoding="utf-8"))
+    handle = stack.enter_context(output_path.open("w", encoding="utf-8"))
+    return _JsonlDestination(handle=handle, label=str(path))
 
 
-def _flush_handles(default_handle: Optional[Any], route_handles: Mapping[str, Any]) -> None:
-    if default_handle is not None:
-        default_handle.flush()
-    for handle in route_handles.values():
-        handle.flush()
+def _flush_handles(
+    default_destination: Optional[_JsonlDestination],
+    route_destinations: Mapping[str, _JsonlDestination],
+) -> None:
+    if default_destination is not None:
+        default_destination.handle.flush()
+    for destination in route_destinations.values():
+        destination.handle.flush()
 
 
 def _read_text(path: Union[str, Path]) -> str:
@@ -907,6 +1134,9 @@ __all__ = [
     "EventStream",
     "ExplicitActor",
     "Population",
+    "ProgressCounter",
+    "ProgressReporter",
+    "ProgressSnapshot",
     "Role",
     "ServiceProfile",
     "TimezoneWeight",
