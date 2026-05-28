@@ -1787,8 +1787,25 @@ def _infer_workspace_region(workspace_client: Any, workspace_id: str) -> str:
         if value:
             return value
 
-    account_id = _workspace_config_attr(workspace_client, "account_id")
+    workspace_config = _workspace_config_details(workspace_client)
+    region = _workspace_config_region(workspace_config)
+    if region:
+        return region
+
+    account_id = (
+        _workspace_config_attr(workspace_client, "account_id")
+        or _api_client_attr(workspace_client, "account_id")
+        or _workspace_config_account_id(workspace_config)
+    )
     if account_id:
+        region = _workspace_region_from_account_endpoint(
+            workspace_client,
+            account_id,
+            workspace_id,
+        )
+        if region:
+            return region
+
         try:
             from databricks.sdk import AccountClient  # type: ignore[import-not-found]
 
@@ -1802,8 +1819,130 @@ def _infer_workspace_region(workspace_client: Any, workspace_id: str) -> str:
             pass
 
     raise ValueError(
-        "could not infer Databricks workspace region for Zerobus; pass region="
+        "could not infer Databricks workspace region for Zerobus from "
+        "WorkspaceClient config, /config, or account workspace details; pass region="
     )
+
+
+def _workspace_config_details(workspace_client: Any) -> dict[str, Any]:
+    response = _workspace_api_do(workspace_client, "GET", "/config")
+    details = _parse_workspace_config_response(response)
+    if details:
+        return details
+    return {}
+
+
+def _workspace_region_from_account_endpoint(
+    workspace_client: Any,
+    account_id: str,
+    workspace_id: str,
+) -> Optional[str]:
+    path = f"/api/2.0/accounts/{account_id}/workspaces/{workspace_id}"
+    response = _workspace_api_do(workspace_client, "GET", path)
+    details = _parse_workspace_config_response(response)
+    return _account_workspace_region(details)
+
+
+def _workspace_api_client(workspace_client: Any) -> Optional[Any]:
+    api_client = getattr(workspace_client, "api_client", None)
+    if callable(api_client):
+        try:
+            return api_client()
+        except TypeError:
+            return api_client
+    return api_client
+
+
+def _api_client_attr(workspace_client: Any, name: str) -> Optional[str]:
+    api_client = _workspace_api_client(workspace_client)
+    value = getattr(api_client, name, None) if api_client is not None else None
+    return str(value) if value else None
+
+
+def _workspace_api_do(
+    workspace_client: Any,
+    method: str,
+    path: str,
+    *,
+    raw: bool = False,
+) -> Any:
+    api_client = _workspace_api_client(workspace_client)
+    do = getattr(api_client, "do", None) if api_client is not None else None
+    if not callable(do):
+        return None
+    try:
+        return do(method, path=path, raw=raw)
+    except TypeError:
+        try:
+            return do(method=method, path=path, raw=raw)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _parse_workspace_config_response(response: Any) -> dict[str, Any]:
+    if response is None:
+        return {}
+    if isinstance(response, Mapping):
+        return {str(key): value for key, value in response.items()}
+    if isinstance(response, (bytes, bytearray)):
+        return _parse_workspace_config_text(response.decode("utf-8", errors="replace"))
+    if isinstance(response, str):
+        return _parse_workspace_config_text(response)
+
+    read = getattr(response, "read", None)
+    if callable(read):
+        try:
+            data = read()
+        except Exception:
+            return {}
+        return _parse_workspace_config_response(data)
+    return {}
+
+
+def _parse_workspace_config_text(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if not stripped:
+        return {}
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, Mapping):
+        return {str(key): value for key, value in parsed.items()}
+
+    values: dict[str, str] = {}
+    for line in stripped.splitlines():
+        item = line.strip()
+        if not item or item.startswith("#"):
+            continue
+        for separator in ("=", ":"):
+            if separator in item:
+                key, value = item.split(separator, 1)
+                values[key.strip()] = value.strip().strip('"')
+                break
+    return values
+
+
+def _workspace_config_region(config: Mapping[str, Any]) -> Optional[str]:
+    return _first_config_value(config, ("regionName", "awsRegion", "region"))
+
+
+def _workspace_config_account_id(config: Mapping[str, Any]) -> Optional[str]:
+    return _first_config_value(config, ("accountId", "account_id"))
+
+
+def _account_workspace_region(config: Mapping[str, Any]) -> Optional[str]:
+    return _first_config_value(config, ("aws_region", "location", "region"))
+
+
+def _first_config_value(config: Mapping[str, Any], keys: Sequence[str]) -> Optional[str]:
+    for key in keys:
+        value = config.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
 
 
 def _resolve_secret(
