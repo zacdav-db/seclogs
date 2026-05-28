@@ -15,9 +15,11 @@ Databricks audit, or Okta records into a downstream system.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import time
 from typing import Any, Iterator, Mapping, MutableMapping, Optional, Sequence, Union
 
 try:
@@ -35,6 +37,7 @@ DEFAULT_TIMEZONES = (
     ("Europe/London", 0.25),
     ("Asia/Singapore", 0.20),
 )
+JsonlDestination = Union[str, Path, Mapping[str, Union[str, Path]]]
 
 
 @dataclass(frozen=True)
@@ -268,12 +271,100 @@ def default_config(
     }
 
 
+class EventStream:
+    """Persistent event stream backed by one Rust generator instance."""
+
+    def __init__(
+        self,
+        *,
+        sources: Sequence[str] = DEFAULT_SOURCES,
+        population: Optional[Union[Population, Mapping[str, Any]]] = None,
+        config: Optional[Mapping[str, Any]] = None,
+        config_path: Optional[Union[str, Path]] = None,
+        config_toml: Optional[str] = None,
+        **config_kwargs: Any,
+    ) -> None:
+        kind, value = _config_input(
+            config=config,
+            config_path=config_path,
+            config_toml=config_toml,
+            sources=sources,
+            population=population,
+            config_kwargs=config_kwargs,
+        )
+        native = _native_module().EventStream
+        self._native = native.from_toml(value) if kind == "toml" else native.from_json(value)
+
+    def __iter__(self) -> "EventStream":
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        event_json = self._native.next_event_json()
+        if event_json is None:
+            raise StopIteration
+        return json.loads(event_json)
+
+    def batches(self, batch_size: int = 1000) -> Iterator[list[dict[str, Any]]]:
+        """Yield batches from the same persistent generator."""
+
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        while True:
+            batch = self._native.next_batch_json(batch_size)
+            if not batch:
+                return
+            yield [json.loads(event_json) for event_json in batch]
+
+    def sink_jsonl(
+        self,
+        destinations: JsonlDestination,
+        *,
+        max_events: Optional[int] = None,
+        payload_only: bool = True,
+        flush_every: int = 1000,
+        events_per_second: Optional[float] = None,
+    ) -> int:
+        """Write this stream to one JSONL destination or per-source destinations."""
+
+        return _sink_stream_jsonl(
+            self,
+            destinations,
+            max_events=max_events,
+            payload_only=payload_only,
+            flush_every=flush_every,
+            events_per_second=events_per_second,
+        )
+
+
+def stream(
+    *,
+    sources: Sequence[str] = DEFAULT_SOURCES,
+    population: Optional[Union[Population, Mapping[str, Any]]] = None,
+    config: Optional[Mapping[str, Any]] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    config_toml: Optional[str] = None,
+    **config_kwargs: Any,
+) -> EventStream:
+    """Create a persistent event stream."""
+
+    return EventStream(
+        sources=sources,
+        population=population,
+        config=config,
+        config_path=config_path,
+        config_toml=config_toml,
+        **config_kwargs,
+    )
+
+
 def generate(
     *,
     max_events: int = 100,
     sources: Sequence[str] = DEFAULT_SOURCES,
     population: Optional[Union[Population, Mapping[str, Any]]] = None,
     config: Optional[Mapping[str, Any]] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    config_toml: Optional[str] = None,
     **config_kwargs: Any,
 ) -> list[dict[str, Any]]:
     """Generate normalized seclog events as dictionaries."""
@@ -284,6 +375,8 @@ def generate(
             sources=sources,
             population=population,
             config=config,
+            config_path=config_path,
+            config_toml=config_toml,
             **config_kwargs,
         )
     )
@@ -295,18 +388,22 @@ def iter_events(
     sources: Sequence[str] = DEFAULT_SOURCES,
     population: Optional[Union[Population, Mapping[str, Any]]] = None,
     config: Optional[Mapping[str, Any]] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    config_toml: Optional[str] = None,
     **config_kwargs: Any,
 ) -> Iterator[dict[str, Any]]:
     """Iterate generated normalized events."""
 
-    selected_config = (
-        dict(config)
-        if config is not None
-        else default_config(sources=sources, population=population, **config_kwargs)
+    event_jsons = _generate_event_jsons(
+        max_events=max_events,
+        config=config,
+        config_path=config_path,
+        config_toml=config_toml,
+        sources=sources,
+        population=population,
+        config_kwargs=config_kwargs,
     )
-    for event_json in _native_module().generate_events_json(
-        json.dumps(selected_config), max_events
-    ):
+    for event_json in event_jsons:
         yield json.loads(event_json)
 
 
@@ -316,6 +413,8 @@ def payloads(
     sources: Sequence[str] = DEFAULT_SOURCES,
     population: Optional[Union[Population, Mapping[str, Any]]] = None,
     config: Optional[Mapping[str, Any]] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    config_toml: Optional[str] = None,
     **config_kwargs: Any,
 ) -> list[dict[str, Any]]:
     """Generate source-native payload dictionaries only."""
@@ -327,6 +426,8 @@ def payloads(
             sources=sources,
             population=population,
             config=config,
+            config_path=config_path,
+            config_toml=config_toml,
             **config_kwargs,
         )
     ]
@@ -334,47 +435,116 @@ def payloads(
 
 def identities(
     population: Optional[Union[Population, Mapping[str, Any]]] = None,
+    *,
+    population_path: Optional[Union[str, Path]] = None,
+    population_toml: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Generate the shared identity registry implied by a population config."""
 
+    population_jsons = _generate_identity_jsons(
+        population=population,
+        population_path=population_path,
+        population_toml=population_toml,
+    )
+    return [json.loads(identity_json) for identity_json in population_jsons]
+
+
+def load_config(path: Union[str, Path]) -> dict[str, Any]:
+    """Load a seclog TOML generator config as a JSON-compatible dictionary."""
+
+    return json.loads(_native_module().config_toml_to_json(_read_text(path)))
+
+
+def load_population(path: Union[str, Path]) -> dict[str, Any]:
+    """Load a seclog TOML population config as a JSON-compatible dictionary."""
+
+    return json.loads(_native_module().population_toml_to_json(_read_text(path)))
+
+
+def sink_jsonl(
+    destinations: JsonlDestination,
+    *,
+    max_events: Optional[int] = None,
+    payload_only: bool = True,
+    flush_every: int = 1000,
+    events_per_second: Optional[float] = None,
+    sources: Sequence[str] = DEFAULT_SOURCES,
+    population: Optional[Union[Population, Mapping[str, Any]]] = None,
+    config: Optional[Mapping[str, Any]] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    config_toml: Optional[str] = None,
+    **config_kwargs: Any,
+) -> int:
+    """Stream events to one JSONL file or to per-source JSONL files."""
+
+    event_stream = stream(
+        sources=sources,
+        population=population,
+        config=config,
+        config_path=config_path,
+        config_toml=config_toml,
+        **config_kwargs,
+    )
+    return event_stream.sink_jsonl(
+        destinations,
+        max_events=max_events,
+        payload_only=payload_only,
+        flush_every=flush_every,
+        events_per_second=events_per_second,
+    )
+
+
+def _generate_identity_jsons(
+    *,
+    population: Optional[Union[Population, Mapping[str, Any]]],
+    population_path: Optional[Union[str, Path]],
+    population_toml: Optional[str],
+) -> list[str]:
+    configured = sum(
+        value is not None for value in (population, population_path, population_toml)
+    )
+    if configured > 1:
+        raise ValueError("set only one of population, population_path, or population_toml")
+    if population_path is not None:
+        return _native_module().generate_identities_toml(_read_text(population_path))
+    if population_toml is not None:
+        return _native_module().generate_identities_toml(population_toml)
     population_dict = _population_to_dict(population)
     return [
-        json.loads(identity_json)
-        for identity_json in _native_module().generate_identities_json(
-            json.dumps(population_dict)
-        )
+        identity_json
+        for identity_json in _native_module().generate_identities_json(json.dumps(population_dict))
     ]
 
 
 def write_jsonl(
     path: Union[str, Path],
     *,
-    max_events: int = 100,
+    max_events: Optional[int] = 100,
     payload_only: bool = False,
     sources: Sequence[str] = DEFAULT_SOURCES,
     population: Optional[Union[Population, Mapping[str, Any]]] = None,
     config: Optional[Mapping[str, Any]] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    config_toml: Optional[str] = None,
+    flush_every: int = 1000,
+    events_per_second: Optional[float] = None,
     **config_kwargs: Any,
 ) -> int:
     """Write generated events or source-native payloads to a JSONL file."""
 
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    count = 0
-
-    with output_path.open("w", encoding="utf-8") as handle:
-        for event in iter_events(
-            max_events=max_events,
-            sources=sources,
-            population=population,
-            config=config,
-            **config_kwargs,
-        ):
-            row = event["payload"] if payload_only else event
-            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
-            count += 1
-
-    return count
+    return sink_jsonl(
+        path,
+        max_events=max_events,
+        payload_only=payload_only,
+        flush_every=flush_every,
+        events_per_second=events_per_second,
+        sources=sources,
+        population=population,
+        config=config,
+        config_path=config_path,
+        config_toml=config_toml,
+        **config_kwargs,
+    )
 
 
 def generate_from_config(
@@ -385,6 +555,147 @@ def generate_from_config(
     """Generate events from an explicit seclog config dictionary."""
 
     return generate(config=config, max_events=max_events)
+
+
+def _generate_event_jsons(
+    *,
+    max_events: int,
+    config: Optional[Mapping[str, Any]],
+    config_path: Optional[Union[str, Path]],
+    config_toml: Optional[str],
+    sources: Sequence[str],
+    population: Optional[Union[Population, Mapping[str, Any]]],
+    config_kwargs: Mapping[str, Any],
+) -> list[str]:
+    kind, value = _config_input(
+        config=config,
+        config_path=config_path,
+        config_toml=config_toml,
+        sources=sources,
+        population=population,
+        config_kwargs=config_kwargs,
+    )
+    if kind == "toml":
+        return _native_module().generate_events_toml(value, max_events)
+    return _native_module().generate_events_json(value, max_events)
+
+
+def _config_input(
+    *,
+    config: Optional[Mapping[str, Any]],
+    config_path: Optional[Union[str, Path]],
+    config_toml: Optional[str],
+    sources: Sequence[str],
+    population: Optional[Union[Population, Mapping[str, Any]]],
+    config_kwargs: Mapping[str, Any],
+) -> tuple[str, str]:
+    configured = sum(value is not None for value in (config, config_path, config_toml))
+    if configured > 1:
+        raise ValueError("set only one of config, config_path, or config_toml")
+
+    has_code_overrides = (
+        tuple(sources) != tuple(DEFAULT_SOURCES)
+        or population is not None
+        or bool(config_kwargs)
+    )
+    if config is not None:
+        if has_code_overrides:
+            raise ValueError("config cannot be combined with source or population arguments")
+        return "json", json.dumps(dict(config))
+    if config_path is not None:
+        if has_code_overrides:
+            raise ValueError("config_path cannot be combined with source or population arguments")
+        return "toml", _read_text(config_path)
+    if config_toml is not None:
+        if has_code_overrides:
+            raise ValueError("config_toml cannot be combined with source or population arguments")
+        return "toml", config_toml
+
+    return "json", json.dumps(
+        default_config(sources=sources, population=population, **config_kwargs)
+    )
+
+
+def _sink_stream_jsonl(
+    event_stream: EventStream,
+    destinations: JsonlDestination,
+    *,
+    max_events: Optional[int],
+    payload_only: bool,
+    flush_every: int,
+    events_per_second: Optional[float],
+) -> int:
+    if max_events is not None and max_events < 0:
+        raise ValueError("max_events must be non-negative or None")
+    if flush_every < 0:
+        raise ValueError("flush_every must be non-negative")
+    if events_per_second is not None and events_per_second <= 0:
+        raise ValueError("events_per_second must be greater than zero")
+
+    count = 0
+    interval = 1.0 / events_per_second if events_per_second else None
+    next_deadline = time.monotonic()
+
+    with ExitStack() as stack:
+        default_handle, route_handles = _open_jsonl_destinations(destinations, stack)
+        while max_events is None or count < max_events:
+            try:
+                event = next(event_stream)
+            except StopIteration:
+                break
+
+            source = event["envelope"]["source"]
+            handle = default_handle or route_handles.get(source)
+            if handle is None:
+                raise ValueError(f"no JSONL destination configured for source {source}")
+
+            row = event["payload"] if payload_only else event
+            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+            count += 1
+
+            if flush_every and count % flush_every == 0:
+                _flush_handles(default_handle, route_handles)
+
+            if interval is not None:
+                next_deadline += interval
+                sleep_seconds = next_deadline - time.monotonic()
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+
+        _flush_handles(default_handle, route_handles)
+
+    return count
+
+
+def _open_jsonl_destinations(
+    destinations: JsonlDestination,
+    stack: ExitStack,
+) -> tuple[Optional[Any], dict[str, Any]]:
+    if isinstance(destinations, Mapping):
+        route_handles = {}
+        for source, path in destinations.items():
+            key = _normalize_source(str(source))
+            route_handles[key] = _open_jsonl_path(path, stack)
+        return None, route_handles
+
+    return _open_jsonl_path(destinations, stack), {}
+
+
+def _open_jsonl_path(path: Union[str, Path], stack: ExitStack) -> Any:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return stack.enter_context(output_path.open("w", encoding="utf-8"))
+
+
+def _flush_handles(default_handle: Optional[Any], route_handles: Mapping[str, Any]) -> None:
+    if default_handle is not None:
+        default_handle.flush()
+    for handle in route_handles.values():
+        handle.flush()
+
+
+def _read_text(path: Union[str, Path]) -> str:
+    return Path(path).read_text(encoding="utf-8")
 
 
 def _source_config(
@@ -497,6 +808,7 @@ __all__ = [
     "DEFAULT_SOURCES",
     "DEFAULT_TIMEZONES",
     "ErrorRate",
+    "EventStream",
     "ExplicitActor",
     "Population",
     "Role",
@@ -507,6 +819,10 @@ __all__ = [
     "generate_from_config",
     "identities",
     "iter_events",
+    "load_config",
+    "load_population",
     "payloads",
+    "sink_jsonl",
+    "stream",
     "write_jsonl",
 ]

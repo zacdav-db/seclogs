@@ -18,13 +18,12 @@ pub type ApiResult<T> = Result<T, Box<dyn Error>>;
 
 /// Generate normalized events from a loaded config.
 pub fn generate_events(config: &Config, max_events: Option<usize>) -> ApiResult<Vec<Event>> {
-    let start_time = parse_start_time(config.traffic.start_time.as_deref())?;
-    let mut source = build_event_source(&config.source, config.seed, start_time)?;
+    let mut stream = EventStream::from_config(config)?;
     let limit = max_events.unwrap_or(100);
     let mut events = Vec::with_capacity(limit);
 
     for _ in 0..limit {
-        let Some(event) = source.next_event() else {
+        let Some(event) = stream.next_event() else {
             break;
         };
         events.push(event);
@@ -33,12 +32,68 @@ pub fn generate_events(config: &Config, max_events: Option<usize>) -> ApiResult<
     Ok(events)
 }
 
+/// Stateful event stream for language bindings and other library callers.
+pub struct EventStream {
+    source: Box<dyn EventSource>,
+}
+
+impl EventStream {
+    pub fn from_config(config: &Config) -> ApiResult<Self> {
+        let start_time = parse_start_time(config.traffic.start_time.as_deref())?;
+        let source = build_event_source(&config.source, config.seed, start_time)?;
+        Ok(Self { source })
+    }
+
+    pub fn from_json(config_json: &str) -> ApiResult<Self> {
+        let config: Config = serde_json::from_str(config_json)?;
+        Self::from_config(&config)
+    }
+
+    pub fn from_toml(config_toml: &str) -> ApiResult<Self> {
+        let config: Config = toml::from_str(config_toml)?;
+        Self::from_config(&config)
+    }
+
+    pub fn next_event(&mut self) -> Option<Event> {
+        self.source.next_event()
+    }
+
+    pub fn next_event_json(&mut self) -> ApiResult<Option<String>> {
+        self.next_event()
+            .map(|event| Ok(serde_json::to_string(&event)?))
+            .transpose()
+    }
+
+    pub fn next_batch_json(&mut self, max_events: usize) -> ApiResult<Vec<String>> {
+        let mut events = Vec::with_capacity(max_events);
+        for _ in 0..max_events {
+            let Some(event) = self.next_event_json()? else {
+                break;
+            };
+            events.push(event);
+        }
+        Ok(events)
+    }
+}
+
 /// Generate JSON-serialized normalized events from a JSON config string.
 pub fn generate_events_json(
     config_json: &str,
     max_events: Option<usize>,
 ) -> ApiResult<Vec<String>> {
     let config: Config = serde_json::from_str(config_json)?;
+    generate_events(&config, max_events)?
+        .into_iter()
+        .map(|event| Ok(serde_json::to_string(&event)?))
+        .collect()
+}
+
+/// Generate JSON-serialized normalized events from a TOML config string.
+pub fn generate_events_toml(
+    config_toml: &str,
+    max_events: Option<usize>,
+) -> ApiResult<Vec<String>> {
+    let config: Config = toml::from_str(config_toml)?;
     generate_events(&config, max_events)?
         .into_iter()
         .map(|event| Ok(serde_json::to_string(&event)?))
@@ -55,6 +110,30 @@ pub fn generate_identities_json(population_json: &str) -> ApiResult<Vec<String>>
         .iter()
         .map(|identity| Ok(serde_json::to_string(identity)?))
         .collect()
+}
+
+/// Generate JSON-serialized identities from a TOML population config string.
+pub fn generate_identities_toml(population_toml: &str) -> ApiResult<Vec<String>> {
+    let config: PopulationConfig = toml::from_str(population_toml)?;
+    let population = generate_population(&config)?;
+    let registry = IdentityRegistry::from_population("generated_identity_registry", &population)?;
+    registry
+        .identities()
+        .iter()
+        .map(|identity| Ok(serde_json::to_string(identity)?))
+        .collect()
+}
+
+/// Convert a TOML generator config to its JSON representation.
+pub fn config_toml_to_json(config_toml: &str) -> ApiResult<String> {
+    let config: Config = toml::from_str(config_toml)?;
+    Ok(serde_json::to_string(&config)?)
+}
+
+/// Convert a TOML population config to its JSON representation.
+pub fn population_toml_to_json(population_toml: &str) -> ApiResult<String> {
+    let config: PopulationConfig = toml::from_str(population_toml)?;
+    Ok(serde_json::to_string(&config)?)
 }
 
 pub fn build_event_source(
