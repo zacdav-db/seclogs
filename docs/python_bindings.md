@@ -198,16 +198,15 @@ configured volume path.
 ## Progress
 
 `progress=True` renders an updating terminal view on stderr. In non-interactive
-output, such as CI logs, it falls back to one plain text line per interval.
+output, such as notebooks and CI logs, it writes one readable block per
+interval.
 
 ```text
-seclog running | 37,122 events | 3,711.8/s avg | 3,734.3/s current | 00:10 elapsed
-sources
-  name                                      events       avg/s   current/s
-  okta_system_log                           37,122     3,711.8     3,734.3
-sinks
-  name                                      events       avg/s   current/s
-  out/seclog/okta_system_log.jsonl          37,122     3,711.8     3,734.3
+seclog progress | running | total=37,122 | +3,734 | current=3,734.3/s | avg=3,711.8/s | elapsed=00:10
+  sources:
+    okta_system_log | total=37,122 | +3,734 | current=3,734.3/s | avg=3,711.8/s
+  sinks:
+    okta_system_log -> zerobus main.seclog.okta_system_log_events | total=37,122 | +3,734 | current=3,734.3/s | avg=3,711.8/s
 ```
 
 Pass a callback when progress should be handled by application code:
