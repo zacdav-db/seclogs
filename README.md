@@ -75,6 +75,12 @@ Build the extension locally:
 pip install -e .
 ```
 
+Install Databricks sink dependencies when Python streams should write to
+Zerobus or Unity Catalog volumes:
+```bash
+pip install -e ".[databricks]"
+```
+
 Start a stream from a TOML config and write source-native payloads to explicit
 sinks:
 ```python
@@ -82,19 +88,54 @@ import seclog
 
 result = (
     seclog.stream(config_path="examples/all_sources.toml")
-    .to(
-        seclog.JsonlSink.payloads(
-            {
-                "cloudtrail": "out/python/cloudtrail.jsonl",
-                "databricks_audit": "out/python/databricks_audit.jsonl",
-                "okta": "out/python/okta_system_log.jsonl",
-            }
-        )
+    .to_jsonl_by_source(
+        cloudtrail="out/python/cloudtrail.jsonl",
+        databricks_audit="out/python/databricks_audit.jsonl",
+        okta="out/python/okta_system_log.jsonl",
     )
     .start(max_events=50_000, progress=True)
 )
 
 print(result.events)
+```
+
+Attach another sink by chaining another output before `start()`:
+```python
+result = (
+    seclog.stream(config_path="examples/all_sources.toml")
+    .to_jsonl_by_source(
+        cloudtrail="out/python/cloudtrail.jsonl",
+        databricks_audit="out/python/databricks_audit.jsonl",
+        okta="out/python/okta_system_log.jsonl",
+    )
+    .to_jsonl("out/python/events.jsonl", record="event")
+    .start(max_events=50_000, progress=True)
+)
+```
+
+Route different sources to different sink types when the data flow is mixed:
+```python
+from databricks.sdk import WorkspaceClient
+import seclog
+
+workspace_client = WorkspaceClient()
+population = seclog.Population(size=1000, seed=42)
+
+result = (
+    seclog.stream(population=population, sources=["okta", "databricks_audit"])
+    .source("okta")
+    .to_zerobus(
+        "lakewatch.bronze.okta_system_logs_unmapped",
+        workspace_client=workspace_client,
+    )
+    .source("databricks_audit")
+    .to_jsonl("out/python/databricks_audit.jsonl")
+    .to_volume(
+        "/Volumes/lakewatch/bronze/raw/seclog",
+        workspace_client=workspace_client,
+    )
+    .start(max_events=None, progress=True)
+)
 ```
 
 Or define the population in Python and attach a single Okta sink:
@@ -103,7 +144,7 @@ population = seclog.Population(size=1000, seed=42)
 
 result = (
     seclog.stream(population=population, sources=["okta"])
-    .to(seclog.JsonlSink.payloads("out/python/okta_system_log.jsonl"))
+    .to_jsonl("out/python/okta_system_log.jsonl")
     .start(max_events=10_000, progress=True)
 )
 ```
@@ -130,14 +171,10 @@ result = (
         population=population,
         sources=["cloudtrail", "databricks_audit", "okta"],
     )
-    .to(
-        seclog.JsonlSink.payloads(
-            {
-                "cloudtrail": "out/python/cloudtrail.jsonl",
-                "databricks_audit": "out/python/databricks_audit.jsonl",
-                "okta": "out/python/okta_system_log.jsonl",
-            }
-        )
+    .to_jsonl_by_source(
+        cloudtrail="out/python/cloudtrail.jsonl",
+        databricks_audit="out/python/databricks_audit.jsonl",
+        okta="out/python/okta_system_log.jsonl",
     )
     .start(max_events=10_000, progress=True)
 )

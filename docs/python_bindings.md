@@ -30,6 +30,13 @@ maturin develop
 
 Both commands build the native extension with the `python` Cargo feature.
 
+Install Databricks sink dependencies when Python streams should write to
+Zerobus or Unity Catalog volumes:
+
+```bash
+pip install -e ".[databricks]"
+```
+
 ## Stream To Sinks
 
 Use an existing seclog TOML config when the same setup should be shared with the
@@ -40,14 +47,10 @@ import seclog
 
 result = (
     seclog.stream(config_path="examples/all_sources.toml")
-    .to(
-        seclog.JsonlSink.payloads(
-            {
-                "cloudtrail": "out/seclog/cloudtrail.jsonl",
-                "databricks_audit": "out/seclog/databricks_audit.jsonl",
-                "okta": "out/seclog/okta_system_log.jsonl",
-            }
-        )
+    .to_jsonl_by_source(
+        cloudtrail="out/seclog/cloudtrail.jsonl",
+        databricks_audit="out/seclog/databricks_audit.jsonl",
+        okta="out/seclog/okta_system_log.jsonl",
     )
     .start(max_events=50_000, progress=True)
 )
@@ -82,14 +85,10 @@ result = (
         population=population,
         sources=["cloudtrail", "databricks_audit", "okta"],
     )
-    .to(
-        seclog.JsonlSink.payloads(
-            {
-                "cloudtrail": "out/seclog/cloudtrail.jsonl",
-                "databricks_audit": "out/seclog/databricks_audit.jsonl",
-                "okta": "out/seclog/okta_system_log.jsonl",
-            }
-        )
+    .to_jsonl_by_source(
+        cloudtrail="out/seclog/cloudtrail.jsonl",
+        databricks_audit="out/seclog/databricks_audit.jsonl",
+        okta="out/seclog/okta_system_log.jsonl",
     )
     .start(max_events=50_000, progress=True)
 )
@@ -102,17 +101,18 @@ population = seclog.Population(size=1000, seed=42)
 
 result = (
     seclog.stream(population=population, sources=["okta"])
-    .to(seclog.JsonlSink.payloads("out/seclog/okta_system_log.jsonl"))
+    .to_jsonl("out/seclog/okta_system_log.jsonl")
     .start(max_events=10_000, progress=True)
 )
 ```
 
 ## Sink Records
 
-`JsonlSink.payloads(...)` writes source-native records, such as raw Okta System
-Log objects or CloudTrail records.
+`to_jsonl(...)` writes source-native records by default, such as raw Okta
+System Log objects or CloudTrail records.
 
-`JsonlSink.events(...)` writes normalized seclog events with two top-level keys:
+Pass `record="event"` when the file should contain normalized seclog events
+with two top-level keys:
 
 - `envelope`: normalized metadata such as source, actor, outcome, and time.
 - `payload`: the source-native record.
@@ -122,25 +122,77 @@ population = seclog.Population(size=1000, seed=42)
 
 result = (
     seclog.stream(population=population)
-    .to(seclog.JsonlSink.events("out/seclog/events.jsonl"))
+    .to_jsonl("out/seclog/events.jsonl", record="event")
     .start(max_events=10_000)
 )
 ```
 
-Multiple sinks fan out the same generated stream:
+Multiple sinks fan out the same generated stream. This writes source-native
+payloads to per-source files and also writes one normalized event file:
 
 ```python
 population = seclog.Population(size=1000, seed=42)
 
 result = (
-    seclog.stream(population=population, sources=["okta"])
-    .to(
-        seclog.JsonlSink.payloads("out/seclog/okta_payloads.jsonl"),
-        seclog.JsonlSink.events("out/seclog/okta_events.jsonl"),
+    seclog.stream(
+        population=population,
+        sources=["cloudtrail", "databricks_audit", "okta"],
     )
+    .to_jsonl_by_source(
+        cloudtrail="out/seclog/cloudtrail.jsonl",
+        databricks_audit="out/seclog/databricks_audit.jsonl",
+        okta="out/seclog/okta_system_log.jsonl",
+    )
+    .to_jsonl("out/seclog/events.jsonl", record="event")
     .start(max_events=10_000, progress=True)
 )
 ```
+
+Each `to_jsonl(...)` call attaches another sink to the same stream. The
+generator produces one event sequence from one population and writes each event
+to every configured sink.
+
+## Source Routes
+
+Use `source(...)` when different sources should go to different sink types. This
+example sends Okta System Log rows to Zerobus and Databricks audit rows to both
+local JSONL and a Unity Catalog volume:
+
+```python
+from databricks.sdk import WorkspaceClient
+import seclog
+
+workspace_client = WorkspaceClient()
+population = seclog.Population(size=1000, seed=42)
+
+result = (
+    seclog.stream(
+        population=population,
+        sources=["okta", "databricks_audit"],
+    )
+    .source("okta")
+    .to_zerobus(
+        "lakewatch.bronze.okta_system_logs_unmapped",
+        workspace_client=workspace_client,
+    )
+    .source("databricks_audit")
+    .to_jsonl("out/seclog/databricks_audit.jsonl")
+    .to_volume(
+        "/Volumes/lakewatch/bronze/raw/seclog",
+        workspace_client=workspace_client,
+    )
+    .start(max_events=None, progress=True)
+)
+```
+
+Each source route appends sinks for only that source. If the stream emits a
+source that no sink handles, `start()` raises a deterministic error instead of
+silently dropping events.
+
+`to_zerobus(...)` writes the common seclog row shape with `time`, envelope
+columns, `envelope_json`, and `payload_json`. `to_volume(...)` writes
+source-native JSONL files below `source=<source>/run_id=<run_id>/` in the
+configured volume path.
 
 ## Progress
 
@@ -169,7 +221,7 @@ population = seclog.Population(size=1000, seed=42)
 
 result = (
     seclog.stream(population=population, sources=["okta"])
-    .to(seclog.JsonlSink.payloads("out/seclog/okta_system_log.jsonl"))
+    .to_jsonl("out/seclog/okta_system_log.jsonl")
     .start(max_events=100_000, progress=report)
 )
 ```
@@ -193,7 +245,7 @@ okta_rows = seclog.payloads(sources=["okta"], max_events=100)
 ```
 
 These functions are for finite samples. For files and long-running generation,
-prefer `stream(...).to(...).start(...)`.
+prefer `stream(...).to_jsonl(...).start(...)`.
 
 ## Config Inputs
 
@@ -220,16 +272,11 @@ config = seclog.default_config(
         "databricks_audit": {"workspace_id": "9876543210"},
     },
 )
-
 result = (
     seclog.stream(config=config)
-    .to(
-        seclog.JsonlSink.payloads(
-            {
-                "okta": "out/seclog/okta_system_log.jsonl",
-                "databricks_audit": "out/seclog/databricks_audit.jsonl",
-            }
-        )
+    .to_jsonl_by_source(
+        okta="out/seclog/okta_system_log.jsonl",
+        databricks_audit="out/seclog/databricks_audit.jsonl",
     )
     .start(max_events=10_000, progress=True)
 )
@@ -266,20 +313,15 @@ population = seclog.Population(
         )
     ],
 )
-
 result = (
     seclog.stream(
         population=population,
         sources=["cloudtrail", "databricks_audit", "okta"],
     )
-    .to(
-        seclog.JsonlSink.payloads(
-            {
-                "cloudtrail": "out/seclog/cloudtrail.jsonl",
-                "databricks_audit": "out/seclog/databricks_audit.jsonl",
-                "okta": "out/seclog/okta_system_log.jsonl",
-            }
-        )
+    .to_jsonl_by_source(
+        cloudtrail="out/seclog/cloudtrail.jsonl",
+        databricks_audit="out/seclog/databricks_audit.jsonl",
+        okta="out/seclog/okta_system_log.jsonl",
     )
     .start(max_events=1000)
 )
@@ -298,7 +340,7 @@ explicit stream form:
 ```python
 result = (
     seclog.stream(population=seclog.Population(size=1000), sources=["okta"])
-    .to(seclog.JsonlSink.payloads("out/seclog/okta_system_log.jsonl"))
+    .to_jsonl("out/seclog/okta_system_log.jsonl")
     .start(max_events=10_000)
 )
 ```
@@ -306,7 +348,7 @@ result = (
 ## Current Scope
 
 The Python package currently supports in-memory generation, persistent stream
-iteration, and local JSONL sinks. Managed file output, Databricks volume
-uploads, and Zerobus writes remain CLI capabilities. The Okta generator is
-schema-faithful for the selected auth, session, and app-access events it emits,
-but it is not a full implementation of Okta's event-type catalog.
+iteration, local JSONL sinks, Databricks Files API volume sinks, and Zerobus
+sinks. Managed rotating file output remains a CLI capability. The Okta generator
+is schema-faithful for the selected auth, session, and app-access events it
+emits, but it is not a full implementation of Okta's event-type catalog.
