@@ -21,6 +21,9 @@ Data realism comes from actor-driven generation: each actor has a role or servic
 - `Approved PR Tests` runs when a pull request review is submitted with an
   approved state. It runs Rust formatting, whitespace checks, Rust tests,
   optional feature checks, and Python package smoke tests.
+- Workflows use read-only repository permissions, pinned action revisions, and
+  checkout credentials are not persisted. Approved PR tests run the exact commit
+  that was approved.
 
 ## Getting started (end-to-end)
 1. Generate an actor population (Parquet):
