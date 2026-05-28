@@ -274,15 +274,7 @@ class ProgressSnapshot:
         }
 
     def format(self) -> str:
-        status = "complete" if self.finished else "running"
-        sources = _format_progress_counters(self.sources)
-        sinks = _format_progress_counters(self.sinks)
-        return (
-            f"seclog progress status={status} events={self.events} "
-            f"rate={self.events_per_second:.1f}/s "
-            f"interval_rate={self.interval_events_per_second:.1f}/s "
-            f"sources=[{sources}] sinks=[{sinks}]"
-        )
+        return _format_progress_log(self)
 
 
 ProgressReporter = Union[bool, Callable[[ProgressSnapshot], None]]
@@ -1422,7 +1414,7 @@ class _ConsoleProgressRenderer:
 
     def __call__(self, snapshot: ProgressSnapshot) -> None:
         if not self._interactive:
-            self._stream.write(snapshot.format() + "\n")
+            self._stream.write(_format_progress_log(snapshot) + "\n")
             self._stream.flush()
             return
 
@@ -1467,6 +1459,41 @@ def _format_progress_counters(counters: Mapping[str, ProgressCounter]) -> str:
         f"{name}:{counter.events}@{counter.interval_events_per_second:.1f}/s"
         for name, counter in counters.items()
     )
+
+
+def _format_progress_log(snapshot: ProgressSnapshot) -> str:
+    status = "complete" if snapshot.finished else "running"
+    lines = [
+        (
+            f"seclog progress | {status} | total={_format_count(snapshot.events)} "
+            f"| +{_format_count(snapshot.interval_events)} "
+            f"| current={_format_rate(snapshot.interval_events_per_second)} "
+            f"| avg={_format_rate(snapshot.events_per_second)} "
+            f"| elapsed={_format_duration(snapshot.elapsed_seconds)}"
+        ),
+        *_format_progress_log_section("sources", snapshot.sources),
+        *_format_progress_log_section("sinks", snapshot.sinks),
+    ]
+    return "\n".join(lines)
+
+
+def _format_progress_log_section(
+    title: str,
+    counters: Mapping[str, ProgressCounter],
+) -> list[str]:
+    lines = [f"  {title}:"]
+    if not counters:
+        lines.append("    - | total=0 | +0 | current=0.0/s | avg=0.0/s")
+        return lines
+
+    for counter in sorted(counters.values(), key=lambda item: item.name):
+        lines.append(
+            f"    {counter.name} | total={_format_count(counter.events)} "
+            f"| +{_format_count(counter.interval_events)} "
+            f"| current={_format_rate(counter.interval_events_per_second)} "
+            f"| avg={_format_rate(counter.events_per_second)}"
+        )
+    return lines
 
 
 def _format_progress_block(snapshot: ProgressSnapshot) -> str:
@@ -1809,7 +1836,7 @@ class _JsonlSinkHandle:
 
         row = _event_record(event, self.sink.record)
         destination.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
-        return destination.label
+        return _jsonl_sink_label(self.sink, destination.label, source)
 
     def flush(self) -> None:
         _flush_handles(self.default_destination, self.route_destinations)
@@ -1824,6 +1851,12 @@ def _open_jsonl_sink(sink: JsonlSink, stack: ExitStack) -> _JsonlSinkHandle:
         default_destination=default_destination,
         route_destinations=route_destinations,
     )
+
+
+def _jsonl_sink_label(sink: JsonlSink, destination: str, source: str) -> str:
+    if sink.sources is not None or isinstance(sink.destinations, Mapping):
+        return f"{source} -> jsonl {destination}"
+    return f"jsonl {destination}"
 
 
 @dataclass
@@ -1871,7 +1904,7 @@ class _DatabricksVolumeSinkHandle:
         rows.clear()
 
     def _label(self, source: str) -> str:
-        return f"{self.base_path}/source={source}"
+        return f"{source} -> volume {self.base_path}"
 
 
 def _open_databricks_volume_sink(
@@ -1905,7 +1938,7 @@ class _ZerobusSinkHandle:
         self.acks.append(ack)
         if self.sink.flush_every and len(self.acks) >= self.sink.flush_every:
             self.flush()
-        return f"zerobus:{self.sink.table}"
+        return f"{source} -> zerobus {self.sink.table}"
 
     def flush(self) -> None:
         while self.acks:
