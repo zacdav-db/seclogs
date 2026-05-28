@@ -14,6 +14,14 @@ Data realism comes from actor-driven generation: each actor has a role or servic
 - Build locally with `cargo doc --no-deps --package seclog`.
 - Python API usage is documented in `docs/python_bindings.md`.
 
+## GitHub automation
+- `Build Artifacts` runs after changes land on `main` and can also be started
+  manually. It builds release binaries plus Python wheels and source
+  distributions, then stores them as workflow artifacts.
+- `Approved PR Tests` runs when a pull request review is submitted with an
+  approved state. It runs Rust formatting, whitespace checks, Rust tests,
+  optional feature checks, and Python package smoke tests.
+
 ## Getting started (end-to-end)
 1. Generate an actor population (Parquet):
 ```bash

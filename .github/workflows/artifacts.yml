@@ -1,0 +1,144 @@
+name: Build Artifacts
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  binary:
+    name: Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: seclog-linux-x86_64
+            binary: seclog
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: seclog-macos-x86_64
+            binary: seclog
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: seclog-macos-aarch64
+            binary: seclog
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: seclog-windows-x86_64
+            binary: seclog.exe
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin seclog --target ${{ matrix.target }}
+
+      - name: Package Unix binary
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.artifact }}/
+          tar -C dist -czf dist/${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+
+      - name: Package Windows binary
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/${{ matrix.artifact }}"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.artifact }}/"
+          Compress-Archive -Path "dist/${{ matrix.artifact }}" -DestinationPath "dist/${{ matrix.artifact }}.zip"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  python:
+    name: Python wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --features python --out dist
+          manylinux: auto
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seclog-python-wheel-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  python-sdist:
+    name: Python source distribution
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin
+        run: python -m pip install --upgrade pip "maturin>=1,<2"
+
+      - name: Build sdist
+        run: maturin sdist --out dist
+
+      - name: Upload Python sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seclog-python-sdist
+          path: dist/*
+          if-no-files-found: error
