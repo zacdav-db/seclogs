@@ -465,13 +465,16 @@ def default_config(
     *,
     sources: Sequence[str] = DEFAULT_SOURCES,
     population: Optional[Union[Population, Mapping[str, Any]]] = None,
+    identity_registry_path: Optional[Union[str, Path]] = None,
+    population_config_path: Optional[Union[str, Path]] = None,
     seed: Optional[int] = None,
     start_time: str = "2026-01-01T00:00:00Z",
     time_scale: float = 36000.0,
     cloudtrail_regions: Sequence[str] = ("us-east-1", "us-west-2", "ap-southeast-1"),
     cloudtrail_region_distribution: Sequence[float] = (0.55, 0.25, 0.20),
     databricks_account_id: str = "example-account-id",
-    databricks_workspace_id: str = "1234567890",
+    databricks_workspace_id: Optional[str] = None,
+    workspace_client: Any = None,
     databricks_baseline_events_per_actor: int = 2,
     okta_org_id: str = "okta-example-org",
     okta_baseline_events_per_actor: int = 2,
@@ -479,6 +482,11 @@ def default_config(
 ) -> dict[str, Any]:
     """Build a complete seclog config using shared-population defaults."""
 
+    if identity_registry_path is not None and population_config_path is not None:
+        raise ValueError("set only one of identity_registry_path or population_config_path")
+    if databricks_workspace_id is None and workspace_client is not None:
+        databricks_workspace_id = _workspace_id(workspace_client)
+    databricks_workspace_id = databricks_workspace_id or "1234567890"
     population_dict = _population_to_dict(population)
     source_configs = [
         _source_config(
@@ -503,11 +511,12 @@ def default_config(
             "files": {"target_size_mb": 50, "max_age_seconds": 10},
             "format": {"type": "jsonl", "compression": None},
         },
-        "source": {
-            "type": "multi",
-            "population_config": population_dict,
-            "sources": source_configs,
-        },
+        "source": _multi_source_config(
+            source_configs,
+            population_config=population_dict,
+            identity_registry_path=identity_registry_path,
+            population_config_path=population_config_path,
+        ),
     }
 
 
@@ -1945,19 +1954,65 @@ def _first_config_value(config: Mapping[str, Any], keys: Sequence[str]) -> Optio
     return None
 
 
-def _resolve_secret(
+def _resolve_optional_secret(
     *,
     explicit: Optional[str],
     config: Optional[str],
     env_name: str,
-    label: str,
-) -> str:
-    value = explicit or config or os.environ.get(env_name)
-    if value:
-        return value
-    raise ValueError(
-        f"{label} is required; set it on the workspace client or in {env_name}"
+) -> Optional[str]:
+    return explicit or config or os.environ.get(env_name)
+
+
+class _WorkspaceHeadersProvider:
+    def __init__(
+        self,
+        authenticate: Callable[..., Mapping[str, Any]],
+        table_name: str,
+    ) -> None:
+        self._authenticate = authenticate
+        self._table_name = table_name
+
+    def get_headers(self) -> list[tuple[str, str]]:
+        headers = _call_workspace_authenticator(self._authenticate)
+        if not isinstance(headers, Mapping):
+            raise ValueError("workspace client authenticate() must return headers")
+        normalized = {str(key).lower(): str(value) for key, value in headers.items()}
+        normalized["x-databricks-zerobus-table-name"] = self._table_name
+        return list(normalized.items())
+
+
+def _workspace_headers_provider(
+    workspace_client: Any,
+    table_name: str,
+) -> _WorkspaceHeadersProvider:
+    return _WorkspaceHeadersProvider(
+        _workspace_authenticator(workspace_client),
+        table_name,
     )
+
+
+def _workspace_authenticator(workspace_client: Any) -> Callable[..., Mapping[str, Any]]:
+    config = getattr(workspace_client, "config", None)
+    authenticate = getattr(config, "authenticate", None) if config is not None else None
+    if callable(authenticate):
+        return authenticate
+
+    api_client = _workspace_api_client(workspace_client)
+    config = getattr(api_client, "config", None) if api_client is not None else None
+    authenticate = getattr(config, "authenticate", None) if config is not None else None
+    if callable(authenticate):
+        return authenticate
+
+    raise ValueError("workspace_client.config.authenticate is required for Zerobus")
+
+
+def _call_workspace_authenticator(
+    authenticate: Callable[..., Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    try:
+        return authenticate()
+    except TypeError:
+        return authenticate(None)
 
 
 @dataclass(frozen=True)
@@ -2032,8 +2087,8 @@ class _DatabricksVolumeSinkHandle:
 
         counter = self.counters.get(source, 0)
         self.counters[source] = counter + 1
-        directory = f"{self.base_path}/source={source}/run_id={self.run_id}"
-        file_path = f"{directory}/{self.sink.file_prefix}-{counter:06d}.jsonl"
+        directory = self.base_path
+        file_path = f"{directory}/{self.sink.file_prefix}-{source}-{counter:06d}.jsonl"
         payload = "".join(rows).encode("utf-8")
         files = getattr(self.sink.workspace_client, "files", None)
         if files is None:
@@ -2113,25 +2168,31 @@ def _open_zerobus_sink(
 
     endpoint = _infer_zerobus_endpoint(sink.workspace_client, sink.region)
     workspace_url = _workspace_host(sink.workspace_client)
-    client_id = _resolve_secret(
+    client_id = _resolve_optional_secret(
         explicit=sink.client_id,
         config=_workspace_config_attr(sink.workspace_client, "client_id"),
         env_name=sink.client_id_env,
-        label="zerobus client id",
     )
-    client_secret = _resolve_secret(
+    client_secret = _resolve_optional_secret(
         explicit=sink.client_secret,
         config=_workspace_config_attr(sink.workspace_client, "client_secret"),
         env_name=sink.client_secret_env,
-        label="zerobus client secret",
+    )
+    if bool(client_id) != bool(client_secret):
+        raise ValueError("set both zerobus client_id and client_secret, or neither")
+    headers_provider = (
+        None
+        if client_id
+        else _workspace_headers_provider(sink.workspace_client, sink.table)
     )
     sdk = ZerobusSdk(endpoint, workspace_url)
     options = StreamConfigurationOptions(record_type=RecordType.JSON)
     stream = sdk.create_stream(
-        client_id,
-        client_secret,
+        client_id or "",
+        client_secret or "",
         TableProperties(sink.table),
         options,
+        headers_provider=headers_provider,
     )
     handle = _ZerobusSinkHandle(
         sink=sink,
@@ -2324,6 +2385,26 @@ def _flush_handles(
 
 def _read_text(path: Union[str, Path]) -> str:
     return Path(path).read_text(encoding="utf-8")
+
+
+def _multi_source_config(
+    sources: Sequence[Mapping[str, Any]],
+    *,
+    population_config: Mapping[str, Any],
+    identity_registry_path: Optional[Union[str, Path]],
+    population_config_path: Optional[Union[str, Path]],
+) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "type": "multi",
+        "sources": list(sources),
+    }
+    if identity_registry_path is not None:
+        config["identity_registry_path"] = str(identity_registry_path)
+    elif population_config_path is not None:
+        config["population_config_path"] = str(population_config_path)
+    else:
+        config["population_config"] = dict(population_config)
+    return config
 
 
 def _source_config(
