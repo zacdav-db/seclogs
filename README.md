@@ -12,7 +12,7 @@ Data realism comes from actor-driven generation: each actor has a role or servic
 ## Documentation
 - Rustdoc is the primary reference and is published to GitHub Pages.
 - Build locally with `cargo doc --no-deps --package seclog`.
-- Python binding UX is documented in `docs/python_bindings.md`.
+- Python API usage is documented in `docs/python_bindings.md`.
 
 ## Getting started (end-to-end)
 1. Generate an actor population (Parquet):
@@ -53,22 +53,23 @@ export DATABRICKS_TOKEN="..."
 cargo run --features databricks_volume --bin seclog -- gen --config examples/all_sources_volume.toml --max-events 100
 ```
 
-## Python bindings
-The Python package wraps the Rust library for in-memory generation with strong
-defaults. By default it synthesizes one shared identity population and emits
-independent CloudTrail, Databricks audit, and Okta System Log events from that
-population.
+## Python API
+The Python package wraps the Rust generator for notebooks, tests, local data
+files, and Python pipelines. It can synthesize one shared identity population
+and emit independent CloudTrail, Databricks audit, and Okta System Log events
+from that population.
 
 Build the extension locally:
 ```bash
 pip install -e .
 ```
 
-Generate normalized events:
+Generate normalized events in memory:
 ```python
 import seclog
 
 events = seclog.generate(max_events=500)
+first_event = events[0]
 ```
 
 Generate source-native payloads only:
@@ -84,23 +85,27 @@ events = seclog.generate(
 )
 ```
 
-Run a persistent stream and route source-native payloads to per-source JSONL
-destinations:
+Write helpers create files and require an explicit generation input. This keeps
+long-running writes from accidentally starting from an implicit default
+population. Write calls block until the requested events are written, the stream
+ends, or an error is raised:
 ```python
-seclog.sink_jsonl(
-    {
-        "cloudtrail": "out/python/cloudtrail.jsonl",
-        "databricks_audit": "out/python/databricks_audit.jsonl",
-        "okta": "out/python/okta_system_log.jsonl",
-    },
-    config_path="examples/all_sources.toml",
-    max_events=None,
-    events_per_second=250,
+count = seclog.write_payloads_jsonl(
+    "out/python/okta_system_log.jsonl",
+    population=seclog.Population(size=1000, seed=42),
+    sources=["okta"],
+    max_events=10_000,
 )
 ```
 
-Write helpers require an explicit generation input such as `config_path` or
-`population`; they will not silently start from the default population.
+Run a persistent stream when a Python process needs to consume events
+incrementally:
+```python
+events = seclog.stream(config_path="examples/all_sources.toml")
+
+for batch in events.batches(1000):
+    write_batch(batch)
+```
 
 Customize the population without hand-authoring every identity:
 ```python
@@ -117,8 +122,8 @@ events = seclog.generate(population=population, max_events=10_000)
 identities = seclog.identities(population)
 ```
 
-See `docs/python_bindings.md` for the full UX, including explicit actor
-overrides and JSONL writing.
+See `docs/python_bindings.md` for the full API guide, including explicit actor
+overrides, JSONL writing, and the current Python feature scope.
 
 ## CLI usage
 ### `seclog gen`

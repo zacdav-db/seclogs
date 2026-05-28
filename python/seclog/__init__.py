@@ -1,4 +1,4 @@
-"""Python bindings for seclog.
+"""Python API for seclog.
 
 The public API is intentionally small:
 
@@ -6,18 +6,18 @@ The public API is intentionally small:
 
     events = seclog.generate(max_events=1000)
     okta_payloads = seclog.payloads(sources=["okta"], max_events=100)
-    identities = seclog.identities(seclog.Population(size=50))
+    population = seclog.Population(size=250, seed=42)
+    identities = seclog.identities(population)
     count = seclog.write_payloads_jsonl(
         "out/okta.jsonl",
-        population=seclog.Population(size=250),
+        population=population,
         sources=["okta"],
         max_events=10_000,
     )
 
 Generated events are dictionaries with the normalized seclog envelope and the
-source-native payload. Use ``payloads`` when loading raw CloudTrail,
-Databricks audit, or Okta records into a downstream system. Write APIs require
-an explicit generation input such as ``population`` or ``config_path``.
+source-native payload. Write APIs require an explicit generation input such as
+``population`` or ``config_path``.
 """
 
 from __future__ import annotations
