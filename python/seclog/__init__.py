@@ -26,6 +26,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import sys
 import time
 from typing import (
     Any,
@@ -879,10 +880,34 @@ def _progress_reporter(
     if progress is None or progress is False:
         return None
     if progress is True:
-        return lambda snapshot: print(snapshot.format(), flush=True)
+        return _ConsoleProgressRenderer()
     if callable(progress):
         return progress
     raise ValueError("progress must be True, False, None, or a callable")
+
+
+class _ConsoleProgressRenderer:
+    def __init__(self, stream: Any = None) -> None:
+        self._stream = stream if stream is not None else sys.stderr
+        isatty = getattr(self._stream, "isatty", None)
+        self._interactive = bool(isatty()) if callable(isatty) else False
+        self._rendered_lines = 0
+
+    def __call__(self, snapshot: ProgressSnapshot) -> None:
+        if not self._interactive:
+            self._stream.write(snapshot.format() + "\n")
+            self._stream.flush()
+            return
+
+        text = _format_progress_block(snapshot)
+        lines = text.count("\n") + 1
+        if self._rendered_lines:
+            self._stream.write(f"\x1b[{self._rendered_lines}F")
+            self._stream.write("\x1b[J")
+
+        self._stream.write(text + "\n")
+        self._stream.flush()
+        self._rendered_lines = lines
 
 
 def _increment_counter(counters: MutableMapping[str, int], key: str) -> None:
@@ -915,6 +940,73 @@ def _format_progress_counters(counters: Mapping[str, ProgressCounter]) -> str:
         f"{name}:{counter.events}@{counter.interval_events_per_second:.1f}/s"
         for name, counter in counters.items()
     )
+
+
+def _format_progress_block(snapshot: ProgressSnapshot) -> str:
+    status = "complete" if snapshot.finished else "running"
+    header = (
+        f"seclog {status} | {_format_count(snapshot.events)} events | "
+        f"{_format_rate(snapshot.events_per_second)} avg | "
+        f"{_format_rate(snapshot.interval_events_per_second)} current | "
+        f"{_format_duration(snapshot.elapsed_seconds)} elapsed"
+    )
+    return "\n".join(
+        [
+            header,
+            _format_progress_table("sources", snapshot.sources),
+            _format_progress_table("sinks", snapshot.sinks),
+        ]
+    )
+
+
+def _format_progress_table(
+    title: str,
+    counters: Mapping[str, ProgressCounter],
+) -> str:
+    lines = [
+        title,
+        "  name                                      events       avg/s   current/s",
+    ]
+    if not counters:
+        lines.append("  -                                              0         0.0         0.0")
+        return "\n".join(lines)
+
+    for counter in sorted(counters.values(), key=lambda item: (-item.events, item.name)):
+        name = _shorten_middle(counter.name, 40)
+        lines.append(
+            f"  {name:<40} "
+            f"{_format_count(counter.events):>10} "
+            f"{counter.events_per_second:>11.1f} "
+            f"{counter.interval_events_per_second:>11.1f}"
+        )
+    return "\n".join(lines)
+
+
+def _format_count(value: int) -> str:
+    return f"{value:,}"
+
+
+def _format_rate(value: float) -> str:
+    return f"{value:,.1f}/s"
+
+
+def _format_duration(seconds: float) -> str:
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _shorten_middle(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    prefix = (width - 3) // 2
+    suffix = width - 3 - prefix
+    return f"{value[:prefix]}...{value[-suffix:]}"
 
 
 def _sink_stream_jsonl(

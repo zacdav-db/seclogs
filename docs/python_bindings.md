@@ -171,8 +171,9 @@ clear from the function name.
 ## Progress Reporting
 
 Long-running writes can emit progress snapshots while they run. `progress=True`
-prints a compact line with total events, current rate, and per-source/per-sink
-counts and rates.
+renders a compact terminal progress view on stderr with total events, current
+rate, and per-source/per-sink counts and rates. In non-interactive output, such
+as CI logs, it falls back to one plain text line per interval.
 
 ```python
 population = seclog.Population(size=1000, seed=42)
@@ -185,6 +186,18 @@ count = seclog.write_payloads_jsonl(
     progress=True,
     progress_interval_seconds=5.0,
 )
+```
+
+Interactive terminal output updates in place:
+
+```text
+seclog running | 37,122 events | 3,711.8/s avg | 3,734.3/s current | 00:10 elapsed
+sources
+  name                                      events       avg/s   current/s
+  okta_system_log                           37,122     3,711.8     3,734.3
+sinks
+  name                                      events       avg/s   current/s
+  out/seclog/okta_payloads.jsonl            37,122     3,711.8     3,734.3
 ```
 
 Pass a callback when progress should be handled by application code:

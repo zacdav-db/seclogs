@@ -98,6 +98,8 @@ count = seclog.write_payloads_jsonl(
     progress=True,
 )
 ```
+`progress=True` renders an updating terminal view on stderr; callback-based
+progress is available for notebooks and applications.
 
 Run a persistent stream when a Python process needs to consume events
 incrementally:
