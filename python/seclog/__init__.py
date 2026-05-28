@@ -4,20 +4,21 @@ The public API is intentionally small:
 
     import seclog
 
-    events = seclog.generate(max_events=1000)
-    okta_payloads = seclog.payloads(sources=["okta"], max_events=100)
     population = seclog.Population(size=250, seed=42)
-    identities = seclog.identities(population)
-    count = seclog.write_payloads_jsonl(
-        "out/okta.jsonl",
-        population=population,
-        sources=["okta"],
-        max_events=10_000,
+    result = (
+        seclog.stream(sources=["okta"], population=population)
+        .to(seclog.JsonlSink.payloads("out/okta.jsonl"))
+        .start(max_events=10_000, progress=True)
     )
 
-Generated events are dictionaries with the normalized seclog envelope and the
-source-native payload. Write APIs require an explicit generation input such as
-``population`` or ``config_path``.
+    events = seclog.generate(max_events=1000)
+    okta_payloads = seclog.payloads(sources=["okta"], max_events=100)
+    identities = seclog.identities(population)
+
+Generated streams write to explicit sinks. In-memory generation returns
+dictionaries with the normalized seclog envelope and the source-native payload.
+Write APIs require an explicit generation input such as ``population`` or
+``config_path``.
 """
 
 from __future__ import annotations
@@ -55,6 +56,58 @@ DEFAULT_TIMEZONES = (
     ("Asia/Singapore", 0.20),
 )
 JsonlDestination = Union[str, Path, Mapping[str, Union[str, Path]]]
+
+
+@dataclass(frozen=True)
+class JsonlSink:
+    """JSONL sink for source-native payloads or normalized seclog events."""
+
+    destinations: JsonlDestination
+    record: str = "payload"
+    flush_every: int = 1000
+
+    @classmethod
+    def payloads(
+        cls,
+        destinations: JsonlDestination,
+        *,
+        flush_every: int = 1000,
+    ) -> "JsonlSink":
+        """Write source-native payload rows."""
+
+        return cls(destinations=destinations, record="payload", flush_every=flush_every)
+
+    @classmethod
+    def events(
+        cls,
+        destinations: JsonlDestination,
+        *,
+        flush_every: int = 1000,
+    ) -> "JsonlSink":
+        """Write normalized rows with envelope and payload."""
+
+        return cls(destinations=destinations, record="event", flush_every=flush_every)
+
+    def __post_init__(self) -> None:
+        _validate_jsonl_record(self.record)
+        if self.flush_every < 0:
+            raise ValueError("flush_every must be non-negative")
+
+
+@dataclass(frozen=True)
+class StreamResult:
+    """Result returned after a stream finishes writing to sinks."""
+
+    events: int
+    elapsed_seconds: float
+    events_per_second: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "events": self.events,
+            "elapsed_seconds": self.elapsed_seconds,
+            "events_per_second": self.events_per_second,
+        }
 
 
 @dataclass(frozen=True)
@@ -409,12 +462,64 @@ class EventStream:
     ) -> int:
         """Write this stream to one JSONL destination or per-source destinations."""
 
-        return _sink_stream_jsonl(
-            self,
+        result = self.to_jsonl(
             destinations,
-            max_events=max_events,
-            payload_only=payload_only,
+            record="payload" if payload_only else "event",
             flush_every=flush_every,
+        ).start(
+            max_events=max_events,
+            events_per_second=events_per_second,
+            progress=progress,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+        return result.events
+
+    def to(self, *sinks: JsonlSink) -> "StreamPipeline":
+        """Attach one or more sinks to this stream."""
+
+        return StreamPipeline(self, sinks)
+
+    def to_jsonl(
+        self,
+        destinations: JsonlDestination,
+        *,
+        record: str = "payload",
+        flush_every: int = 1000,
+    ) -> "StreamPipeline":
+        """Attach a JSONL sink to this stream."""
+
+        return self.to(
+            JsonlSink(destinations=destinations, record=record, flush_every=flush_every)
+        )
+
+
+class StreamPipeline:
+    """Configured stream plus its output sinks."""
+
+    def __init__(self, event_stream: EventStream, sinks: Sequence[JsonlSink]) -> None:
+        if not sinks:
+            raise ValueError("configure at least one sink before starting a stream")
+        self._event_stream = event_stream
+        self._sinks = tuple(sinks)
+
+    def start(
+        self,
+        *,
+        max_events: Optional[int] = None,
+        events_per_second: Optional[float] = None,
+        progress: Optional[ProgressReporter] = None,
+        progress_interval_seconds: float = 5.0,
+    ) -> StreamResult:
+        """Start generation and write events to the configured sinks.
+
+        This call is blocking. It returns when ``max_events`` is reached, the
+        configured sources are exhausted, or an error is raised.
+        """
+
+        return _run_stream_to_jsonl_sinks(
+            self._event_stream,
+            self._sinks,
+            max_events=max_events,
             events_per_second=events_per_second,
             progress=progress,
             progress_interval_seconds=progress_interval_seconds,
@@ -823,20 +928,33 @@ class _ProgressTracker:
         self._interval_source_events: dict[str, int] = {}
         self._interval_sink_events: dict[str, int] = {}
 
-    def record(self, source: str, sink: str) -> None:
+    def record_event(self, source: str) -> None:
         if self._reporter is None:
             return
 
         self._events += 1
         self._interval_events += 1
         _increment_counter(self._source_events, source)
-        _increment_counter(self._sink_events, sink)
         _increment_counter(self._interval_source_events, source)
+
+    def record_sink(self, sink: str) -> None:
+        if self._reporter is None:
+            return
+
+        _increment_counter(self._sink_events, sink)
         _increment_counter(self._interval_sink_events, sink)
 
+    def maybe_emit(self) -> None:
+        if self._reporter is None:
+            return
         now = time.monotonic()
         if now - self._last_report_at >= self._progress_interval_seconds:
             self._emit(now, finished=False)
+
+    def record(self, source: str, sink: str) -> None:
+        self.record_event(source)
+        self.record_sink(sink)
+        self.maybe_emit()
 
     def finish(self) -> None:
         if self._reporter is None:
@@ -1009,6 +1127,114 @@ def _shorten_middle(value: str, width: int) -> str:
     return f"{value[:prefix]}...{value[-suffix:]}"
 
 
+def _validate_jsonl_record(record: str) -> None:
+    if record not in {"payload", "event"}:
+        raise ValueError("JSONL sink record must be 'payload' or 'event'")
+
+
+def _jsonl_record_payload_only(record: str) -> bool:
+    _validate_jsonl_record(record)
+    return record == "payload"
+
+
+@dataclass(frozen=True)
+class _JsonlSinkHandle:
+    sink: JsonlSink
+    default_destination: Optional["_JsonlDestination"]
+    route_destinations: Mapping[str, "_JsonlDestination"]
+
+    def write(self, event: Mapping[str, Any], source: str) -> str:
+        destination = self.default_destination or self.route_destinations.get(source)
+        if destination is None:
+            raise ValueError(f"no JSONL destination configured for source {source}")
+
+        row = (
+            event["payload"]
+            if _jsonl_record_payload_only(self.sink.record)
+            else event
+        )
+        destination.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        return destination.label
+
+    def flush(self) -> None:
+        _flush_handles(self.default_destination, self.route_destinations)
+
+
+def _open_jsonl_sink(sink: JsonlSink, stack: ExitStack) -> _JsonlSinkHandle:
+    default_destination, route_destinations = _open_jsonl_destinations(
+        sink.destinations, stack
+    )
+    return _JsonlSinkHandle(
+        sink=sink,
+        default_destination=default_destination,
+        route_destinations=route_destinations,
+    )
+
+
+def _run_stream_to_jsonl_sinks(
+    event_stream: EventStream,
+    sinks: Sequence[JsonlSink],
+    *,
+    max_events: Optional[int],
+    events_per_second: Optional[float],
+    progress: Optional[ProgressReporter],
+    progress_interval_seconds: float,
+) -> StreamResult:
+    if max_events is not None and max_events < 0:
+        raise ValueError("max_events must be non-negative or None")
+    if events_per_second is not None and events_per_second <= 0:
+        raise ValueError("events_per_second must be greater than zero")
+    if progress_interval_seconds <= 0:
+        raise ValueError("progress_interval_seconds must be greater than zero")
+    if not sinks:
+        raise ValueError("configure at least one sink before starting a stream")
+
+    count = 0
+    interval = 1.0 / events_per_second if events_per_second else None
+    next_deadline = time.monotonic()
+    started_at = next_deadline
+    progress_tracker = _ProgressTracker(progress, progress_interval_seconds)
+
+    with ExitStack() as stack:
+        sink_handles = [_open_jsonl_sink(sink, stack) for sink in sinks]
+        try:
+            while max_events is None or count < max_events:
+                try:
+                    event = next(event_stream)
+                except StopIteration:
+                    break
+
+                source = event["envelope"]["source"]
+                count += 1
+                progress_tracker.record_event(source)
+
+                for sink_handle in sink_handles:
+                    sink_label = sink_handle.write(event, source)
+                    progress_tracker.record_sink(sink_label)
+
+                for sink_handle in sink_handles:
+                    if sink_handle.sink.flush_every and count % sink_handle.sink.flush_every == 0:
+                        sink_handle.flush()
+                progress_tracker.maybe_emit()
+
+                if interval is not None:
+                    next_deadline += interval
+                    sleep_seconds = next_deadline - time.monotonic()
+                    if sleep_seconds > 0:
+                        time.sleep(sleep_seconds)
+        finally:
+            for sink_handle in sink_handles:
+                sink_handle.flush()
+            progress_tracker.finish()
+
+    elapsed = max(time.monotonic() - started_at, 0.000_001)
+    return StreamResult(
+        events=count,
+        elapsed_seconds=elapsed,
+        events_per_second=count / elapsed,
+    )
+
+
 def _sink_stream_jsonl(
     event_stream: EventStream,
     destinations: JsonlDestination,
@@ -1020,56 +1246,20 @@ def _sink_stream_jsonl(
     progress: Optional[ProgressReporter],
     progress_interval_seconds: float,
 ) -> int:
-    if max_events is not None and max_events < 0:
-        raise ValueError("max_events must be non-negative or None")
-    if flush_every < 0:
-        raise ValueError("flush_every must be non-negative")
-    if events_per_second is not None and events_per_second <= 0:
-        raise ValueError("events_per_second must be greater than zero")
-    if progress_interval_seconds <= 0:
-        raise ValueError("progress_interval_seconds must be greater than zero")
-
-    count = 0
-    interval = 1.0 / events_per_second if events_per_second else None
-    next_deadline = time.monotonic()
-    progress_tracker = _ProgressTracker(progress, progress_interval_seconds)
-
-    with ExitStack() as stack:
-        default_destination, route_destinations = _open_jsonl_destinations(
-            destinations, stack
-        )
-        try:
-            while max_events is None or count < max_events:
-                try:
-                    event = next(event_stream)
-                except StopIteration:
-                    break
-
-                source = event["envelope"]["source"]
-                destination = default_destination or route_destinations.get(source)
-                if destination is None:
-                    raise ValueError(
-                        f"no JSONL destination configured for source {source}"
-                    )
-
-                row = event["payload"] if payload_only else event
-                destination.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
-                count += 1
-                progress_tracker.record(source, destination.label)
-
-                if flush_every and count % flush_every == 0:
-                    _flush_handles(default_destination, route_destinations)
-
-                if interval is not None:
-                    next_deadline += interval
-                    sleep_seconds = next_deadline - time.monotonic()
-                    if sleep_seconds > 0:
-                        time.sleep(sleep_seconds)
-        finally:
-            _flush_handles(default_destination, route_destinations)
-            progress_tracker.finish()
-
-    return count
+    sink = JsonlSink(
+        destinations=destinations,
+        record="payload" if payload_only else "event",
+        flush_every=flush_every,
+    )
+    result = _run_stream_to_jsonl_sinks(
+        event_stream,
+        [sink],
+        max_events=max_events,
+        events_per_second=events_per_second,
+        progress=progress,
+        progress_interval_seconds=progress_interval_seconds,
+    )
+    return result.events
 
 
 @dataclass(frozen=True)
@@ -1225,12 +1415,15 @@ __all__ = [
     "ErrorRate",
     "EventStream",
     "ExplicitActor",
+    "JsonlSink",
     "Population",
     "ProgressCounter",
     "ProgressReporter",
     "ProgressSnapshot",
     "Role",
     "ServiceProfile",
+    "StreamPipeline",
+    "StreamResult",
     "TimezoneWeight",
     "default_config",
     "generate",
