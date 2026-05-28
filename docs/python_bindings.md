@@ -41,6 +41,78 @@ okta_rows = seclog.payloads(sources=["okta"], max_events=100)
 Use `payloads` when loading raw records into source-specific tables. Use
 `generate` when downstream code needs normalized envelope metadata.
 
+## Use A TOML Config
+
+Every generation entry point accepts an existing seclog TOML config as either a
+path or a string.
+
+```python
+events = seclog.generate(
+    config_path="examples/all_sources.toml",
+    max_events=1000,
+)
+
+config = seclog.load_config("examples/all_sources.toml")
+```
+
+When `config_path` or `config_toml` is set, the TOML file is the source of
+truth. Do not also pass code-level source or population overrides.
+
+## Stream Continuously
+
+`seclog.stream` keeps one Rust generator alive and advances it event by event.
+Use this for long-running jobs so generation does not restart from the same seed
+on every batch.
+
+```python
+events = seclog.stream(config_path="examples/all_sources.toml")
+
+for event in events:
+    handle(event)
+```
+
+For batch consumers:
+
+```python
+events = seclog.stream(config_path="examples/all_sources.toml")
+
+for batch in events.batches(1000):
+    write_batch(batch)
+```
+
+## Sink To JSONL Destinations
+
+Write one continuous stream to a single destination:
+
+```python
+seclog.sink_jsonl(
+    "out/seclog/events.jsonl",
+    config_path="examples/all_sources.toml",
+    max_events=50_000,
+    payload_only=False,
+)
+```
+
+Or route source-native payloads to one destination per source:
+
+```python
+seclog.sink_jsonl(
+    {
+        "cloudtrail": "out/seclog/cloudtrail.jsonl",
+        "databricks_audit": "out/seclog/databricks_audit.jsonl",
+        "okta": "out/seclog/okta_system_log.jsonl",
+    },
+    config_path="examples/all_sources.toml",
+    max_events=None,
+    events_per_second=250,
+)
+```
+
+`max_events=None` runs until the configured source stream is exhausted or the
+process is stopped. Some configured sources are finite; for example selected
+Okta and Databricks audit baselines drain after their scheduled events are
+emitted.
+
 ## Customize The Shared Population
 
 ```python
@@ -134,8 +206,8 @@ still allowing source-specific overrides where needed.
 
 ## Scope
 
-The bindings currently expose in-memory generation and JSONL convenience
-writing. Durable sinks such as file output, Databricks volume uploads, and
-Zerobus remain CLI capabilities. The Okta generator is schema-faithful for the
-selected auth/session/app-access events it emits, but it is not a full
-implementation of Okta's event-type catalog.
+The bindings currently expose in-memory generation, persistent stream
+iteration, and local JSONL sinks. Managed file output, Databricks volume
+uploads, and Zerobus remain CLI capabilities. The Okta generator is
+schema-faithful for the selected auth/session/app-access events it emits, but
+it is not a full implementation of Okta's event-type catalog.

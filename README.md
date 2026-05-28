@@ -76,6 +76,29 @@ Generate source-native payloads only:
 okta_rows = seclog.payloads(sources=["okta"], max_events=100)
 ```
 
+Use an existing TOML generator config instead of code:
+```python
+events = seclog.generate(
+    config_path="examples/all_sources.toml",
+    max_events=1000,
+)
+```
+
+Run a persistent stream and route source-native payloads to per-source JSONL
+destinations:
+```python
+seclog.sink_jsonl(
+    {
+        "cloudtrail": "out/python/cloudtrail.jsonl",
+        "databricks_audit": "out/python/databricks_audit.jsonl",
+        "okta": "out/python/okta_system_log.jsonl",
+    },
+    config_path="examples/all_sources.toml",
+    max_events=None,
+    events_per_second=250,
+)
+```
+
 Customize the population without hand-authoring every identity:
 ```python
 population = seclog.Population(
