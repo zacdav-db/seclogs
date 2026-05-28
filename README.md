@@ -12,6 +12,7 @@ Data realism comes from actor-driven generation: each actor has a role or servic
 ## Documentation
 - Rustdoc is the primary reference and is published to GitHub Pages.
 - Build locally with `cargo doc --no-deps --package seclog`.
+- Python API usage is documented in `docs/python_bindings.md`.
 
 ## Getting started (end-to-end)
 1. Generate an actor population (Parquet):
@@ -51,6 +52,81 @@ To upload source-native files to a Unity Catalog volume through the Databricks F
 export DATABRICKS_TOKEN="..."
 cargo run --features databricks_volume --bin seclog -- gen --config examples/all_sources_volume.toml --max-events 100
 ```
+
+## Python API
+The Python package wraps the Rust generator for notebooks, tests, local data
+files, and Python pipelines. It can synthesize one shared identity population
+and emit independent CloudTrail, Databricks audit, and Okta System Log events
+from that population.
+
+Build the extension locally:
+```bash
+pip install -e .
+```
+
+Generate normalized events in memory:
+```python
+import seclog
+
+events = seclog.generate(max_events=500)
+first_event = events[0]
+```
+
+Generate source-native payloads only:
+```python
+okta_rows = seclog.payloads(sources=["okta"], max_events=100)
+```
+
+Use an existing TOML generator config instead of code:
+```python
+events = seclog.generate(
+    config_path="examples/all_sources.toml",
+    max_events=1000,
+)
+```
+
+Write helpers create files and require an explicit generation input. This keeps
+long-running writes from accidentally starting from an implicit default
+population. Write calls block until the requested events are written, the stream
+ends, or an error is raised:
+```python
+count = seclog.write_payloads_jsonl(
+    "out/python/okta_system_log.jsonl",
+    population=seclog.Population(size=1000, seed=42),
+    sources=["okta"],
+    max_events=10_000,
+    progress=True,
+)
+```
+`progress=True` renders an updating terminal view on stderr; callback-based
+progress is available for notebooks and applications.
+
+Run a persistent stream when a Python process needs to consume events
+incrementally:
+```python
+events = seclog.stream(config_path="examples/all_sources.toml")
+
+for batch in events.batches(1000):
+    write_batch(batch)
+```
+
+Customize the population without hand-authoring every identity:
+```python
+population = seclog.Population(
+    size=1000,
+    timezones=[
+        ("America/Los_Angeles", 0.45),
+        ("Europe/London", 0.35),
+        ("Asia/Singapore", 0.20),
+    ],
+)
+
+events = seclog.generate(population=population, max_events=10_000)
+identities = seclog.identities(population)
+```
+
+See `docs/python_bindings.md` for the full API guide, including explicit actor
+overrides, JSONL writing, and the current Python feature scope.
 
 ## CLI usage
 ### `seclog gen`
@@ -502,9 +578,10 @@ Each destination table uses the common seclog row shape:
 `time` must be a target table `TIMESTAMP` column and is emitted on the JSON path
 as epoch microseconds for Zerobus. `payload_json` preserves the exact
 CloudTrail, Databricks audit, or Okta payload. When an `actor_population` table
-route is present and the source configuration uses an `identity_registry_path`
-or `population_config_path`, `seclog gen` writes the identity population to that
-table before event generation. The actor population table uses `time`,
+route is present and the source configuration uses an `identity_registry_path`,
+`population_config_path`, or inline `population_config`, `seclog gen` writes the
+identity population to that table before event generation. The actor population
+table uses `time`,
 `registry_name`, `actor_id`, `actor_kind`, identity fields,
 `normal_countries_regions_json`, `tags_json`, `aws_principals_json`,
 `identity_json`, `run_id`, and `generated_at`.
