@@ -4,27 +4,32 @@ The public API is intentionally small:
 
     import seclog
 
-    events = seclog.generate(max_events=1000)
-    okta_payloads = seclog.payloads(sources=["okta"], max_events=100)
     population = seclog.Population(size=250, seed=42)
-    identities = seclog.identities(population)
-    count = seclog.write_payloads_jsonl(
-        "out/okta.jsonl",
-        population=population,
-        sources=["okta"],
-        max_events=10_000,
+    result = (
+        seclog.stream(sources=["okta"], population=population)
+        .route(okta=seclog.jsonl("out/okta.jsonl"))
+        .to_jsonl("out/events.jsonl", record="event")
+        .start(max_events=10_000, progress=True)
     )
 
-Generated events are dictionaries with the normalized seclog envelope and the
-source-native payload. Write APIs require an explicit generation input such as
-``population`` or ``config_path``.
+    events = seclog.generate(max_events=1000)
+    okta_payloads = seclog.payloads(sources=["okta"], max_events=100)
+    identities = seclog.identities(population)
+
+Generated streams write to explicit sinks. In-memory generation returns
+dictionaries with the normalized seclog envelope and the source-native payload.
+Write APIs require an explicit generation input such as ``population`` or
+``config_path``.
 """
 
 from __future__ import annotations
 
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+import io
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -38,6 +43,7 @@ from typing import (
     Sequence,
     Union,
 )
+import uuid
 
 try:
     from . import _native
@@ -55,6 +61,167 @@ DEFAULT_TIMEZONES = (
     ("Asia/Singapore", 0.20),
 )
 JsonlDestination = Union[str, Path, Mapping[str, Union[str, Path]]]
+Sources = Optional[tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class JsonlSink:
+    """JSONL sink for source-native payloads or normalized seclog events."""
+
+    destinations: JsonlDestination
+    record: str = "payload"
+    flush_every: int = 1000
+    sources: Sources = None
+
+    @classmethod
+    def payloads(
+        cls,
+        destinations: JsonlDestination,
+        *,
+        flush_every: int = 1000,
+    ) -> "JsonlSink":
+        """Write source-native payload rows."""
+
+        return cls(destinations=destinations, record="payload", flush_every=flush_every)
+
+    @classmethod
+    def events(
+        cls,
+        destinations: JsonlDestination,
+        *,
+        flush_every: int = 1000,
+    ) -> "JsonlSink":
+        """Write normalized rows with envelope and payload."""
+
+        return cls(destinations=destinations, record="event", flush_every=flush_every)
+
+    def __post_init__(self) -> None:
+        _validate_jsonl_record(self.record)
+        if self.flush_every < 0:
+            raise ValueError("flush_every must be non-negative")
+        _validate_sources(self.sources)
+
+
+@dataclass(frozen=True)
+class DatabricksVolumeSink:
+    """Unity Catalog volume sink using the Databricks SDK Files API."""
+
+    volume_path: str
+    workspace_client: Any
+    record: str = "payload"
+    flush_every: int = 1000
+    sources: Sources = None
+    overwrite: bool = False
+    file_prefix: str = "part"
+
+    def __post_init__(self) -> None:
+        _validate_jsonl_record(self.record)
+        _validate_sources(self.sources)
+        if self.flush_every < 0:
+            raise ValueError("flush_every must be non-negative")
+        if not self.volume_path.strip():
+            raise ValueError("volume_path must be non-empty")
+        if not self.file_prefix.strip():
+            raise ValueError("file_prefix must be non-empty")
+
+
+@dataclass(frozen=True)
+class ZerobusSink:
+    """Databricks Zerobus sink using the Zerobus Python SDK JSON path."""
+
+    table: str
+    workspace_client: Any
+    sources: Sources = None
+    region: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    client_id_env: str = "DATABRICKS_CLIENT_ID"
+    client_secret_env: str = "DATABRICKS_CLIENT_SECRET"
+    flush_every: int = 1000
+
+    def __post_init__(self) -> None:
+        _validate_sources(self.sources)
+        if not self.table.strip():
+            raise ValueError("table must be non-empty")
+        if self.flush_every < 0:
+            raise ValueError("flush_every must be non-negative")
+
+
+Sink = Union[JsonlSink, DatabricksVolumeSink, ZerobusSink]
+RouteValue = Union[Sink, Sequence[Sink]]
+
+
+def jsonl(
+    path: Union[str, Path],
+    *,
+    record: str = "payload",
+    flush_every: int = 1000,
+) -> JsonlSink:
+    """Create a JSONL sink for use in ``stream(...).route(...)``."""
+
+    return JsonlSink(destinations=path, record=record, flush_every=flush_every)
+
+
+def volume(
+    volume_path: str,
+    *,
+    workspace_client: Any,
+    record: str = "payload",
+    flush_every: int = 1000,
+    overwrite: bool = False,
+    file_prefix: str = "part",
+) -> DatabricksVolumeSink:
+    """Create a Unity Catalog volume sink for use in ``stream(...).route(...)``."""
+
+    return DatabricksVolumeSink(
+        volume_path=volume_path,
+        workspace_client=workspace_client,
+        record=record,
+        flush_every=flush_every,
+        overwrite=overwrite,
+        file_prefix=file_prefix,
+    )
+
+
+def zerobus(
+    table: str,
+    *,
+    workspace_client: Any,
+    region: Optional[str] = None,
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    client_id_env: str = "DATABRICKS_CLIENT_ID",
+    client_secret_env: str = "DATABRICKS_CLIENT_SECRET",
+    flush_every: int = 1000,
+) -> ZerobusSink:
+    """Create a Zerobus sink for use in ``stream(...).route(...)``."""
+
+    return ZerobusSink(
+        table=table,
+        workspace_client=workspace_client,
+        region=region,
+        client_id=client_id,
+        client_secret=client_secret,
+        client_id_env=client_id_env,
+        client_secret_env=client_secret_env,
+        flush_every=flush_every,
+    )
+
+
+@dataclass(frozen=True)
+class StreamResult:
+    """Result returned after a stream finishes writing to sinks."""
+
+    events: int
+    elapsed_seconds: float
+    events_per_second: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "events": self.events,
+            "elapsed_seconds": self.elapsed_seconds,
+            "events_per_second": self.events_per_second,
+        }
 
 
 @dataclass(frozen=True)
@@ -409,12 +576,359 @@ class EventStream:
     ) -> int:
         """Write this stream to one JSONL destination or per-source destinations."""
 
-        return _sink_stream_jsonl(
-            self,
+        result = self.to_jsonl(
             destinations,
-            max_events=max_events,
-            payload_only=payload_only,
+            record="payload" if payload_only else "event",
             flush_every=flush_every,
+        ).start(
+            max_events=max_events,
+            events_per_second=events_per_second,
+            progress=progress,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+        return result.events
+
+    def to(self, *sinks: Sink) -> "StreamPipeline":
+        """Attach one or more sinks to this stream."""
+
+        return StreamPipeline(self, sinks)
+
+    def route(
+        self,
+        routes: Optional[Mapping[str, RouteValue]] = None,
+        **source_routes: RouteValue,
+    ) -> "StreamPipeline":
+        """Attach sinks by source in one route map."""
+
+        return StreamPipeline(self, _route_sinks(routes, source_routes))
+
+    def source(self, *sources: str) -> "SourceRoute":
+        """Select source events before attaching one or more sinks."""
+
+        return SourceRoute(self, (), _normalize_sources(sources))
+
+    def to_jsonl(
+        self,
+        destinations: JsonlDestination,
+        *,
+        record: str = "payload",
+        flush_every: int = 1000,
+    ) -> "StreamPipeline":
+        """Attach a JSONL sink to this stream."""
+
+        return self.to(
+            JsonlSink(destinations=destinations, record=record, flush_every=flush_every)
+        )
+
+    def to_jsonl_by_source(
+        self,
+        destinations: Optional[Mapping[str, Union[str, Path]]] = None,
+        *,
+        record: str = "payload",
+        flush_every: int = 1000,
+        **source_destinations: Union[str, Path],
+    ) -> "StreamPipeline":
+        """Attach a JSONL sink with explicit source-to-path routes."""
+
+        return self.to_jsonl(
+            _source_route_destinations(destinations, source_destinations),
+            record=record,
+            flush_every=flush_every,
+        )
+
+    def to_volume(
+        self,
+        volume_path: str,
+        *,
+        workspace_client: Any,
+        record: str = "payload",
+        flush_every: int = 1000,
+        overwrite: bool = False,
+        file_prefix: str = "part",
+    ) -> "StreamPipeline":
+        """Attach a Databricks volume sink for all stream sources."""
+
+        return self.to(
+            DatabricksVolumeSink(
+                volume_path=volume_path,
+                workspace_client=workspace_client,
+                record=record,
+                flush_every=flush_every,
+                overwrite=overwrite,
+                file_prefix=file_prefix,
+            )
+        )
+
+    def to_zerobus(
+        self,
+        table: str,
+        *,
+        workspace_client: Any,
+        region: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        client_id_env: str = "DATABRICKS_CLIENT_ID",
+        client_secret_env: str = "DATABRICKS_CLIENT_SECRET",
+        flush_every: int = 1000,
+    ) -> "StreamPipeline":
+        """Attach a Databricks Zerobus sink for all stream sources."""
+
+        return self.to(
+            ZerobusSink(
+                table=table,
+                workspace_client=workspace_client,
+                region=region,
+                client_id=client_id,
+                client_secret=client_secret,
+                client_id_env=client_id_env,
+                client_secret_env=client_secret_env,
+                flush_every=flush_every,
+            )
+        )
+
+
+class StreamPipeline:
+    """Configured stream plus its output sinks."""
+
+    def __init__(self, event_stream: EventStream, sinks: Sequence[Sink]) -> None:
+        if not sinks:
+            raise ValueError("configure at least one sink before starting a stream")
+        self._event_stream = event_stream
+        self._sinks = tuple(sinks)
+
+    def to(self, *sinks: Sink) -> "StreamPipeline":
+        """Attach additional sinks to this stream."""
+
+        if not sinks:
+            raise ValueError("configure at least one sink")
+        return StreamPipeline(self._event_stream, (*self._sinks, *sinks))
+
+    def route(
+        self,
+        routes: Optional[Mapping[str, RouteValue]] = None,
+        **source_routes: RouteValue,
+    ) -> "StreamPipeline":
+        """Attach additional sinks by source in one route map."""
+
+        return self.to(*_route_sinks(routes, source_routes))
+
+    def source(self, *sources: str) -> "SourceRoute":
+        """Select source events before attaching additional sinks."""
+
+        return SourceRoute(self._event_stream, self._sinks, _normalize_sources(sources))
+
+    def to_jsonl(
+        self,
+        destinations: JsonlDestination,
+        *,
+        record: str = "payload",
+        flush_every: int = 1000,
+    ) -> "StreamPipeline":
+        """Attach an additional JSONL sink to this stream."""
+
+        return self.to(
+            JsonlSink(destinations=destinations, record=record, flush_every=flush_every)
+        )
+
+    def to_jsonl_by_source(
+        self,
+        destinations: Optional[Mapping[str, Union[str, Path]]] = None,
+        *,
+        record: str = "payload",
+        flush_every: int = 1000,
+        **source_destinations: Union[str, Path],
+    ) -> "StreamPipeline":
+        """Attach an additional JSONL sink with explicit source-to-path routes."""
+
+        return self.to_jsonl(
+            _source_route_destinations(destinations, source_destinations),
+            record=record,
+            flush_every=flush_every,
+        )
+
+    def to_volume(
+        self,
+        volume_path: str,
+        *,
+        workspace_client: Any,
+        record: str = "payload",
+        flush_every: int = 1000,
+        overwrite: bool = False,
+        file_prefix: str = "part",
+    ) -> "StreamPipeline":
+        """Attach an additional Databricks volume sink for all sources."""
+
+        return self.to(
+            DatabricksVolumeSink(
+                volume_path=volume_path,
+                workspace_client=workspace_client,
+                record=record,
+                flush_every=flush_every,
+                overwrite=overwrite,
+                file_prefix=file_prefix,
+            )
+        )
+
+    def to_zerobus(
+        self,
+        table: str,
+        *,
+        workspace_client: Any,
+        region: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        client_id_env: str = "DATABRICKS_CLIENT_ID",
+        client_secret_env: str = "DATABRICKS_CLIENT_SECRET",
+        flush_every: int = 1000,
+    ) -> "StreamPipeline":
+        """Attach an additional Databricks Zerobus sink for all sources."""
+
+        return self.to(
+            ZerobusSink(
+                table=table,
+                workspace_client=workspace_client,
+                region=region,
+                client_id=client_id,
+                client_secret=client_secret,
+                client_id_env=client_id_env,
+                client_secret_env=client_secret_env,
+                flush_every=flush_every,
+            )
+        )
+
+    def start(
+        self,
+        *,
+        max_events: Optional[int] = None,
+        events_per_second: Optional[float] = None,
+        progress: Optional[ProgressReporter] = None,
+        progress_interval_seconds: float = 5.0,
+    ) -> StreamResult:
+        """Start generation and write events to the configured sinks.
+
+        This call is blocking. It returns when ``max_events`` is reached, the
+        configured sources are exhausted, or an error is raised.
+        """
+
+        return _run_stream_to_sinks(
+            self._event_stream,
+            self._sinks,
+            max_events=max_events,
+            events_per_second=events_per_second,
+            progress=progress,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+
+
+class SourceRoute:
+    """Source-scoped sink builder for explicit routing."""
+
+    def __init__(
+        self,
+        event_stream: EventStream,
+        sinks: Sequence[Sink],
+        sources: tuple[str, ...],
+    ) -> None:
+        self._event_stream = event_stream
+        self._sinks = tuple(sinks)
+        self._sources = sources
+
+    def source(self, *sources: str) -> "SourceRoute":
+        """Select a different source route while keeping configured sinks."""
+
+        return SourceRoute(self._event_stream, self._sinks, _normalize_sources(sources))
+
+    def to(self, *sinks: Sink) -> "SourceRoute":
+        """Attach sinks to this source route."""
+
+        if not sinks:
+            raise ValueError("configure at least one sink")
+        return SourceRoute(self._event_stream, (*self._sinks, *sinks), self._sources)
+
+    def to_jsonl(
+        self,
+        path: Union[str, Path],
+        *,
+        record: str = "payload",
+        flush_every: int = 1000,
+    ) -> "SourceRoute":
+        """Route the selected source events to a JSONL file."""
+
+        return self.to(
+            JsonlSink(
+                destinations=path,
+                record=record,
+                flush_every=flush_every,
+                sources=self._sources,
+            )
+        )
+
+    def to_volume(
+        self,
+        volume_path: str,
+        *,
+        workspace_client: Any,
+        record: str = "payload",
+        flush_every: int = 1000,
+        overwrite: bool = False,
+        file_prefix: str = "part",
+    ) -> "SourceRoute":
+        """Route the selected source events to a Databricks volume."""
+
+        return self.to(
+            DatabricksVolumeSink(
+                volume_path=volume_path,
+                workspace_client=workspace_client,
+                record=record,
+                flush_every=flush_every,
+                sources=self._sources,
+                overwrite=overwrite,
+                file_prefix=file_prefix,
+            )
+        )
+
+    def to_zerobus(
+        self,
+        table: str,
+        *,
+        workspace_client: Any,
+        region: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        client_id_env: str = "DATABRICKS_CLIENT_ID",
+        client_secret_env: str = "DATABRICKS_CLIENT_SECRET",
+        flush_every: int = 1000,
+    ) -> "SourceRoute":
+        """Route the selected source events to a Databricks Zerobus table."""
+
+        return self.to(
+            ZerobusSink(
+                table=table,
+                workspace_client=workspace_client,
+                sources=self._sources,
+                region=region,
+                client_id=client_id,
+                client_secret=client_secret,
+                client_id_env=client_id_env,
+                client_secret_env=client_secret_env,
+                flush_every=flush_every,
+            )
+        )
+
+    def start(
+        self,
+        *,
+        max_events: Optional[int] = None,
+        events_per_second: Optional[float] = None,
+        progress: Optional[ProgressReporter] = None,
+        progress_interval_seconds: float = 5.0,
+    ) -> StreamResult:
+        """Start generation and write events to the configured source routes."""
+
+        return _run_stream_to_sinks(
+            self._event_stream,
+            self._sinks,
+            max_events=max_events,
             events_per_second=events_per_second,
             progress=progress,
             progress_interval_seconds=progress_interval_seconds,
@@ -823,20 +1337,33 @@ class _ProgressTracker:
         self._interval_source_events: dict[str, int] = {}
         self._interval_sink_events: dict[str, int] = {}
 
-    def record(self, source: str, sink: str) -> None:
+    def record_event(self, source: str) -> None:
         if self._reporter is None:
             return
 
         self._events += 1
         self._interval_events += 1
         _increment_counter(self._source_events, source)
-        _increment_counter(self._sink_events, sink)
         _increment_counter(self._interval_source_events, source)
+
+    def record_sink(self, sink: str) -> None:
+        if self._reporter is None:
+            return
+
+        _increment_counter(self._sink_events, sink)
         _increment_counter(self._interval_sink_events, sink)
 
+    def maybe_emit(self) -> None:
+        if self._reporter is None:
+            return
         now = time.monotonic()
         if now - self._last_report_at >= self._progress_interval_seconds:
             self._emit(now, finished=False)
+
+    def record(self, source: str, sink: str) -> None:
+        self.record_event(source)
+        self.record_sink(sink)
+        self.maybe_emit()
 
     def finish(self) -> None:
         if self._reporter is None:
@@ -1009,6 +1536,554 @@ def _shorten_middle(value: str, width: int) -> str:
     return f"{value[:prefix]}...{value[-suffix:]}"
 
 
+def _validate_jsonl_record(record: str) -> None:
+    if record not in {"payload", "event"}:
+        raise ValueError("JSONL sink record must be 'payload' or 'event'")
+
+
+def _jsonl_record_payload_only(record: str) -> bool:
+    _validate_jsonl_record(record)
+    return record == "payload"
+
+
+def _event_record(event: Mapping[str, Any], record: str) -> Any:
+    return event["payload"] if _jsonl_record_payload_only(record) else event
+
+
+def _validate_sources(sources: Sources) -> None:
+    if sources is None:
+        return
+    if not sources:
+        raise ValueError("source routes must include at least one source")
+    for source in sources:
+        _normalize_source(source)
+
+
+def _normalize_sources(sources: Sequence[str]) -> tuple[str, ...]:
+    if not sources:
+        raise ValueError("select at least one source")
+    normalized: list[str] = []
+    for source in sources:
+        value = _normalize_source(source)
+        if value not in normalized:
+            normalized.append(value)
+    return tuple(normalized)
+
+
+def _matches_sources(sources: Sources, source: str) -> bool:
+    if sources is None:
+        return True
+    return _normalize_source(source) in {_normalize_source(item) for item in sources}
+
+
+def _route_sinks(
+    routes: Optional[Mapping[str, RouteValue]],
+    source_routes: Mapping[str, RouteValue],
+) -> tuple[Sink, ...]:
+    merged: dict[str, RouteValue] = {}
+    if routes is not None:
+        merged.update(routes)
+    merged.update(source_routes)
+    if not merged:
+        raise ValueError("configure at least one source route")
+
+    routed: list[Sink] = []
+    for source, value in merged.items():
+        sources = (_normalize_source(source),)
+        for sink in _route_value_sinks(value):
+            routed.append(_sink_with_sources(sink, sources))
+    return tuple(routed)
+
+
+def _route_value_sinks(value: RouteValue) -> tuple[Sink, ...]:
+    if _is_sink(value):
+        return (value,)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        sinks = tuple(value)
+        if not sinks:
+            raise ValueError("source route must include at least one sink")
+        for sink in sinks:
+            if not _is_sink(sink):
+                raise TypeError(
+                    "source route values must be seclog.jsonl(...), "
+                    "seclog.volume(...), seclog.zerobus(...), or a list of them"
+                )
+        return sinks
+    raise TypeError(
+        "source route values must be seclog.jsonl(...), seclog.volume(...), "
+        "seclog.zerobus(...), or a list of them"
+    )
+
+
+def _is_sink(value: object) -> bool:
+    return isinstance(value, (JsonlSink, DatabricksVolumeSink, ZerobusSink))
+
+
+def _sink_with_sources(sink: Sink, sources: tuple[str, ...]) -> Sink:
+    return replace(sink, sources=sources)
+
+
+def _source_route_destinations(
+    destinations: Optional[Mapping[str, Union[str, Path]]],
+    source_destinations: Mapping[str, Union[str, Path]],
+) -> dict[str, Union[str, Path]]:
+    routes: dict[str, Union[str, Path]] = {}
+    if destinations is not None:
+        routes.update(destinations)
+    routes.update(source_destinations)
+    if not routes:
+        raise ValueError("configure at least one source route")
+    return routes
+
+
+def _normalize_volume_path(path: str) -> str:
+    value = path.strip()
+    if value.startswith("dbfs:/Volumes/"):
+        value = value[len("dbfs:"):]
+    value = value.rstrip("/")
+    parts = value.split("/")
+    if len(parts) < 5 or parts[:2] != ["", "Volumes"]:
+        raise ValueError(
+            "volume_path must start with /Volumes/<catalog>/<schema>/<volume> "
+            "or dbfs:/Volumes/..."
+        )
+    return value
+
+
+def _event_to_zerobus_row(
+    event: Mapping[str, Any],
+    run_id: str,
+    generated_at: datetime,
+) -> dict[str, Any]:
+    envelope = event["envelope"]
+    payload = event["payload"]
+    timestamp = str(envelope.get("timestamp", ""))
+    parsed_time = _parse_rfc3339(timestamp)
+    actor = envelope.get("actor") or {}
+    target = envelope.get("target") or {}
+
+    return {
+        "time": (
+            int(parsed_time.timestamp() * 1_000_000)
+            if parsed_time is not None
+            else None
+        ),
+        "event_time": timestamp,
+        "event_date": parsed_time.strftime("%Y-%m-%d") if parsed_time else None,
+        "event_ts_ms": (
+            int(parsed_time.timestamp() * 1_000)
+            if parsed_time is not None
+            else None
+        ),
+        "source": envelope.get("source"),
+        "event_type": envelope.get("event_type"),
+        "actor_id": actor.get("id"),
+        "actor_kind": actor.get("kind"),
+        "actor_name": actor.get("name"),
+        "target_id": target.get("id"),
+        "target_kind": target.get("kind"),
+        "target_name": target.get("name"),
+        "outcome": envelope.get("outcome"),
+        "ip": envelope.get("ip"),
+        "user_agent": envelope.get("user_agent"),
+        "session_id": envelope.get("session_id"),
+        "tenant_id": envelope.get("tenant_id"),
+        "envelope_json": json.dumps(envelope, separators=(",", ":")),
+        "payload_json": json.dumps(payload, separators=(",", ":")),
+        "run_id": run_id,
+        "generated_at": _format_datetime_utc(generated_at),
+    }
+
+
+def _parse_rfc3339(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_datetime_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _workspace_config_attr(workspace_client: Any, name: str) -> Optional[str]:
+    config = getattr(workspace_client, "config", None)
+    value = getattr(config, name, None) if config is not None else None
+    return str(value) if value else None
+
+
+def _workspace_host(workspace_client: Any) -> str:
+    host = _workspace_config_attr(workspace_client, "host")
+    if not host:
+        raise ValueError("workspace_client.config.host is required")
+    return host.rstrip("/")
+
+
+def _workspace_id(workspace_client: Any) -> str:
+    get_workspace_id = getattr(workspace_client, "get_workspace_id", None)
+    if callable(get_workspace_id):
+        workspace_id = get_workspace_id()
+        if workspace_id:
+            return str(workspace_id)
+    workspace_id = _workspace_config_attr(workspace_client, "workspace_id")
+    if workspace_id:
+        return workspace_id
+    raise ValueError("workspace_client must provide get_workspace_id() or config.workspace_id")
+
+
+def _infer_zerobus_endpoint(
+    workspace_client: Any,
+    region: Optional[str],
+) -> str:
+    workspace_id = _workspace_id(workspace_client)
+    workspace_region = region or _infer_workspace_region(workspace_client, workspace_id)
+    host = _workspace_host(workspace_client)
+    if host.endswith(".azuredatabricks.net"):
+        suffix = "azuredatabricks.net"
+    elif host.endswith(".gcp.databricks.com"):
+        suffix = "gcp.databricks.com"
+    else:
+        suffix = "cloud.databricks.com"
+    return f"https://{workspace_id}.zerobus.{workspace_region}.{suffix}"
+
+
+def _infer_workspace_region(workspace_client: Any, workspace_id: str) -> str:
+    for attr in ("region", "aws_region", "location"):
+        value = _workspace_config_attr(workspace_client, attr)
+        if value:
+            return value
+
+    account_id = _workspace_config_attr(workspace_client, "account_id")
+    if account_id:
+        try:
+            from databricks.sdk import AccountClient  # type: ignore[import-not-found]
+
+            account_client = AccountClient(account_id=account_id)
+            workspace = account_client.workspaces.get(workspace_id=int(workspace_id))
+            for attr in ("aws_region", "location", "region"):
+                value = getattr(workspace, attr, None)
+                if value:
+                    return str(value)
+        except Exception:
+            pass
+
+    raise ValueError(
+        "could not infer Databricks workspace region for Zerobus; pass region="
+    )
+
+
+def _resolve_secret(
+    *,
+    explicit: Optional[str],
+    config: Optional[str],
+    env_name: str,
+    label: str,
+) -> str:
+    value = explicit or config or os.environ.get(env_name)
+    if value:
+        return value
+    raise ValueError(
+        f"{label} is required; set it on the workspace client or in {env_name}"
+    )
+
+
+@dataclass(frozen=True)
+class _JsonlSinkHandle:
+    sink: JsonlSink
+    default_destination: Optional["_JsonlDestination"]
+    route_destinations: Mapping[str, "_JsonlDestination"]
+
+    def write(self, event: Mapping[str, Any], source: str) -> Optional[str]:
+        if not _matches_sources(self.sink.sources, source):
+            return None
+        destination = self.default_destination or self.route_destinations.get(source)
+        if destination is None:
+            return None
+
+        row = _event_record(event, self.sink.record)
+        destination.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        return destination.label
+
+    def flush(self) -> None:
+        _flush_handles(self.default_destination, self.route_destinations)
+
+
+def _open_jsonl_sink(sink: JsonlSink, stack: ExitStack) -> _JsonlSinkHandle:
+    default_destination, route_destinations = _open_jsonl_destinations(
+        sink.destinations, stack
+    )
+    return _JsonlSinkHandle(
+        sink=sink,
+        default_destination=default_destination,
+        route_destinations=route_destinations,
+    )
+
+
+@dataclass
+class _DatabricksVolumeSinkHandle:
+    sink: DatabricksVolumeSink
+    base_path: str
+    run_id: str
+    buffers: dict[str, list[str]] = field(default_factory=dict)
+    counters: dict[str, int] = field(default_factory=dict)
+
+    def write(self, event: Mapping[str, Any], source: str) -> Optional[str]:
+        if not _matches_sources(self.sink.sources, source):
+            return None
+
+        row = _event_record(event, self.sink.record)
+        self.buffers.setdefault(source, []).append(
+            json.dumps(row, separators=(",", ":")) + "\n"
+        )
+        if self.sink.flush_every and len(self.buffers[source]) >= self.sink.flush_every:
+            self._upload_source(source)
+        return self._label(source)
+
+    def flush(self) -> None:
+        for source in list(self.buffers):
+            self._upload_source(source)
+
+    def close(self) -> None:
+        self.flush()
+
+    def _upload_source(self, source: str) -> None:
+        rows = self.buffers.get(source)
+        if not rows:
+            return
+
+        counter = self.counters.get(source, 0)
+        self.counters[source] = counter + 1
+        directory = f"{self.base_path}/source={source}/run_id={self.run_id}"
+        file_path = f"{directory}/{self.sink.file_prefix}-{counter:06d}.jsonl"
+        payload = "".join(rows).encode("utf-8")
+        files = getattr(self.sink.workspace_client, "files", None)
+        if files is None:
+            raise ValueError("workspace_client must expose a files API")
+        files.create_directory(directory)
+        files.upload(file_path, io.BytesIO(payload), overwrite=self.sink.overwrite)
+        rows.clear()
+
+    def _label(self, source: str) -> str:
+        return f"{self.base_path}/source={source}"
+
+
+def _open_databricks_volume_sink(
+    sink: DatabricksVolumeSink,
+    stack: ExitStack,
+    run_id: str,
+) -> _DatabricksVolumeSinkHandle:
+    handle = _DatabricksVolumeSinkHandle(
+        sink=sink,
+        base_path=_normalize_volume_path(sink.volume_path),
+        run_id=run_id,
+    )
+    stack.callback(handle.close)
+    return handle
+
+
+@dataclass
+class _ZerobusSinkHandle:
+    sink: ZerobusSink
+    stream: Any
+    run_id: str
+    generated_at: datetime
+    acks: list[Any] = field(default_factory=list)
+
+    def write(self, event: Mapping[str, Any], source: str) -> Optional[str]:
+        if not _matches_sources(self.sink.sources, source):
+            return None
+
+        row = _event_to_zerobus_row(event, self.run_id, self.generated_at)
+        ack = self.stream.ingest_record(row)
+        self.acks.append(ack)
+        if self.sink.flush_every and len(self.acks) >= self.sink.flush_every:
+            self.flush()
+        return f"zerobus:{self.sink.table}"
+
+    def flush(self) -> None:
+        while self.acks:
+            ack = self.acks.pop(0)
+            wait_for_ack = getattr(ack, "wait_for_ack", None)
+            if callable(wait_for_ack):
+                wait_for_ack()
+
+    def close(self) -> None:
+        self.flush()
+        close = getattr(self.stream, "close", None)
+        if callable(close):
+            close()
+
+
+def _open_zerobus_sink(
+    sink: ZerobusSink,
+    stack: ExitStack,
+    run_id: str,
+    generated_at: datetime,
+) -> _ZerobusSinkHandle:
+    try:
+        from zerobus.sdk.shared import (  # type: ignore[import-not-found]
+            RecordType,
+            StreamConfigurationOptions,
+            TableProperties,
+        )
+        from zerobus.sdk.sync import ZerobusSdk  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError(
+            "Zerobus sinks require `pip install databricks-zerobus-ingest-sdk`"
+        ) from exc
+
+    endpoint = _infer_zerobus_endpoint(sink.workspace_client, sink.region)
+    workspace_url = _workspace_host(sink.workspace_client)
+    client_id = _resolve_secret(
+        explicit=sink.client_id,
+        config=_workspace_config_attr(sink.workspace_client, "client_id"),
+        env_name=sink.client_id_env,
+        label="zerobus client id",
+    )
+    client_secret = _resolve_secret(
+        explicit=sink.client_secret,
+        config=_workspace_config_attr(sink.workspace_client, "client_secret"),
+        env_name=sink.client_secret_env,
+        label="zerobus client secret",
+    )
+    sdk = ZerobusSdk(endpoint, workspace_url)
+    options = StreamConfigurationOptions(record_type=RecordType.JSON)
+    stream = sdk.create_stream(
+        client_id,
+        client_secret,
+        TableProperties(sink.table),
+        options,
+    )
+    handle = _ZerobusSinkHandle(
+        sink=sink,
+        stream=stream,
+        run_id=run_id,
+        generated_at=generated_at,
+    )
+    stack.callback(handle.close)
+    return handle
+
+
+def _open_sink(
+    sink: Sink,
+    stack: ExitStack,
+    run_id: str,
+    generated_at: datetime,
+) -> Any:
+    if isinstance(sink, JsonlSink):
+        return _open_jsonl_sink(sink, stack)
+    if isinstance(sink, DatabricksVolumeSink):
+        return _open_databricks_volume_sink(sink, stack, run_id)
+    if isinstance(sink, ZerobusSink):
+        return _open_zerobus_sink(sink, stack, run_id, generated_at)
+    raise TypeError(f"unsupported sink: {type(sink).__name__}")
+
+
+def _sink_flush_every(sink: Sink) -> int:
+    return sink.flush_every
+
+
+def _run_stream_to_sinks(
+    event_stream: EventStream,
+    sinks: Sequence[Sink],
+    *,
+    max_events: Optional[int],
+    events_per_second: Optional[float],
+    progress: Optional[ProgressReporter],
+    progress_interval_seconds: float,
+) -> StreamResult:
+    if max_events is not None and max_events < 0:
+        raise ValueError("max_events must be non-negative or None")
+    if events_per_second is not None and events_per_second <= 0:
+        raise ValueError("events_per_second must be greater than zero")
+    if progress_interval_seconds <= 0:
+        raise ValueError("progress_interval_seconds must be greater than zero")
+    if not sinks:
+        raise ValueError("configure at least one sink before starting a stream")
+
+    count = 0
+    interval = 1.0 / events_per_second if events_per_second else None
+    next_deadline = time.monotonic()
+    started_at = next_deadline
+    progress_tracker = _ProgressTracker(progress, progress_interval_seconds)
+    run_id = f"seclog-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    generated_at = datetime.now(timezone.utc)
+
+    with ExitStack() as stack:
+        sink_handles = [
+            _open_sink(sink, stack, run_id, generated_at)
+            for sink in sinks
+        ]
+        try:
+            while max_events is None or count < max_events:
+                try:
+                    event = next(event_stream)
+                except StopIteration:
+                    break
+
+                source = event["envelope"]["source"]
+                count += 1
+                progress_tracker.record_event(source)
+
+                sink_count = 0
+                for sink_handle in sink_handles:
+                    sink_label = sink_handle.write(event, source)
+                    if sink_label is not None:
+                        sink_count += 1
+                        progress_tracker.record_sink(sink_label)
+                if sink_count == 0:
+                    raise ValueError(f"no sink configured for source {source}")
+
+                for sink_handle in sink_handles:
+                    flush_every = _sink_flush_every(sink_handle.sink)
+                    if flush_every and count % flush_every == 0:
+                        sink_handle.flush()
+                progress_tracker.maybe_emit()
+
+                if interval is not None:
+                    next_deadline += interval
+                    sleep_seconds = next_deadline - time.monotonic()
+                    if sleep_seconds > 0:
+                        time.sleep(sleep_seconds)
+        finally:
+            for sink_handle in sink_handles:
+                sink_handle.flush()
+            progress_tracker.finish()
+
+    elapsed = max(time.monotonic() - started_at, 0.000_001)
+    return StreamResult(
+        events=count,
+        elapsed_seconds=elapsed,
+        events_per_second=count / elapsed,
+    )
+
+
+def _run_stream_to_jsonl_sinks(
+    event_stream: EventStream,
+    sinks: Sequence[JsonlSink],
+    *,
+    max_events: Optional[int],
+    events_per_second: Optional[float],
+    progress: Optional[ProgressReporter],
+    progress_interval_seconds: float,
+) -> StreamResult:
+    return _run_stream_to_sinks(
+        event_stream,
+        sinks,
+        max_events=max_events,
+        events_per_second=events_per_second,
+        progress=progress,
+        progress_interval_seconds=progress_interval_seconds,
+    )
+
+
 def _sink_stream_jsonl(
     event_stream: EventStream,
     destinations: JsonlDestination,
@@ -1020,56 +2095,20 @@ def _sink_stream_jsonl(
     progress: Optional[ProgressReporter],
     progress_interval_seconds: float,
 ) -> int:
-    if max_events is not None and max_events < 0:
-        raise ValueError("max_events must be non-negative or None")
-    if flush_every < 0:
-        raise ValueError("flush_every must be non-negative")
-    if events_per_second is not None and events_per_second <= 0:
-        raise ValueError("events_per_second must be greater than zero")
-    if progress_interval_seconds <= 0:
-        raise ValueError("progress_interval_seconds must be greater than zero")
-
-    count = 0
-    interval = 1.0 / events_per_second if events_per_second else None
-    next_deadline = time.monotonic()
-    progress_tracker = _ProgressTracker(progress, progress_interval_seconds)
-
-    with ExitStack() as stack:
-        default_destination, route_destinations = _open_jsonl_destinations(
-            destinations, stack
-        )
-        try:
-            while max_events is None or count < max_events:
-                try:
-                    event = next(event_stream)
-                except StopIteration:
-                    break
-
-                source = event["envelope"]["source"]
-                destination = default_destination or route_destinations.get(source)
-                if destination is None:
-                    raise ValueError(
-                        f"no JSONL destination configured for source {source}"
-                    )
-
-                row = event["payload"] if payload_only else event
-                destination.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
-                count += 1
-                progress_tracker.record(source, destination.label)
-
-                if flush_every and count % flush_every == 0:
-                    _flush_handles(default_destination, route_destinations)
-
-                if interval is not None:
-                    next_deadline += interval
-                    sleep_seconds = next_deadline - time.monotonic()
-                    if sleep_seconds > 0:
-                        time.sleep(sleep_seconds)
-        finally:
-            _flush_handles(default_destination, route_destinations)
-            progress_tracker.finish()
-
-    return count
+    sink = JsonlSink(
+        destinations=destinations,
+        record="payload" if payload_only else "event",
+        flush_every=flush_every,
+    )
+    result = _run_stream_to_jsonl_sinks(
+        event_stream,
+        [sink],
+        max_events=max_events,
+        events_per_second=events_per_second,
+        progress=progress,
+        progress_interval_seconds=progress_interval_seconds,
+    )
+    return result.events
 
 
 @dataclass(frozen=True)
@@ -1086,6 +2125,8 @@ def _open_jsonl_destinations(
         route_handles = {}
         for source, path in destinations.items():
             key = _normalize_source(str(source))
+            if key in route_handles:
+                raise ValueError(f"duplicate JSONL destination for source {key}")
             route_handles[key] = _open_jsonl_path(path, stack)
         return None, route_handles
 
@@ -1222,27 +2263,36 @@ def _native_module() -> Any:
 __all__ = [
     "DEFAULT_SOURCES",
     "DEFAULT_TIMEZONES",
+    "DatabricksVolumeSink",
     "ErrorRate",
     "EventStream",
     "ExplicitActor",
+    "JsonlSink",
     "Population",
     "ProgressCounter",
     "ProgressReporter",
     "ProgressSnapshot",
     "Role",
     "ServiceProfile",
+    "SourceRoute",
+    "StreamPipeline",
+    "StreamResult",
     "TimezoneWeight",
+    "ZerobusSink",
     "default_config",
     "generate",
     "generate_from_config",
     "identities",
     "iter_events",
+    "jsonl",
     "load_config",
     "load_population",
     "payloads",
     "sink_jsonl",
     "stream",
+    "volume",
     "write_events_jsonl",
     "write_jsonl",
     "write_payloads_jsonl",
+    "zerobus",
 ]

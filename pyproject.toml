@@ -15,6 +15,12 @@ classifiers = [
   "Programming Language :: Rust",
 ]
 
+[project.optional-dependencies]
+databricks = [
+  "databricks-sdk>=0.72.0",
+  "databricks-zerobus-ingest-sdk",
+]
+
 [tool.maturin]
 features = ["python"]
 module-name = "seclog._native"

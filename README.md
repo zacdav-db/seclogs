@@ -75,50 +75,86 @@ Build the extension locally:
 pip install -e .
 ```
 
-Generate normalized events in memory:
+Install Databricks sink dependencies when Python streams should write to
+Zerobus or Unity Catalog volumes:
+```bash
+pip install -e ".[databricks]"
+```
+
+Start a stream from a TOML config and write source-native payloads to explicit
+sinks:
 ```python
 import seclog
 
+result = (
+    seclog.stream(config_path="examples/all_sources.toml")
+    .route(
+        cloudtrail=seclog.jsonl("out/python/cloudtrail.jsonl"),
+        databricks_audit=seclog.jsonl("out/python/databricks_audit.jsonl"),
+        okta=seclog.jsonl("out/python/okta_system_log.jsonl"),
+    )
+    .start(max_events=50_000, progress=True)
+)
+
+print(result.events)
+```
+
+Attach another sink by chaining another output before `start()`:
+```python
+result = (
+    seclog.stream(config_path="examples/all_sources.toml")
+    .route(
+        cloudtrail=seclog.jsonl("out/python/cloudtrail.jsonl"),
+        databricks_audit=seclog.jsonl("out/python/databricks_audit.jsonl"),
+        okta=seclog.jsonl("out/python/okta_system_log.jsonl"),
+    )
+    .to_jsonl("out/python/events.jsonl", record="event")
+    .start(max_events=50_000, progress=True)
+)
+```
+
+Route different sources to different sink types when the data flow is mixed:
+```python
+from databricks.sdk import WorkspaceClient
+import seclog
+
+workspace_client = WorkspaceClient()
+population = seclog.Population(size=1000, seed=42)
+
+result = (
+    seclog.stream(population=population, sources=["okta", "databricks_audit"])
+    .route(
+        okta=seclog.zerobus(
+            "lakewatch.bronze.okta_system_logs_unmapped",
+            workspace_client=workspace_client,
+        ),
+        databricks_audit=[
+            seclog.jsonl("out/python/databricks_audit.jsonl"),
+            seclog.volume(
+                "/Volumes/lakewatch/bronze/raw/seclog",
+                workspace_client=workspace_client,
+            ),
+        ],
+    )
+    .start(max_events=None, progress=True)
+)
+```
+
+Or define the population in Python and attach a single Okta sink:
+```python
+population = seclog.Population(size=1000, seed=42)
+
+result = (
+    seclog.stream(population=population, sources=["okta"])
+    .to_jsonl("out/python/okta_system_log.jsonl")
+    .start(max_events=10_000, progress=True)
+)
+```
+
+Use in-memory generation only for finite samples:
+```python
 events = seclog.generate(max_events=500)
-first_event = events[0]
-```
-
-Generate source-native payloads only:
-```python
 okta_rows = seclog.payloads(sources=["okta"], max_events=100)
-```
-
-Use an existing TOML generator config instead of code:
-```python
-events = seclog.generate(
-    config_path="examples/all_sources.toml",
-    max_events=1000,
-)
-```
-
-Write helpers create files and require an explicit generation input. This keeps
-long-running writes from accidentally starting from an implicit default
-population. Write calls block until the requested events are written, the stream
-ends, or an error is raised:
-```python
-count = seclog.write_payloads_jsonl(
-    "out/python/okta_system_log.jsonl",
-    population=seclog.Population(size=1000, seed=42),
-    sources=["okta"],
-    max_events=10_000,
-    progress=True,
-)
-```
-`progress=True` renders an updating terminal view on stderr; callback-based
-progress is available for notebooks and applications.
-
-Run a persistent stream when a Python process needs to consume events
-incrementally:
-```python
-events = seclog.stream(config_path="examples/all_sources.toml")
-
-for batch in events.batches(1000):
-    write_batch(batch)
 ```
 
 Customize the population without hand-authoring every identity:
@@ -132,12 +168,23 @@ population = seclog.Population(
     ],
 )
 
-events = seclog.generate(population=population, max_events=10_000)
+result = (
+    seclog.stream(
+        population=population,
+        sources=["cloudtrail", "databricks_audit", "okta"],
+    )
+    .route(
+        cloudtrail=seclog.jsonl("out/python/cloudtrail.jsonl"),
+        databricks_audit=seclog.jsonl("out/python/databricks_audit.jsonl"),
+        okta=seclog.jsonl("out/python/okta_system_log.jsonl"),
+    )
+    .start(max_events=10_000, progress=True)
+)
 identities = seclog.identities(population)
 ```
 
-See `docs/python_bindings.md` for the full API guide, including explicit actor
-overrides, JSONL writing, and the current Python feature scope.
+See `docs/python_bindings.md` for the full API guide, including stream startup,
+sink records, progress callbacks, explicit actor overrides, and current scope.
 
 ## CLI usage
 ### `seclog gen`
