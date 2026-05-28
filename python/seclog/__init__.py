@@ -7,10 +7,17 @@ The public API is intentionally small:
     events = seclog.generate(max_events=1000)
     okta_payloads = seclog.payloads(sources=["okta"], max_events=100)
     identities = seclog.identities(seclog.Population(size=50))
+    count = seclog.write_payloads_jsonl(
+        "out/okta.jsonl",
+        population=seclog.Population(size=250),
+        sources=["okta"],
+        max_events=10_000,
+    )
 
 Generated events are dictionaries with the normalized seclog envelope and the
 source-native payload. Use ``payloads`` when loading raw CloudTrail,
-Databricks audit, or Okta records into a downstream system.
+Databricks audit, or Okta records into a downstream system. Write APIs require
+an explicit generation input such as ``population`` or ``config_path``.
 """
 
 from __future__ import annotations
@@ -464,21 +471,31 @@ def load_population(path: Union[str, Path]) -> dict[str, Any]:
 def sink_jsonl(
     destinations: JsonlDestination,
     *,
-    max_events: Optional[int] = None,
+    max_events: Optional[int],
     payload_only: bool = True,
     flush_every: int = 1000,
     events_per_second: Optional[float] = None,
-    sources: Sequence[str] = DEFAULT_SOURCES,
+    sources: Optional[Sequence[str]] = None,
     population: Optional[Union[Population, Mapping[str, Any]]] = None,
     config: Optional[Mapping[str, Any]] = None,
     config_path: Optional[Union[str, Path]] = None,
     config_toml: Optional[str] = None,
     **config_kwargs: Any,
 ) -> int:
-    """Stream events to one JSONL file or to per-source JSONL files."""
+    """Stream events to one JSONL file or to per-source JSONL files.
 
+    A write must name its generation input. Pass one of ``config``,
+    ``config_path``, ``config_toml``, or ``population``.
+    """
+
+    _require_explicit_write_input(
+        config=config,
+        config_path=config_path,
+        config_toml=config_toml,
+        population=population,
+    )
     event_stream = stream(
-        sources=sources,
+        sources=sources or DEFAULT_SOURCES,
         population=population,
         config=config,
         config_path=config_path,
@@ -519,9 +536,9 @@ def _generate_identity_jsons(
 def write_jsonl(
     path: Union[str, Path],
     *,
-    max_events: Optional[int] = 100,
+    max_events: Optional[int],
     payload_only: bool = False,
-    sources: Sequence[str] = DEFAULT_SOURCES,
+    sources: Optional[Sequence[str]] = None,
     population: Optional[Union[Population, Mapping[str, Any]]] = None,
     config: Optional[Mapping[str, Any]] = None,
     config_path: Optional[Union[str, Path]] = None,
@@ -530,12 +547,76 @@ def write_jsonl(
     events_per_second: Optional[float] = None,
     **config_kwargs: Any,
 ) -> int:
-    """Write generated events or source-native payloads to a JSONL file."""
+    """Write generated events or source-native payloads to a JSONL file.
+
+    Prefer ``write_events_jsonl`` or ``write_payloads_jsonl`` at call sites
+    where the row shape should be obvious from the function name.
+    """
 
     return sink_jsonl(
         path,
         max_events=max_events,
         payload_only=payload_only,
+        flush_every=flush_every,
+        events_per_second=events_per_second,
+        sources=sources,
+        population=population,
+        config=config,
+        config_path=config_path,
+        config_toml=config_toml,
+        **config_kwargs,
+    )
+
+
+def write_events_jsonl(
+    path: Union[str, Path],
+    *,
+    max_events: Optional[int],
+    sources: Optional[Sequence[str]] = None,
+    population: Optional[Union[Population, Mapping[str, Any]]] = None,
+    config: Optional[Mapping[str, Any]] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    config_toml: Optional[str] = None,
+    flush_every: int = 1000,
+    events_per_second: Optional[float] = None,
+    **config_kwargs: Any,
+) -> int:
+    """Write normalized seclog events with ``envelope`` and ``payload`` fields."""
+
+    return sink_jsonl(
+        path,
+        max_events=max_events,
+        payload_only=False,
+        flush_every=flush_every,
+        events_per_second=events_per_second,
+        sources=sources,
+        population=population,
+        config=config,
+        config_path=config_path,
+        config_toml=config_toml,
+        **config_kwargs,
+    )
+
+
+def write_payloads_jsonl(
+    path: Union[str, Path],
+    *,
+    max_events: Optional[int],
+    sources: Optional[Sequence[str]] = None,
+    population: Optional[Union[Population, Mapping[str, Any]]] = None,
+    config: Optional[Mapping[str, Any]] = None,
+    config_path: Optional[Union[str, Path]] = None,
+    config_toml: Optional[str] = None,
+    flush_every: int = 1000,
+    events_per_second: Optional[float] = None,
+    **config_kwargs: Any,
+) -> int:
+    """Write source-native CloudTrail, Databricks audit, or Okta JSON payloads."""
+
+    return sink_jsonl(
+        path,
+        max_events=max_events,
+        payload_only=True,
         flush_every=flush_every,
         events_per_second=events_per_second,
         sources=sources,
@@ -578,6 +659,21 @@ def _generate_event_jsons(
     if kind == "toml":
         return _native_module().generate_events_toml(value, max_events)
     return _native_module().generate_events_json(value, max_events)
+
+
+def _require_explicit_write_input(
+    *,
+    config: Optional[Mapping[str, Any]],
+    config_path: Optional[Union[str, Path]],
+    config_toml: Optional[str],
+    population: Optional[Union[Population, Mapping[str, Any]]],
+) -> None:
+    if any(value is not None for value in (config, config_path, config_toml, population)):
+        return
+    raise ValueError(
+        "write APIs require an explicit generation input; pass config, "
+        "config_path, config_toml, or population"
+    )
 
 
 def _config_input(
@@ -824,5 +920,7 @@ __all__ = [
     "payloads",
     "sink_jsonl",
     "stream",
+    "write_events_jsonl",
     "write_jsonl",
+    "write_payloads_jsonl",
 ]

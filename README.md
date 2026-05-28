@@ -99,6 +99,9 @@ seclog.sink_jsonl(
 )
 ```
 
+Write helpers require an explicit generation input such as `config_path` or
+`population`; they will not silently start from the default population.
+
 Customize the population without hand-authoring every identity:
 ```python
 population = seclog.Population(

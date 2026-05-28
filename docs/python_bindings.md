@@ -19,7 +19,7 @@ maturin develop
 
 Both commands build the Rust extension with the `python` Cargo feature.
 
-## Generate With Defaults
+## Generate In Memory With Defaults
 
 ```python
 import seclog
@@ -81,6 +81,11 @@ for batch in events.batches(1000):
 ```
 
 ## Sink To JSONL Destinations
+
+Write APIs intentionally do not start from an implicit default generation. Pass
+one explicit input: `population`, `config`, `config_path`, or `config_toml`.
+Also pass `max_events`; use `max_events=None` only when you want the write to
+continue until the stream ends or the process is stopped.
 
 Write one continuous stream to a single destination:
 
@@ -173,18 +178,35 @@ across source payloads.
 ## Write JSONL
 
 ```python
-count = seclog.write_jsonl(
+population = seclog.Population(
+    size=1000,
+    seed=42,
+    timezones=[
+        ("America/Los_Angeles", 0.45),
+        ("Europe/London", 0.35),
+        ("Asia/Singapore", 0.20),
+    ],
+)
+
+count = seclog.write_events_jsonl(
     "out/seclog/events.jsonl",
+    population=population,
+    sources=["cloudtrail", "databricks_audit", "okta"],
     max_events=50_000,
 )
 
-payload_count = seclog.write_jsonl(
+payload_count = seclog.write_payloads_jsonl(
     "out/seclog/okta_payloads.jsonl",
+    population=population,
     sources=["okta"],
     max_events=10_000,
-    payload_only=True,
 )
 ```
+
+`write_events_jsonl` writes normalized rows with `envelope` and `payload`.
+`write_payloads_jsonl` writes only the source-native payload. `write_jsonl`
+remains available as a lower-level helper when `payload_only` needs to be
+selected dynamically, but it follows the same explicit-input rule.
 
 ## Advanced Config Escape Hatch
 
