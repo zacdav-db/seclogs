@@ -47,10 +47,10 @@ import seclog
 
 result = (
     seclog.stream(config_path="examples/all_sources.toml")
-    .to_jsonl_by_source(
-        cloudtrail="out/seclog/cloudtrail.jsonl",
-        databricks_audit="out/seclog/databricks_audit.jsonl",
-        okta="out/seclog/okta_system_log.jsonl",
+    .route(
+        cloudtrail=seclog.jsonl("out/seclog/cloudtrail.jsonl"),
+        databricks_audit=seclog.jsonl("out/seclog/databricks_audit.jsonl"),
+        okta=seclog.jsonl("out/seclog/okta_system_log.jsonl"),
     )
     .start(max_events=50_000, progress=True)
 )
@@ -85,10 +85,10 @@ result = (
         population=population,
         sources=["cloudtrail", "databricks_audit", "okta"],
     )
-    .to_jsonl_by_source(
-        cloudtrail="out/seclog/cloudtrail.jsonl",
-        databricks_audit="out/seclog/databricks_audit.jsonl",
-        okta="out/seclog/okta_system_log.jsonl",
+    .route(
+        cloudtrail=seclog.jsonl("out/seclog/cloudtrail.jsonl"),
+        databricks_audit=seclog.jsonl("out/seclog/databricks_audit.jsonl"),
+        okta=seclog.jsonl("out/seclog/okta_system_log.jsonl"),
     )
     .start(max_events=50_000, progress=True)
 )
@@ -138,23 +138,22 @@ result = (
         population=population,
         sources=["cloudtrail", "databricks_audit", "okta"],
     )
-    .to_jsonl_by_source(
-        cloudtrail="out/seclog/cloudtrail.jsonl",
-        databricks_audit="out/seclog/databricks_audit.jsonl",
-        okta="out/seclog/okta_system_log.jsonl",
+    .route(
+        cloudtrail=seclog.jsonl("out/seclog/cloudtrail.jsonl"),
+        databricks_audit=seclog.jsonl("out/seclog/databricks_audit.jsonl"),
+        okta=seclog.jsonl("out/seclog/okta_system_log.jsonl"),
     )
     .to_jsonl("out/seclog/events.jsonl", record="event")
     .start(max_events=10_000, progress=True)
 )
 ```
 
-Each `to_jsonl(...)` call attaches another sink to the same stream. The
-generator produces one event sequence from one population and writes each event
-to every configured sink.
+`route(...)` maps each source to one sink or a list of sinks. A later
+`to_jsonl(...)` call can still attach a sink that receives every source.
 
-## Source Routes
+## Route Map
 
-Use `source(...)` when different sources should go to different sink types. This
+Use `route(...)` when different sources should go to different sink types. This
 example sends Okta System Log rows to Zerobus and Databricks audit rows to both
 local JSONL and a Unity Catalog volume:
 
@@ -170,27 +169,29 @@ result = (
         population=population,
         sources=["okta", "databricks_audit"],
     )
-    .source("okta")
-    .to_zerobus(
-        "lakewatch.bronze.okta_system_logs_unmapped",
-        workspace_client=workspace_client,
-    )
-    .source("databricks_audit")
-    .to_jsonl("out/seclog/databricks_audit.jsonl")
-    .to_volume(
-        "/Volumes/lakewatch/bronze/raw/seclog",
-        workspace_client=workspace_client,
+    .route(
+        okta=seclog.zerobus(
+            "lakewatch.bronze.okta_system_logs_unmapped",
+            workspace_client=workspace_client,
+        ),
+        databricks_audit=[
+            seclog.jsonl("out/seclog/databricks_audit.jsonl"),
+            seclog.volume(
+                "/Volumes/lakewatch/bronze/raw/seclog",
+                workspace_client=workspace_client,
+            ),
+        ],
     )
     .start(max_events=None, progress=True)
 )
 ```
 
-Each source route appends sinks for only that source. If the stream emits a
-source that no sink handles, `start()` raises a deterministic error instead of
-silently dropping events.
+Each key is a source route. Each value is either one sink or a list of sinks. If
+the stream emits a source that no sink handles, `start()` raises a deterministic
+error instead of silently dropping events.
 
-`to_zerobus(...)` writes the common seclog row shape with `time`, envelope
-columns, `envelope_json`, and `payload_json`. `to_volume(...)` writes
+`zerobus(...)` writes the common seclog row shape with `time`, envelope
+columns, `envelope_json`, and `payload_json`. `volume(...)` writes
 source-native JSONL files below `source=<source>/run_id=<run_id>/` in the
 configured volume path.
 
@@ -274,9 +275,9 @@ config = seclog.default_config(
 )
 result = (
     seclog.stream(config=config)
-    .to_jsonl_by_source(
-        okta="out/seclog/okta_system_log.jsonl",
-        databricks_audit="out/seclog/databricks_audit.jsonl",
+    .route(
+        okta=seclog.jsonl("out/seclog/okta_system_log.jsonl"),
+        databricks_audit=seclog.jsonl("out/seclog/databricks_audit.jsonl"),
     )
     .start(max_events=10_000, progress=True)
 )
@@ -318,10 +319,10 @@ result = (
         population=population,
         sources=["cloudtrail", "databricks_audit", "okta"],
     )
-    .to_jsonl_by_source(
-        cloudtrail="out/seclog/cloudtrail.jsonl",
-        databricks_audit="out/seclog/databricks_audit.jsonl",
-        okta="out/seclog/okta_system_log.jsonl",
+    .route(
+        cloudtrail=seclog.jsonl("out/seclog/cloudtrail.jsonl"),
+        databricks_audit=seclog.jsonl("out/seclog/databricks_audit.jsonl"),
+        okta=seclog.jsonl("out/seclog/okta_system_log.jsonl"),
     )
     .start(max_events=1000)
 )

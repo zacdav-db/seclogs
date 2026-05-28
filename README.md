@@ -88,10 +88,10 @@ import seclog
 
 result = (
     seclog.stream(config_path="examples/all_sources.toml")
-    .to_jsonl_by_source(
-        cloudtrail="out/python/cloudtrail.jsonl",
-        databricks_audit="out/python/databricks_audit.jsonl",
-        okta="out/python/okta_system_log.jsonl",
+    .route(
+        cloudtrail=seclog.jsonl("out/python/cloudtrail.jsonl"),
+        databricks_audit=seclog.jsonl("out/python/databricks_audit.jsonl"),
+        okta=seclog.jsonl("out/python/okta_system_log.jsonl"),
     )
     .start(max_events=50_000, progress=True)
 )
@@ -103,10 +103,10 @@ Attach another sink by chaining another output before `start()`:
 ```python
 result = (
     seclog.stream(config_path="examples/all_sources.toml")
-    .to_jsonl_by_source(
-        cloudtrail="out/python/cloudtrail.jsonl",
-        databricks_audit="out/python/databricks_audit.jsonl",
-        okta="out/python/okta_system_log.jsonl",
+    .route(
+        cloudtrail=seclog.jsonl("out/python/cloudtrail.jsonl"),
+        databricks_audit=seclog.jsonl("out/python/databricks_audit.jsonl"),
+        okta=seclog.jsonl("out/python/okta_system_log.jsonl"),
     )
     .to_jsonl("out/python/events.jsonl", record="event")
     .start(max_events=50_000, progress=True)
@@ -123,16 +123,18 @@ population = seclog.Population(size=1000, seed=42)
 
 result = (
     seclog.stream(population=population, sources=["okta", "databricks_audit"])
-    .source("okta")
-    .to_zerobus(
-        "lakewatch.bronze.okta_system_logs_unmapped",
-        workspace_client=workspace_client,
-    )
-    .source("databricks_audit")
-    .to_jsonl("out/python/databricks_audit.jsonl")
-    .to_volume(
-        "/Volumes/lakewatch/bronze/raw/seclog",
-        workspace_client=workspace_client,
+    .route(
+        okta=seclog.zerobus(
+            "lakewatch.bronze.okta_system_logs_unmapped",
+            workspace_client=workspace_client,
+        ),
+        databricks_audit=[
+            seclog.jsonl("out/python/databricks_audit.jsonl"),
+            seclog.volume(
+                "/Volumes/lakewatch/bronze/raw/seclog",
+                workspace_client=workspace_client,
+            ),
+        ],
     )
     .start(max_events=None, progress=True)
 )
@@ -171,10 +173,10 @@ result = (
         population=population,
         sources=["cloudtrail", "databricks_audit", "okta"],
     )
-    .to_jsonl_by_source(
-        cloudtrail="out/python/cloudtrail.jsonl",
-        databricks_audit="out/python/databricks_audit.jsonl",
-        okta="out/python/okta_system_log.jsonl",
+    .route(
+        cloudtrail=seclog.jsonl("out/python/cloudtrail.jsonl"),
+        databricks_audit=seclog.jsonl("out/python/databricks_audit.jsonl"),
+        okta=seclog.jsonl("out/python/okta_system_log.jsonl"),
     )
     .start(max_events=10_000, progress=True)
 )

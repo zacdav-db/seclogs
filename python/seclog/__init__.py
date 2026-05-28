@@ -7,7 +7,7 @@ The public API is intentionally small:
     population = seclog.Population(size=250, seed=42)
     result = (
         seclog.stream(sources=["okta"], population=population)
-        .to_jsonl_by_source(okta_system_log="out/okta.jsonl")
+        .route(okta=seclog.jsonl("out/okta.jsonl"))
         .to_jsonl("out/events.jsonl", record="event")
         .start(max_events=10_000, progress=True)
     )
@@ -25,7 +25,7 @@ Write APIs require an explicit generation input such as ``population`` or
 from __future__ import annotations
 
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import io
 import json
@@ -148,6 +148,64 @@ class ZerobusSink:
 
 
 Sink = Union[JsonlSink, DatabricksVolumeSink, ZerobusSink]
+RouteValue = Union[Sink, Sequence[Sink]]
+
+
+def jsonl(
+    path: Union[str, Path],
+    *,
+    record: str = "payload",
+    flush_every: int = 1000,
+) -> JsonlSink:
+    """Create a JSONL sink for use in ``stream(...).route(...)``."""
+
+    return JsonlSink(destinations=path, record=record, flush_every=flush_every)
+
+
+def volume(
+    volume_path: str,
+    *,
+    workspace_client: Any,
+    record: str = "payload",
+    flush_every: int = 1000,
+    overwrite: bool = False,
+    file_prefix: str = "part",
+) -> DatabricksVolumeSink:
+    """Create a Unity Catalog volume sink for use in ``stream(...).route(...)``."""
+
+    return DatabricksVolumeSink(
+        volume_path=volume_path,
+        workspace_client=workspace_client,
+        record=record,
+        flush_every=flush_every,
+        overwrite=overwrite,
+        file_prefix=file_prefix,
+    )
+
+
+def zerobus(
+    table: str,
+    *,
+    workspace_client: Any,
+    region: Optional[str] = None,
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    client_id_env: str = "DATABRICKS_CLIENT_ID",
+    client_secret_env: str = "DATABRICKS_CLIENT_SECRET",
+    flush_every: int = 1000,
+) -> ZerobusSink:
+    """Create a Zerobus sink for use in ``stream(...).route(...)``."""
+
+    return ZerobusSink(
+        table=table,
+        workspace_client=workspace_client,
+        region=region,
+        client_id=client_id,
+        client_secret=client_secret,
+        client_id_env=client_id_env,
+        client_secret_env=client_secret_env,
+        flush_every=flush_every,
+    )
 
 
 @dataclass(frozen=True)
@@ -535,6 +593,15 @@ class EventStream:
 
         return StreamPipeline(self, sinks)
 
+    def route(
+        self,
+        routes: Optional[Mapping[str, RouteValue]] = None,
+        **source_routes: RouteValue,
+    ) -> "StreamPipeline":
+        """Attach sinks by source in one route map."""
+
+        return StreamPipeline(self, _route_sinks(routes, source_routes))
+
     def source(self, *sources: str) -> "SourceRoute":
         """Select source events before attaching one or more sinks."""
 
@@ -635,6 +702,15 @@ class StreamPipeline:
         if not sinks:
             raise ValueError("configure at least one sink")
         return StreamPipeline(self._event_stream, (*self._sinks, *sinks))
+
+    def route(
+        self,
+        routes: Optional[Mapping[str, RouteValue]] = None,
+        **source_routes: RouteValue,
+    ) -> "StreamPipeline":
+        """Attach additional sinks by source in one route map."""
+
+        return self.to(*_route_sinks(routes, source_routes))
 
     def source(self, *sources: str) -> "SourceRoute":
         """Select source events before attaching additional sinks."""
@@ -1500,6 +1576,53 @@ def _matches_sources(sources: Sources, source: str) -> bool:
     return _normalize_source(source) in {_normalize_source(item) for item in sources}
 
 
+def _route_sinks(
+    routes: Optional[Mapping[str, RouteValue]],
+    source_routes: Mapping[str, RouteValue],
+) -> tuple[Sink, ...]:
+    merged: dict[str, RouteValue] = {}
+    if routes is not None:
+        merged.update(routes)
+    merged.update(source_routes)
+    if not merged:
+        raise ValueError("configure at least one source route")
+
+    routed: list[Sink] = []
+    for source, value in merged.items():
+        sources = (_normalize_source(source),)
+        for sink in _route_value_sinks(value):
+            routed.append(_sink_with_sources(sink, sources))
+    return tuple(routed)
+
+
+def _route_value_sinks(value: RouteValue) -> tuple[Sink, ...]:
+    if _is_sink(value):
+        return (value,)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        sinks = tuple(value)
+        if not sinks:
+            raise ValueError("source route must include at least one sink")
+        for sink in sinks:
+            if not _is_sink(sink):
+                raise TypeError(
+                    "source route values must be seclog.jsonl(...), "
+                    "seclog.volume(...), seclog.zerobus(...), or a list of them"
+                )
+        return sinks
+    raise TypeError(
+        "source route values must be seclog.jsonl(...), seclog.volume(...), "
+        "seclog.zerobus(...), or a list of them"
+    )
+
+
+def _is_sink(value: object) -> bool:
+    return isinstance(value, (JsonlSink, DatabricksVolumeSink, ZerobusSink))
+
+
+def _sink_with_sources(sink: Sink, sources: tuple[str, ...]) -> Sink:
+    return replace(sink, sources=sources)
+
+
 def _source_route_destinations(
     destinations: Optional[Mapping[str, Union[str, Path]]],
     source_destinations: Mapping[str, Union[str, Path]],
@@ -2161,12 +2284,15 @@ __all__ = [
     "generate_from_config",
     "identities",
     "iter_events",
+    "jsonl",
     "load_config",
     "load_population",
     "payloads",
     "sink_jsonl",
     "stream",
+    "volume",
     "write_events_jsonl",
     "write_jsonl",
     "write_payloads_jsonl",
+    "zerobus",
 ]
