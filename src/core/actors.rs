@@ -120,7 +120,8 @@ impl ActorProfile {
 
     /// Returns whether the actor can emit events at the given time.
     ///
-    /// This updates session boundaries and cooldowns when a session ends.
+    /// This updates session boundaries when a session ends. Session state affects
+    /// event context, while event cadence comes from the actor rate scheduler.
     pub fn is_available(&mut self, now: DateTime<Utc>, rng: &mut impl Rng) -> bool {
         if let Some(end) = self.session_end_at {
             if now >= end {
@@ -129,19 +130,11 @@ impl ActorProfile {
                 self.session_remaining = 0;
                 self.session_user_agent = None;
                 self.session_source_ip = None;
-                let cooldown = cooldown_minutes(&self.seed.kind, rng);
-                self.next_session_at = Some(now + Duration::minutes(cooldown));
             }
         }
 
         if !within_active_window(&self.seed, now) {
             return false;
-        }
-
-        if let Some(next) = self.next_session_at {
-            if now < next {
-                return false;
-            }
         }
 
         true
@@ -323,7 +316,11 @@ pub fn generate_population(config: &PopulationConfig) -> Result<ActorPopulation,
     let hot_actor_multiplier = population.hot_actor_multiplier.unwrap_or(6.0).max(1.0);
     let (role_weights, role_rates) = build_role_config(population.role.as_ref());
     let account_ids = build_account_pool(population);
-    let service_rate = population.service_events_per_hour.unwrap_or(6.0).max(0.1);
+    let service_rate = optional_positive_rate(
+        population.service_events_per_hour,
+        "population.service_events_per_hour",
+    )?
+    .unwrap_or(6.0);
     let service_profiles =
         build_service_profiles(population.service_profiles.as_ref(), service_rate);
     let baseline_error = error_rate_spec(population.error_rate.as_ref(), default_error_rate_spec());
@@ -871,7 +868,7 @@ fn pick_service_profile<'a>(
         return ServiceProfileSpec {
             profile: ServiceProfile::Generic,
             weight: 1.0,
-            rate_per_hour: fallback_rate.max(0.1),
+            rate_per_hour: fallback_rate,
             pattern: ServicePattern::Constant,
         };
     }
@@ -986,7 +983,10 @@ fn build_service_profiles(
             Some(profile) => profile,
             None => continue,
         };
-        let rate = entry.events_per_hour.unwrap_or(fallback_rate).max(0.1);
+        let rate = entry.events_per_hour.unwrap_or(fallback_rate);
+        if !rate.is_finite() || rate <= 0.0 {
+            continue;
+        }
         let pattern = entry
             .pattern
             .as_ref()
@@ -1001,6 +1001,19 @@ fn build_service_profiles(
     }
 
     profiles
+}
+
+fn optional_positive_rate(
+    value: Option<f64>,
+    field: &str,
+) -> Result<Option<f64>, ActorConfigError> {
+    let Some(rate) = value else {
+        return Ok(None);
+    };
+    if !rate.is_finite() || rate <= 0.0 {
+        return Err(ActorConfigError(format!("{field} must be > 0")));
+    }
+    Ok(Some(rate))
 }
 
 fn default_error_rate_spec() -> ErrorRateSpec {
@@ -1777,13 +1790,6 @@ fn session_minutes(kind: &ActorKind, rng: &mut impl Rng) -> i64 {
     }
 }
 
-fn cooldown_minutes(kind: &ActorKind, rng: &mut impl Rng) -> i64 {
-    match kind {
-        ActorKind::Human => rng.gen_range(30..180),
-        ActorKind::Service => rng.gen_range(5..30),
-    }
-}
-
 fn is_weekend_date(date: chrono::NaiveDate) -> bool {
     let day = date.weekday().number_from_monday();
     day >= 6
@@ -2153,6 +2159,23 @@ mod tests {
                 >= 2
         );
         assert!(actor.arn.ends_with(&format!(":user/{user_name}")));
+    }
+
+    #[test]
+    fn service_rates_preserve_low_configured_values() {
+        let mut config = population_config("Europe/London", 1, 1.0, Vec::new());
+        config.population.service_events_per_hour = Some(0.01);
+        config.population.service_profiles = Some(vec![ServiceProfileConfig {
+            name: "logs_shipper".to_string(),
+            weight: 1.0,
+            events_per_hour: Some(0.02),
+            pattern: Some(ServicePatternConfig::Constant),
+        }]);
+
+        let population = generate_population(&config).unwrap();
+        let actor = population.actors.first().unwrap();
+
+        assert_eq!(actor.rate_per_hour, 0.02);
     }
 
     fn population_config(

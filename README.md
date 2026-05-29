@@ -323,7 +323,7 @@ event_bias = { "ConsoleLogin" = 3.0, "AssumeRole" = 2.0 }
 | `population.human_error_rate` | table | no | baseline | Overrides baseline for humans (often higher auth errors). |
 | `population.service_error_rate` | table | no | baseline | Overrides baseline for services (often lower). |
 | `population.role` | table[] | no | defaults | Defines role weights and per-role throughput overrides. |
-| `population.service_events_per_hour` | float | no | 6.0 | Sets default throughput for services. |
+| `population.service_events_per_hour` | float | no | 6.0 | Sets default throughput for services. Positive low rates are preserved as configured. |
 | `population.service_profiles` | table[] | no | none | Controls service profile mix and event families. |
 | `population.actor` | table[] | no | none | Adds explicit actors with fixed traits and optional behavior biasing. |
 
@@ -345,7 +345,7 @@ event_bias = { "ConsoleLogin" = 3.0, "AssumeRole" = 2.0 }
 | --- | --- | --- | --- |
 | `population.service_profiles.name` | string | yes | Chooses the service behavior profile: `generic`, `ec2_reaper`, `datalake_bot`, `logs_shipper`, `metrics_collector`. |
 | `population.service_profiles.weight` | float | yes | Higher weight increases share of that profile. |
-| `population.service_profiles.events_per_hour` | float | no | Overrides `population.service_events_per_hour` for this profile. |
+| `population.service_profiles.events_per_hour` | float | no | Overrides `population.service_events_per_hour` for this profile. Positive low rates are preserved as configured. |
 | `population.service_profiles.pattern` | string | no | Shapes activity over time (steady vs. diurnal vs. bursts). |
 
 ### Service profile meanings
@@ -430,6 +430,7 @@ region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
 | `seed` | int | no | random | Fixes RNG for repeatable output sequences. |
 | `[traffic]` | table | yes | - | Simulated clock controls. |
 | `traffic.start_time` | string | no | now | Shifts event timestamps; use for backfill windows. |
+| `traffic.until_time` | string | no | none | Stops generation after this simulated timestamp; use with `time_scale = 0` for fast backfills. |
 | `traffic.time_scale` | float | no | 1.0 | Increases/decreases how fast simulated time advances. |
 | `[output]` | table | yes | - | Output sink configuration. |
 | `output.type` | string | no | file | Set to `zerobus` for Databricks Zerobus output or `databricks_volume` for Databricks Files API volume uploads; omit for file output. |
@@ -459,8 +460,10 @@ region_distribution = [0.6, 0.25, 0.15] # Weights aligned to regions.
 ### Databricks audit source
 Use `source.type = "databricks_audit"` to emit payloads shaped like
 Databricks `system.access.audit` rows. The source loads a shared identity
-registry, generates optional baseline activity for each identity, and can inject
-deterministic audit events for a scenario.
+registry, schedules continuous baseline activity for each identity from the
+shared actor rate model, and can inject deterministic audit events for a
+scenario. Set `baseline_events_per_actor = 0` only when you want explicit
+events without generated baseline traffic.
 
 This source is intentionally limited today. It preserves the real
 `system.access.audit` row shape and supports deterministic baseline rows plus
@@ -473,7 +476,6 @@ type = "databricks_audit"
 identity_registry_path = "./examples/identity_registry.toml"
 account_id = "example-account-id"
 workspace_id = "1234567890"
-baseline_events_per_actor = 2
 
 [source.baseline_source_ips]
 user-001 = ["198.51.100.10"]
@@ -501,8 +503,10 @@ observed `system.access.audit` schema: `request_params` is a `map<string,string>
 Use `source.type = "okta"` to emit payloads shaped like Okta System Log
 `LogEvent` records. The alias `okta_system_log` is also accepted. The source
 loads the shared identity registry, maps generated actors to Okta user/client
-IDs, emits deterministic baseline auth/session/app-access activity, and can
-inject explicit System Log events.
+IDs, schedules continuous baseline auth/session/app-access activity from the
+shared actor rate model, and can inject explicit System Log events. Set
+`baseline_events_per_actor = 0` only when you want explicit events without
+generated baseline traffic.
 
 This source is intentionally limited today. It preserves the raw Okta
 System Log landing shape and selected nested objects, including `actor`,
@@ -515,7 +519,6 @@ full implementation of the Okta event-type catalog.
 type = "okta"
 identity_registry_path = "./examples/identity_registry.toml"
 org_id = "okta-example-org"
-baseline_events_per_actor = 2
 
 [source.baseline_source_ips]
 user-001 = ["198.51.100.10"]
@@ -641,7 +644,7 @@ route is present and the source configuration uses an `identity_registry_path`,
 identity population to that table before event generation. The actor population
 table uses `time`,
 `registry_name`, `actor_id`, `actor_kind`, identity fields,
-`normal_countries_regions_json`, `tags_json`, `aws_principals_json`,
+`rate_per_hour`, `normal_countries_regions_json`, `tags_json`, `aws_principals_json`,
 `identity_json`, `run_id`, and `generated_at`.
 
 ### Databricks volume output

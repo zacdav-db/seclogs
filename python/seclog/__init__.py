@@ -256,6 +256,8 @@ class ProgressSnapshot:
     interval_events_per_second: float
     sources: Mapping[str, ProgressCounter]
     sinks: Mapping[str, ProgressCounter]
+    simulated_high_water: Optional[datetime] = None
+    simulated_elapsed_seconds: Optional[float] = None
     finished: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -270,6 +272,12 @@ class ProgressSnapshot:
                 name: counter.to_dict() for name, counter in self.sources.items()
             },
             "sinks": {name: counter.to_dict() for name, counter in self.sinks.items()},
+            "simulated_high_water": (
+                _format_datetime_utc(self.simulated_high_water)
+                if self.simulated_high_water is not None
+                else None
+            ),
+            "simulated_elapsed_seconds": self.simulated_elapsed_seconds,
             "finished": self.finished,
         }
 
@@ -475,9 +483,9 @@ def default_config(
     databricks_account_id: str = "example-account-id",
     databricks_workspace_id: Optional[str] = None,
     workspace_client: Any = None,
-    databricks_baseline_events_per_actor: int = 2,
+    databricks_baseline_events_per_actor: Optional[int] = None,
     okta_org_id: str = "okta-example-org",
-    okta_baseline_events_per_actor: int = 2,
+    okta_baseline_events_per_actor: Optional[int] = None,
     source_overrides: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Build a complete seclog config using shared-population defaults."""
@@ -802,6 +810,8 @@ class StreamPipeline:
         *,
         max_events: Optional[int] = None,
         events_per_second: Optional[float] = None,
+        until_time: Optional[Union[str, datetime]] = None,
+        time_scale: Optional[float] = None,
         progress: Optional[ProgressReporter] = None,
         progress_interval_seconds: float = 5.0,
     ) -> StreamResult:
@@ -816,6 +826,8 @@ class StreamPipeline:
             self._sinks,
             max_events=max_events,
             events_per_second=events_per_second,
+            until_time=until_time,
+            time_scale=time_scale,
             progress=progress,
             progress_interval_seconds=progress_interval_seconds,
         )
@@ -921,6 +933,8 @@ class SourceRoute:
         *,
         max_events: Optional[int] = None,
         events_per_second: Optional[float] = None,
+        until_time: Optional[Union[str, datetime]] = None,
+        time_scale: Optional[float] = None,
         progress: Optional[ProgressReporter] = None,
         progress_interval_seconds: float = 5.0,
     ) -> StreamResult:
@@ -931,6 +945,8 @@ class SourceRoute:
             self._sinks,
             max_events=max_events,
             events_per_second=events_per_second,
+            until_time=until_time,
+            time_scale=time_scale,
             progress=progress,
             progress_interval_seconds=progress_interval_seconds,
         )
@@ -1337,8 +1353,10 @@ class _ProgressTracker:
         self._sink_events: dict[str, int] = {}
         self._interval_source_events: dict[str, int] = {}
         self._interval_sink_events: dict[str, int] = {}
+        self._simulated_start: Optional[datetime] = None
+        self._simulated_high_water: Optional[datetime] = None
 
-    def record_event(self, source: str) -> None:
+    def record_event(self, source: str, event_time: Optional[datetime] = None) -> None:
         if self._reporter is None:
             return
 
@@ -1346,6 +1364,11 @@ class _ProgressTracker:
         self._interval_events += 1
         _increment_counter(self._source_events, source)
         _increment_counter(self._interval_source_events, source)
+        if event_time is not None:
+            if self._simulated_start is None:
+                self._simulated_start = event_time
+            if self._simulated_high_water is None or event_time > self._simulated_high_water:
+                self._simulated_high_water = event_time
 
     def record_sink(self, sink: str) -> None:
         if self._reporter is None:
@@ -1361,8 +1384,13 @@ class _ProgressTracker:
         if now - self._last_report_at >= self._progress_interval_seconds:
             self._emit(now, finished=False)
 
-    def record(self, source: str, sink: str) -> None:
-        self.record_event(source)
+    def record(
+        self,
+        source: str,
+        sink: str,
+        event_time: Optional[datetime] = None,
+    ) -> None:
+        self.record_event(source, event_time)
         self.record_sink(sink)
         self.maybe_emit()
 
@@ -1392,6 +1420,11 @@ class _ProgressTracker:
                 intervals=self._interval_sink_events,
                 elapsed_seconds=elapsed,
                 interval_seconds=interval_elapsed,
+            ),
+            simulated_high_water=self._simulated_high_water,
+            simulated_elapsed_seconds=_simulated_elapsed_seconds(
+                self._simulated_start,
+                self._simulated_high_water,
             ),
             finished=finished,
         )
@@ -1461,6 +1494,15 @@ def _progress_counters(
     }
 
 
+def _simulated_elapsed_seconds(
+    start: Optional[datetime],
+    high_water: Optional[datetime],
+) -> Optional[float]:
+    if start is None or high_water is None:
+        return None
+    return max((high_water - start).total_seconds(), 0.0)
+
+
 def _format_progress_counters(counters: Mapping[str, ProgressCounter]) -> str:
     if not counters:
         return "-"
@@ -1472,6 +1514,12 @@ def _format_progress_counters(counters: Mapping[str, ProgressCounter]) -> str:
 
 def _format_progress_log(snapshot: ProgressSnapshot) -> str:
     status = "complete" if snapshot.finished else "running"
+    simulated = ""
+    if snapshot.simulated_high_water is not None:
+        simulated = (
+            f" | simulated={_format_datetime_utc(snapshot.simulated_high_water)}"
+            f" | sim_elapsed={_format_duration(snapshot.simulated_elapsed_seconds or 0.0)}"
+        )
     lines = [
         (
             f"seclog progress | {status} | total={_format_count(snapshot.events)} "
@@ -1479,6 +1527,7 @@ def _format_progress_log(snapshot: ProgressSnapshot) -> str:
             f"| current={_format_rate(snapshot.interval_events_per_second)} "
             f"| avg={_format_rate(snapshot.events_per_second)} "
             f"| elapsed={_format_duration(snapshot.elapsed_seconds)}"
+            f"{simulated}"
         ),
         *_format_progress_log_section("sources", snapshot.sources),
         *_format_progress_log_section("sinks", snapshot.sinks),
@@ -1507,11 +1556,18 @@ def _format_progress_log_section(
 
 def _format_progress_block(snapshot: ProgressSnapshot) -> str:
     status = "complete" if snapshot.finished else "running"
+    simulated = ""
+    if snapshot.simulated_high_water is not None:
+        simulated = (
+            f" | sim {_format_datetime_utc(snapshot.simulated_high_water)}"
+            f" ({_format_duration(snapshot.simulated_elapsed_seconds or 0.0)})"
+        )
     header = (
         f"seclog {status} | {_format_count(snapshot.events)} events | "
         f"{_format_rate(snapshot.events_per_second)} avg | "
         f"{_format_rate(snapshot.interval_events_per_second)} current | "
         f"{_format_duration(snapshot.elapsed_seconds)} elapsed"
+        f"{simulated}"
     )
     return "\n".join(
         [
@@ -1684,6 +1740,10 @@ def _normalize_volume_path(path: str) -> str:
             "or dbfs:/Volumes/..."
         )
     return value
+
+
+def _safe_volume_segment(value: str) -> str:
+    return "".join(char if char.isalnum() or char in "._=-" else "_" for char in value)
 
 
 def _event_to_zerobus_row(
@@ -2095,6 +2155,7 @@ class _JsonlSinkHandle:
     sink: JsonlSink
     default_destination: Optional["_JsonlDestination"]
     route_destinations: Mapping[str, "_JsonlDestination"]
+    record_count: int = 0
 
     def write(self, event: Mapping[str, Any], source: str) -> Optional[str]:
         if not _matches_sources(self.sink.sources, source):
@@ -2105,6 +2166,9 @@ class _JsonlSinkHandle:
 
         row = _event_record(event, self.sink.record)
         destination.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        object.__setattr__(self, "record_count", self.record_count + 1)
+        if self.sink.flush_every and self.record_count % self.sink.flush_every == 0:
+            self.flush()
         return _jsonl_sink_label(self.sink, destination.label, source)
 
     def flush(self) -> None:
@@ -2135,6 +2199,7 @@ class _DatabricksVolumeSinkHandle:
     run_id: str
     buffers: dict[str, list[str]] = field(default_factory=dict)
     counters: dict[str, int] = field(default_factory=dict)
+    created_directories: set[str] = field(default_factory=set)
 
     def write(self, event: Mapping[str, Any], source: str) -> Optional[str]:
         if not _matches_sources(self.sink.sources, source):
@@ -2163,12 +2228,17 @@ class _DatabricksVolumeSinkHandle:
         counter = self.counters.get(source, 0)
         self.counters[source] = counter + 1
         directory = self.base_path
-        file_path = f"{directory}/{self.sink.file_prefix}-{source}-{counter:06d}.jsonl"
+        file_path = (
+            f"{directory}/{self.sink.file_prefix}-"
+            f"{_safe_volume_segment(source)}-{counter:06d}.jsonl"
+        )
         payload = "".join(rows).encode("utf-8")
         files = getattr(self.sink.workspace_client, "files", None)
         if files is None:
             raise ValueError("workspace_client must expose a files API")
-        files.create_directory(directory)
+        if directory not in self.created_directories:
+            files.create_directory(directory)
+            self.created_directories.add(directory)
         files.upload(file_path, io.BytesIO(payload), overwrite=self.sink.overwrite)
         rows.clear()
 
@@ -2196,6 +2266,7 @@ class _ZerobusSinkHandle:
     stream: Any
     run_id: str
     generated_at: datetime
+    batch: list[dict[str, Any]] = field(default_factory=list)
     acks: list[Any] = field(default_factory=list)
 
     def write(self, event: Mapping[str, Any], source: str) -> Optional[str]:
@@ -2203,18 +2274,44 @@ class _ZerobusSinkHandle:
             return None
 
         row = _event_to_zerobus_row(event, self.run_id, self.generated_at)
-        ack = self.stream.ingest_record(row)
-        self.acks.append(ack)
-        if self.sink.flush_every and len(self.acks) >= self.sink.flush_every:
+        self.batch.append(row)
+        if self.sink.flush_every and len(self.batch) >= self.sink.flush_every:
             self.flush()
         return f"{source} -> zerobus {self.sink.table}"
 
     def flush(self) -> None:
+        if self.batch:
+            self._ingest_batch()
         while self.acks:
             ack = self.acks.pop(0)
             wait_for_ack = getattr(ack, "wait_for_ack", None)
             if callable(wait_for_ack):
                 wait_for_ack()
+
+    def _ingest_batch(self) -> None:
+        batch = self.batch
+        self.batch = []
+        ingest_records = getattr(self.stream, "ingest_records", None)
+        if callable(ingest_records):
+            self._record_ack(ingest_records(batch))
+            return
+
+        ingest_records_offset = getattr(self.stream, "ingest_records_offset", None)
+        if callable(ingest_records_offset):
+            self._record_ack(ingest_records_offset(batch))
+            return
+
+        ingest_record = getattr(self.stream, "ingest_record")
+        for row in batch:
+            self._record_ack(ingest_record(row))
+
+    def _record_ack(self, ack: Any) -> None:
+        if ack is None:
+            return
+        if isinstance(ack, (list, tuple)):
+            self.acks.extend(ack)
+        else:
+            self.acks.append(ack)
 
     def close(self) -> None:
         self.flush()
@@ -2294,8 +2391,23 @@ def _open_sink(
     raise TypeError(f"unsupported sink: {type(sink).__name__}")
 
 
-def _sink_flush_every(sink: Sink) -> int:
-    return sink.flush_every
+def _normalize_until_time(value: Optional[Union[str, datetime]]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    parsed = _parse_rfc3339(value)
+    if parsed is None:
+        raise ValueError(f"invalid until_time: {value}")
+    return parsed
+
+
+def _event_timestamp(event: Mapping[str, Any]) -> Optional[datetime]:
+    envelope = event.get("envelope")
+    if not isinstance(envelope, Mapping):
+        return None
+    timestamp = envelope.get("timestamp")
+    return _parse_rfc3339(str(timestamp)) if timestamp is not None else None
 
 
 def _run_stream_to_sinks(
@@ -2304,6 +2416,8 @@ def _run_stream_to_sinks(
     *,
     max_events: Optional[int],
     events_per_second: Optional[float],
+    until_time: Optional[Union[str, datetime]],
+    time_scale: Optional[float],
     progress: Optional[ProgressReporter],
     progress_interval_seconds: float,
 ) -> StreamResult:
@@ -2311,14 +2425,21 @@ def _run_stream_to_sinks(
         raise ValueError("max_events must be non-negative or None")
     if events_per_second is not None and events_per_second <= 0:
         raise ValueError("events_per_second must be greater than zero")
+    if time_scale is not None and time_scale <= 0:
+        raise ValueError("time_scale must be greater than zero")
+    if events_per_second is not None and time_scale is not None:
+        raise ValueError("set only one of events_per_second or time_scale")
     if progress_interval_seconds <= 0:
         raise ValueError("progress_interval_seconds must be greater than zero")
     if not sinks:
         raise ValueError("configure at least one sink before starting a stream")
 
+    stop_at = _normalize_until_time(until_time)
     count = 0
     interval = 1.0 / events_per_second if events_per_second else None
     next_deadline = time.monotonic()
+    replay_deadline = next_deadline
+    last_event_time: Optional[datetime] = None
     started_at = next_deadline
     progress_tracker = _ProgressTracker(progress, progress_interval_seconds)
     run_id = f"seclog-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
@@ -2336,9 +2457,22 @@ def _run_stream_to_sinks(
                 except StopIteration:
                     break
 
+                event_time = _event_timestamp(event)
+                if stop_at is not None and event_time is not None and event_time > stop_at:
+                    break
+                if time_scale is not None and event_time is not None:
+                    if last_event_time is not None and event_time > last_event_time:
+                        replay_deadline += (
+                            event_time - last_event_time
+                        ).total_seconds() / time_scale
+                        sleep_seconds = replay_deadline - time.monotonic()
+                        if sleep_seconds > 0:
+                            time.sleep(sleep_seconds)
+                    last_event_time = event_time
+
                 source = event["envelope"]["source"]
                 count += 1
-                progress_tracker.record_event(source)
+                progress_tracker.record_event(source, event_time)
 
                 sink_count = 0
                 for sink_handle in sink_handles:
@@ -2349,10 +2483,6 @@ def _run_stream_to_sinks(
                 if sink_count == 0:
                     raise ValueError(f"no sink configured for source {source}")
 
-                for sink_handle in sink_handles:
-                    flush_every = _sink_flush_every(sink_handle.sink)
-                    if flush_every and count % flush_every == 0:
-                        sink_handle.flush()
                 progress_tracker.maybe_emit()
 
                 if interval is not None:
@@ -2387,6 +2517,8 @@ def _run_stream_to_jsonl_sinks(
         sinks,
         max_events=max_events,
         events_per_second=events_per_second,
+        until_time=None,
+        time_scale=None,
         progress=progress,
         progress_interval_seconds=progress_interval_seconds,
     )
@@ -2489,9 +2621,9 @@ def _source_config(
     cloudtrail_region_distribution: Sequence[float],
     databricks_account_id: str,
     databricks_workspace_id: str,
-    databricks_baseline_events_per_actor: int,
+    databricks_baseline_events_per_actor: Optional[int],
     okta_org_id: str,
-    okta_baseline_events_per_actor: int,
+    okta_baseline_events_per_actor: Optional[int],
     overrides: Optional[Mapping[str, Mapping[str, Any]]],
 ) -> dict[str, Any]:
     normalized = _normalize_source(source)
@@ -2507,14 +2639,16 @@ def _source_config(
             "type": "databricks_audit",
             "account_id": databricks_account_id,
             "workspace_id": databricks_workspace_id,
-            "baseline_events_per_actor": databricks_baseline_events_per_actor,
         }
+        if databricks_baseline_events_per_actor is not None:
+            config["baseline_events_per_actor"] = databricks_baseline_events_per_actor
     elif normalized == "okta_system_log":
         config = {
             "type": "okta",
             "org_id": okta_org_id,
-            "baseline_events_per_actor": okta_baseline_events_per_actor,
         }
+        if okta_baseline_events_per_actor is not None:
+            config["baseline_events_per_actor"] = okta_baseline_events_per_actor
     else:  # pragma: no cover - _normalize_source raises first
         raise ValueError(f"unsupported seclog source: {source}")
 

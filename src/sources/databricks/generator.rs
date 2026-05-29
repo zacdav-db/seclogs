@@ -6,11 +6,16 @@ use crate::core::event::{Actor, Event, EventEnvelope, Geo, Outcome};
 use crate::core::identity::{Identity, IdentityRegistry, IdentityRegistryError};
 use crate::core::traits::EventSource;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use std::collections::{BTreeMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 
 /// Databricks audit generator backed by a shared identity registry.
 pub struct DatabricksAuditGenerator {
-    events: VecDeque<Event>,
+    config: DatabricksAuditSourceConfig,
+    injected_events: VecDeque<ScheduledDatabricksEvent>,
+    identities: Vec<Identity>,
+    schedule: BinaryHeap<Reverse<(DateTime<Utc>, usize)>>,
+    next_event_idx: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -37,7 +42,7 @@ impl std::fmt::Display for DatabricksAuditError {
             DatabricksAuditError::EmptyStream => {
                 write!(
                     f,
-                    "databricks audit source needs baseline_events_per_actor or event entries"
+                    "databricks audit source needs identity registry actors or event entries"
                 )
             }
         }
@@ -68,9 +73,11 @@ impl DatabricksAuditGenerator {
     ) -> Result<Self, DatabricksAuditError> {
         let mut scheduled = Vec::new();
         append_injected_events(config, &registry, start_time, &mut scheduled)?;
-        append_baseline_events(config, &registry, start_time, &mut scheduled)?;
+        let mut identities = sorted_identities(&registry);
 
-        if scheduled.is_empty() {
+        if scheduled.is_empty()
+            && (config.baseline_events_per_actor == Some(0) || identities.is_empty())
+        {
             return Err(DatabricksAuditError::EmptyStream);
         }
 
@@ -80,14 +87,52 @@ impl DatabricksAuditGenerator {
                 .then(left.sequence.cmp(&right.sequence))
                 .then(left.actor_id.cmp(&right.actor_id))
         });
-        let events = scheduled.into_iter().map(|item| item.event).collect();
-        Ok(Self { events })
+        let schedule = if config.baseline_events_per_actor == Some(0) {
+            BinaryHeap::new()
+        } else {
+            build_identity_schedule(&identities, start_time)
+        };
+        let next_event_idx = vec![0; identities.len()];
+        Ok(Self {
+            config: config.clone(),
+            injected_events: scheduled.into(),
+            identities: std::mem::take(&mut identities),
+            schedule,
+            next_event_idx,
+        })
     }
 }
 
 impl EventSource for DatabricksAuditGenerator {
     fn next_event(&mut self) -> Option<Event> {
-        self.events.pop_front()
+        let injected_time = self.injected_events.front().map(|event| event.event_time);
+        let scheduled_time = self.schedule.peek().map(|Reverse((time, _))| *time);
+
+        match (injected_time, scheduled_time) {
+            (None, None) => None,
+            (Some(_), None) => self.injected_events.pop_front().map(|item| item.event),
+            (Some(injected), Some(scheduled)) if injected <= scheduled => {
+                self.injected_events.pop_front().map(|item| item.event)
+            }
+            _ => self.next_scheduled_event(),
+        }
+    }
+}
+
+impl DatabricksAuditGenerator {
+    fn next_scheduled_event(&mut self) -> Option<Event> {
+        let Reverse((event_time, actor_idx)) = self.schedule.pop()?;
+        let event_idx = self.next_event_idx[actor_idx];
+        self.next_event_idx[actor_idx] += 1;
+
+        let identity = &self.identities[actor_idx];
+        let row =
+            baseline_row_for_identity(&self.config, identity, actor_idx, event_idx, event_time);
+        let event = event_from_row(identity, row, None);
+
+        let next_at = event_time + interval_for_identity(identity);
+        self.schedule.push(Reverse((next_at, actor_idx)));
+        Some(event)
     }
 }
 
@@ -122,36 +167,75 @@ fn append_injected_events(
     Ok(())
 }
 
-fn append_baseline_events(
-    config: &DatabricksAuditSourceConfig,
-    registry: &IdentityRegistry,
-    start_time: DateTime<Utc>,
-    scheduled: &mut Vec<ScheduledDatabricksEvent>,
-) -> Result<(), DatabricksAuditError> {
-    let count = config.baseline_events_per_actor.unwrap_or(0);
-    if count == 0 {
-        return Ok(());
-    }
-
+fn sorted_identities(registry: &IdentityRegistry) -> Vec<Identity> {
     let mut identities: Vec<&Identity> = registry.identities().iter().collect();
     identities.sort_by(|left, right| left.actor_id.cmp(&right.actor_id));
-    let offset_base = config.events.len();
+    identities.into_iter().cloned().collect()
+}
 
-    for (actor_idx, identity) in identities.iter().enumerate() {
-        for event_idx in 0..count {
-            let seconds = 60 + (actor_idx as i64 * 23) + (event_idx as i64 * 360);
-            let event_time = start_time + Duration::seconds(seconds);
-            let row = baseline_row_for_identity(config, identity, actor_idx, event_idx, event_time);
-            let event = event_from_row(identity, row, None);
-            scheduled.push(ScheduledDatabricksEvent {
-                event_time,
-                sequence: offset_base + actor_idx * count + event_idx,
-                actor_id: identity.actor_id.clone(),
-                event,
-            });
-        }
+fn build_identity_schedule(
+    identities: &[Identity],
+    start_time: DateTime<Utc>,
+) -> BinaryHeap<Reverse<(DateTime<Utc>, usize)>> {
+    let mut schedule = BinaryHeap::with_capacity(identities.len());
+    for (idx, identity) in identities.iter().enumerate() {
+        let first_at = start_time + deterministic_phase(identity, interval_for_identity(identity));
+        schedule.push(Reverse((first_at, idx)));
     }
-    Ok(())
+    schedule
+}
+
+fn interval_for_identity(identity: &Identity) -> Duration {
+    interval_for_rate(identity_rate_per_hour(identity))
+}
+
+fn interval_for_rate(rate_per_hour: f64) -> Duration {
+    let rate = if rate_per_hour.is_finite() && rate_per_hour > 0.0 {
+        rate_per_hour
+    } else {
+        1.0
+    };
+    let millis = ((3600.0 / rate) * 1000.0)
+        .round()
+        .clamp(1.0, i64::MAX as f64) as i64;
+    Duration::milliseconds(millis)
+}
+
+fn deterministic_phase(identity: &Identity, interval: Duration) -> Duration {
+    let millis = interval.num_milliseconds().max(1) as u64;
+    Duration::milliseconds((stable_hash(&identity.actor_id) % millis) as i64)
+}
+
+fn identity_rate_per_hour(identity: &Identity) -> f64 {
+    identity
+        .rate_per_hour
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or_else(|| default_rate_for_identity(identity))
+}
+
+fn default_rate_for_identity(identity: &Identity) -> f64 {
+    if identity.service_account {
+        return 12.0;
+    }
+    let role = identity.role_persona.to_ascii_lowercase();
+    if role.contains("admin") {
+        18.0
+    } else if role.contains("audit") || role.contains("risk") || role.contains("security") {
+        6.0
+    } else if role.contains("read") || role.contains("business") || role.contains("support") {
+        8.0
+    } else {
+        14.0
+    }
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn audit_row_for_entry(
@@ -538,6 +622,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scheduled_rows_follow_identity_rate() {
+        let mut config = test_config();
+        config.events.clear();
+        config.baseline_events_per_actor = None;
+        let mut actor = identity("user-primary", "primary@example.com", &["Australia"], false);
+        actor.rate_per_hour = Some(0.5);
+        let registry = IdentityRegistry::new("test", vec![actor]).unwrap();
+        let mut generator =
+            DatabricksAuditGenerator::from_registry(&config, registry, test_start_time()).unwrap();
+
+        let first = generator.next_event().unwrap();
+        let second = generator.next_event().unwrap();
+        let first_time = DateTime::parse_from_rfc3339(&first.envelope.timestamp)
+            .unwrap()
+            .with_timezone(&Utc);
+        let second_time = DateTime::parse_from_rfc3339(&second.envelope.timestamp)
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(second_time - first_time, Duration::hours(2));
+    }
+
     fn generator(
         config: &DatabricksAuditSourceConfig,
         start_time: DateTime<Utc>,
@@ -554,8 +661,10 @@ mod tests {
 
     fn collect_events(mut generator: DatabricksAuditGenerator) -> Vec<Event> {
         let mut events = Vec::new();
-        while let Some(event) = generator.next_event() {
-            events.push(event);
+        for _ in 0..32 {
+            if let Some(event) = generator.next_event() {
+                events.push(event);
+            }
         }
         events
     }
@@ -665,6 +774,7 @@ mod tests {
             }],
             service_account,
             tags: Vec::new(),
+            rate_per_hour: None,
         }
     }
 }

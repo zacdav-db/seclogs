@@ -66,7 +66,7 @@ pub struct AwsPrincipal {
 }
 
 /// Stable identity shared by source generators.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Identity {
     pub actor_id: String,
     pub email: String,
@@ -85,6 +85,8 @@ pub struct Identity {
     pub service_account: bool,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub rate_per_hour: Option<f64>,
 }
 
 /// Registry file format.
@@ -364,6 +366,7 @@ fn identity_from_actor_seed(actor: &ActorSeed, idx: usize, ordinal: usize) -> Id
         aws_principals: vec![aws_principal_from_actor(actor)],
         service_account,
         tags: actor.tags.clone(),
+        rate_per_hour: Some(actor.rate_per_hour),
     }
 }
 
@@ -704,6 +707,7 @@ mod tests {
             }],
             service_account: false,
             tags: Vec::new(),
+            rate_per_hour: None,
         }
     }
 }

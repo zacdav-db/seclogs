@@ -198,6 +198,10 @@ endpoint; pass `region=` only when those endpoints are unavailable.
 `volume(...)` writes source-native JSONL files directly below the configured
 volume path using `<file_prefix>-<source>-000000.jsonl` file names.
 
+Use `until_time=` to run a bounded simulated backfill without setting an event
+count. When neither `events_per_second` nor `time_scale` is set, generation runs
+as fast as the configured sinks can accept records.
+
 ## Progress
 
 `progress=True` renders an updating terminal view on stderr. In non-interactive
@@ -205,7 +209,7 @@ output, such as notebooks and CI logs, it writes one readable block per
 interval.
 
 ```text
-seclog progress | running | total=37,122 | +3,734 | current=3,734.3/s | avg=3,711.8/s | elapsed=00:10
+seclog progress | running | total=37,122 | +3,734 | current=3,734.3/s | avg=3,711.8/s | elapsed=00:10 | simulated=2026-01-04T16:42:12.100Z | sim_elapsed=88:42:12
   sources:
     okta_system_log | total=37,122 | +3,734 | current=3,734.3/s | avg=3,711.8/s
   sinks:
@@ -271,7 +275,7 @@ config = seclog.default_config(
     sources=["okta", "databricks_audit"],
     population=population,
     source_overrides={
-        "okta_system_log": {"baseline_events_per_actor": 4},
+        "okta_system_log": {"org_id": "okta-example-org"},
         "databricks_audit": {"workspace_id": "9876543210"},
     },
 )

@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS main.seclog.actor_population (
   okta_user_id STRING,
   databricks_username STRING,
   service_account BOOLEAN,
+  rate_per_hour DOUBLE,
   tags_json STRING,
   aws_principals_json STRING,
   identity_json STRING,

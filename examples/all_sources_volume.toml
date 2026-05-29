@@ -33,8 +33,6 @@ svc-exfil-01 = ["10.40.2.10"]
 type = "databricks_audit"
 account_id = "example-account-id"
 workspace_id = "1234567890"
-baseline_events_per_actor = 2
-
 [source.sources.baseline_source_ips]
 human-mal-001 = ["198.51.100.10"]
 svc-exfil-01 = ["10.16.0.10"]
@@ -54,8 +52,6 @@ source_geo_city = "Example City"
 [[source.sources]]
 type = "okta"
 org_id = "okta-example-org"
-baseline_events_per_actor = 2
-
 [source.sources.baseline_source_ips]
 human-mal-001 = ["198.51.100.10"]
 svc-exfil-01 = ["10.24.1.10"]

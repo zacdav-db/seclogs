@@ -21,8 +21,6 @@ type = "okta"
 # explicit injected auth/session/app-access events, not the full Okta catalog.
 identity_registry_path = "./examples/identity_registry.toml"
 org_id = "okta-example-org"
-baseline_events_per_actor = 2
-
 [source.baseline_source_ips]
 user-001 = ["198.51.100.10"]
 user-002 = ["203.0.113.62"]

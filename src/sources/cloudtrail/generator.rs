@@ -240,14 +240,10 @@ fn actor_seed_from_identity(
     } else {
         None
     };
-    let rate_per_hour = match (&kind, role.as_ref()) {
-        (ActorKind::Human, Some(ActorRole::Admin)) => 18.0,
-        (ActorKind::Human, Some(ActorRole::Developer)) => 14.0,
-        (ActorKind::Human, Some(ActorRole::ReadOnly)) => 8.0,
-        (ActorKind::Human, Some(ActorRole::Auditor)) => 6.0,
-        (ActorKind::Human, None) => 10.0,
-        (ActorKind::Service, _) => 12.0,
-    };
+    let rate_per_hour = identity
+        .rate_per_hour
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or_else(|| default_rate_for_identity(&kind, role.as_ref()));
     let identity_type = if principal.arn.contains(":assumed-role/") {
         "AssumedRole"
     } else {
@@ -288,6 +284,17 @@ fn actor_seed_from_identity(
         timezone_offset: timezone_offset_for_identity(identity),
         timezone_fixed: true,
         weekend_active: identity.service_account,
+    }
+}
+
+fn default_rate_for_identity(kind: &ActorKind, role: Option<&ActorRole>) -> f64 {
+    match (kind, role) {
+        (ActorKind::Human, Some(ActorRole::Admin)) => 18.0,
+        (ActorKind::Human, Some(ActorRole::Developer)) => 14.0,
+        (ActorKind::Human, Some(ActorRole::ReadOnly)) => 8.0,
+        (ActorKind::Human, Some(ActorRole::Auditor)) => 6.0,
+        (ActorKind::Human, None) => 10.0,
+        (ActorKind::Service, _) => 12.0,
     }
 }
 
@@ -767,12 +774,7 @@ fn build_schedule(
 
 fn schedule_after(actor: &ActorProfile, now: DateTime<Utc>, rng: &mut impl Rng) -> DateTime<Utc> {
     let rate = effective_rate(actor, now, rng);
-    let mut next = now + sample_interval(rate, rng);
-    if let Some(end) = actor.session_end_at {
-        if next > end {
-            next = end;
-        }
-    }
+    let next = now + sample_interval(rate, rng);
     actor.next_available_at(next)
 }
 
@@ -783,7 +785,11 @@ fn schedule_from(actor: &ActorProfile, base: DateTime<Utc>, rng: &mut impl Rng) 
 }
 
 fn sample_interval(rate_per_hour: f64, rng: &mut impl Rng) -> Duration {
-    let rate = rate_per_hour.max(0.001);
+    let rate = if rate_per_hour.is_finite() && rate_per_hour > 0.0 {
+        rate_per_hour
+    } else {
+        0.001
+    };
     let lambda = rate / 3600.0;
     let u: f64 = rng.gen_range(0.0..1.0);
     let secs = -u.ln() / lambda;
@@ -791,7 +797,11 @@ fn sample_interval(rate_per_hour: f64, rng: &mut impl Rng) -> Duration {
 }
 
 fn effective_rate(actor: &ActorProfile, now: DateTime<Utc>, rng: &mut impl Rng) -> f64 {
-    let base = actor.seed.rate_per_hour.max(0.1);
+    let base = if actor.seed.rate_per_hour.is_finite() && actor.seed.rate_per_hour > 0.0 {
+        actor.seed.rate_per_hour
+    } else {
+        0.001
+    };
     if matches!(actor.seed.kind, ActorKind::Human) {
         return base;
     }
@@ -903,5 +913,54 @@ fn shuffle_actors(actors: &mut [ActorProfile], rng: &mut impl Rng) {
     for idx in (1..actors.len()).rev() {
         let swap_idx = rng.gen_range(0..=idx);
         actors.swap(idx, swap_idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::actors::ActorSeed;
+    use std::collections::HashMap;
+
+    #[test]
+    fn schedule_after_does_not_clamp_to_session_end() {
+        let now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let session_end = now + Duration::minutes(1);
+        let mut actor = ActorProfile::from_seed(ActorSeed {
+            kind: ActorKind::Human,
+            role: Some(ActorRole::Developer),
+            id: Some("actor-1".to_string()),
+            identity_type: "IAMUser".to_string(),
+            principal_id: "AIDAEXAMPLE".to_string(),
+            arn: "arn:aws:iam::123456789012:user/actor-1".to_string(),
+            account_id: "123456789012".to_string(),
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            rate_per_hour: 0.000_001,
+            error_rate: 0.01,
+            tags: Vec::new(),
+            event_bias: HashMap::new(),
+            service_profile: None,
+            service_pattern: None,
+            user_name: Some("actor-1".to_string()),
+            display_name: Some("Actor One".to_string()),
+            email: Some("actor-1@example.com".to_string()),
+            home_location: Some("Test".to_string()),
+            normal_countries_regions: Vec::new(),
+            user_agents: vec!["test-agent".to_string()],
+            source_ips: vec!["198.51.100.10".to_string()],
+            active_start_hour: 0,
+            active_hours: 24,
+            timezone_offset: 0,
+            timezone_fixed: true,
+            weekend_active: true,
+        });
+        actor.session_end_at = Some(session_end);
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let next = schedule_after(&actor, now, &mut rng);
+
+        assert!(next > session_end);
     }
 }

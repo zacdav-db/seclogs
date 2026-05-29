@@ -22,8 +22,6 @@ type = "databricks_audit"
 identity_registry_path = "./examples/identity_registry.toml"
 account_id = "example-account-id"
 workspace_id = "1234567890"
-baseline_events_per_actor = 2
-
 [source.baseline_source_ips]
 user-001 = ["198.51.100.10"]
 svc-001 = ["10.16.0.10"]
