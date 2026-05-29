@@ -192,11 +192,11 @@ error instead of silently dropping events.
 
 `zerobus(...)` writes the common seclog row shape with `time`, envelope
 columns, `envelope_json`, and `payload_json`. It infers the Zerobus endpoint
-from the Databricks SDK workspace client by checking SDK config, `/config`, and
-the account workspace-details endpoint; pass `region=` only when those
-endpoints are unavailable. `volume(...)` writes source-native JSONL files
-directly below the configured volume path using
-`<file_prefix>-<source>-000000.jsonl` file names.
+from the Databricks SDK workspace client by checking SDK config, the workspace
+metastore summary region, `/config`, and the account workspace-details
+endpoint; pass `region=` only when those endpoints are unavailable.
+`volume(...)` writes source-native JSONL files directly below the configured
+volume path using `<file_prefix>-<source>-000000.jsonl` file names.
 
 ## Progress
 
