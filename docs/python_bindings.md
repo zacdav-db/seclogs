@@ -195,8 +195,10 @@ columns, `envelope_json`, and `payload_json`. It infers the Zerobus endpoint
 from the Databricks SDK workspace client by checking SDK config, the workspace
 metastore summary region, `/config`, and the account workspace-details
 endpoint; pass `region=` only when those endpoints are unavailable.
-`volume(...)` writes source-native JSONL files directly below the configured
-volume path using `<file_prefix>-<source>-000000.jsonl` file names.
+`volume(...)` writes source-native JSONL files below the configured volume path,
+partitioned as `source=<source>/tenant_id=<tenant_id>/region=<region>/`. The
+Python sink derives `tenant_id` from the normalized envelope and `region` from
+CloudTrail-style `awsRegion` / `aws_region` payload fields.
 
 Use `until_time=` to run a bounded simulated backfill without setting an event
 count. When neither `events_per_second` nor `time_scale` is set, generation runs

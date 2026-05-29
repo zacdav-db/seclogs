@@ -1743,7 +1743,11 @@ def _normalize_volume_path(path: str) -> str:
 
 
 def _safe_volume_segment(value: str) -> str:
-    return "".join(char if char.isalnum() or char in "._=-" else "_" for char in value)
+    sanitized = "".join(
+        char if char.isascii() and (char.isalnum() or char in "-_.") else "_"
+        for char in value
+    )
+    return sanitized or "unknown"
 
 
 def _event_to_zerobus_row(
@@ -2196,9 +2200,7 @@ def _jsonl_sink_label(sink: JsonlSink, destination: str, source: str) -> str:
 class _DatabricksVolumeSinkHandle:
     sink: DatabricksVolumeSink
     base_path: str
-    run_id: str
-    buffers: dict[str, list[str]] = field(default_factory=dict)
-    counters: dict[str, int] = field(default_factory=dict)
+    buffers: dict[tuple[str, str, str], list[str]] = field(default_factory=dict)
     created_directories: set[str] = field(default_factory=set)
 
     def write(self, event: Mapping[str, Any], source: str) -> Optional[str]:
@@ -2206,44 +2208,81 @@ class _DatabricksVolumeSinkHandle:
             return None
 
         row = _event_record(event, self.sink.record)
-        self.buffers.setdefault(source, []).append(
+        key = _volume_partition_key(event, source)
+        self.buffers.setdefault(key, []).append(
             json.dumps(row, separators=(",", ":")) + "\n"
         )
-        if self.sink.flush_every and len(self.buffers[source]) >= self.sink.flush_every:
-            self._upload_source(source)
+        if self.sink.flush_every and len(self.buffers[key]) >= self.sink.flush_every:
+            self._upload_partition(key)
         return self._label(source)
 
     def flush(self) -> None:
-        for source in list(self.buffers):
-            self._upload_source(source)
+        for key in list(self.buffers):
+            self._upload_partition(key)
 
     def close(self) -> None:
         self.flush()
 
-    def _upload_source(self, source: str) -> None:
-        rows = self.buffers.get(source)
+    def _upload_partition(self, key: tuple[str, str, str]) -> None:
+        rows = self.buffers.get(key)
         if not rows:
             return
 
-        counter = self.counters.get(source, 0)
-        self.counters[source] = counter + 1
-        directory = self.base_path
-        file_path = (
-            f"{directory}/{self.sink.file_prefix}-"
-            f"{_safe_volume_segment(source)}-{counter:06d}.jsonl"
+        source, tenant_id, region = key
+        directory = (
+            f"{self.base_path}/source={_safe_volume_segment(source)}"
+            f"/tenant_id={_safe_volume_segment(tenant_id)}"
+            f"/region={_safe_volume_segment(region)}"
         )
+        file_path = f"{directory}/{_volume_file_name(source, tenant_id, region)}"
         payload = "".join(rows).encode("utf-8")
         files = getattr(self.sink.workspace_client, "files", None)
         if files is None:
             raise ValueError("workspace_client must expose a files API")
-        if directory not in self.created_directories:
-            files.create_directory(directory)
-            self.created_directories.add(directory)
+        self._ensure_directory(files, directory)
         files.upload(file_path, io.BytesIO(payload), overwrite=self.sink.overwrite)
         rows.clear()
 
+    def _ensure_directory(self, files: Any, directory: str) -> None:
+        for path in _volume_subdirectories_below_root(directory):
+            if path and path not in self.created_directories:
+                files.create_directory(path)
+                self.created_directories.add(path)
+
     def _label(self, source: str) -> str:
         return f"{source} -> volume {self.base_path}"
+
+
+def _volume_partition_key(event: Mapping[str, Any], source: str) -> tuple[str, str, str]:
+    envelope = event.get("envelope")
+    payload = event.get("payload")
+    tenant_id = "unknown-tenant"
+    region = "global"
+    if isinstance(envelope, Mapping):
+        tenant_id = str(envelope.get("tenant_id") or tenant_id)
+    if isinstance(payload, Mapping):
+        region = str(payload.get("awsRegion") or payload.get("aws_region") or region)
+    return source, tenant_id, region
+
+
+def _volume_file_name(source: str, tenant_id: str, region: str) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%MZ")
+    unique = uuid.uuid4().hex[:16]
+    return (
+        f"{_safe_volume_segment(tenant_id)}_"
+        f"{_safe_volume_segment(source)}_"
+        f"{_safe_volume_segment(region)}_"
+        f"{stamp}_{unique}.jsonl"
+    )
+
+
+def _volume_subdirectories_below_root(directory: str) -> list[str]:
+    parts = directory.split("/")
+    if len(parts) < 5 or parts[:2] != ["", "Volumes"]:
+        raise ValueError(
+            "volume_path must start with /Volumes/<catalog>/<schema>/<volume>"
+        )
+    return ["/".join(parts[:index]) for index in range(6, len(parts) + 1)]
 
 
 def _open_databricks_volume_sink(
@@ -2254,7 +2293,6 @@ def _open_databricks_volume_sink(
     handle = _DatabricksVolumeSinkHandle(
         sink=sink,
         base_path=_normalize_volume_path(sink.volume_path),
-        run_id=run_id,
     )
     stack.callback(handle.close)
     return handle
