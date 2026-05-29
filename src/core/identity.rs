@@ -4,7 +4,9 @@
 //! service accounts, and platform identifiers should live in registry files,
 //! while generators consume the normalized identities through this module.
 
-use super::actors::{ActorKind, ActorPopulation, ActorRole, ActorSeed, ServiceProfile};
+use super::actors::{
+    ActorKind, ActorPopulation, ActorRole, ActorSeed, ServicePattern, ServiceProfile,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -87,6 +89,16 @@ pub struct Identity {
     pub tags: Vec<String>,
     #[serde(default)]
     pub rate_per_hour: Option<f64>,
+    #[serde(default)]
+    pub active_start_hour: Option<u8>,
+    #[serde(default)]
+    pub active_hours: Option<u8>,
+    #[serde(default)]
+    pub timezone_offset: Option<i8>,
+    #[serde(default)]
+    pub weekend_active: Option<bool>,
+    #[serde(default)]
+    pub service_pattern: Option<String>,
 }
 
 /// Registry file format.
@@ -367,7 +379,21 @@ fn identity_from_actor_seed(actor: &ActorSeed, idx: usize, ordinal: usize) -> Id
         service_account,
         tags: actor.tags.clone(),
         rate_per_hour: Some(actor.rate_per_hour),
+        active_start_hour: Some(actor.active_start_hour),
+        active_hours: Some(actor.active_hours),
+        timezone_offset: Some(actor.timezone_offset),
+        weekend_active: Some(actor.weekend_active),
+        service_pattern: actor.service_pattern.as_ref().map(service_pattern_name),
     }
+}
+
+fn service_pattern_name(pattern: &ServicePattern) -> String {
+    match pattern {
+        ServicePattern::Constant => "constant",
+        ServicePattern::Diurnal => "diurnal",
+        ServicePattern::Bursty => "bursty",
+    }
+    .to_string()
 }
 
 fn aws_principal_from_actor(actor: &ActorSeed) -> AwsPrincipal {
@@ -708,6 +734,11 @@ mod tests {
             service_account: false,
             tags: Vec::new(),
             rate_per_hour: None,
+            active_start_hour: None,
+            active_hours: None,
+            timezone_offset: None,
+            weekend_active: None,
+            service_pattern: None,
         }
     }
 }

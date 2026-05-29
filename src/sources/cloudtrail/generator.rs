@@ -1,6 +1,7 @@
 use super::catalog::{resolve_event_weights, CatalogError, EventSelector, WeightedEvent};
 use super::templates::{build_cloudtrail_event, default_error_profile, ActorContext};
 use crate::actors_parquet as actor_store;
+use crate::core::activity::identity_timezone_offset;
 use crate::core::actors::{ActorKind, ActorProfile, ActorRole, ServicePattern, ServiceProfile};
 use crate::core::config::CloudTrailSourceConfig;
 use crate::core::event::{Actor, Event, EventEnvelope, Outcome};
@@ -235,11 +236,10 @@ fn actor_seed_from_identity(
     } else {
         None
     };
-    let service_pattern = if identity.service_account {
-        Some(ServicePattern::Constant)
-    } else {
-        None
-    };
+    let service_pattern = identity
+        .service_pattern
+        .as_deref()
+        .and_then(service_pattern_for);
     let rate_per_hour = identity
         .rate_per_hour
         .filter(|rate| rate.is_finite() && *rate > 0.0)
@@ -279,11 +279,26 @@ fn actor_seed_from_identity(
         normal_countries_regions: identity.normal_countries_regions.clone(),
         user_agents: user_agents_for_identity(identity),
         source_ips: source_ips_for_identity(config, identity, idx),
-        active_start_hour: if identity.service_account { 0 } else { 8 },
-        active_hours: if identity.service_account { 24 } else { 10 },
-        timezone_offset: timezone_offset_for_identity(identity),
+        active_start_hour: identity
+            .active_start_hour
+            .filter(|hour| *hour < 24)
+            .unwrap_or(if identity.service_account { 0 } else { 8 }),
+        active_hours: identity
+            .active_hours
+            .filter(|hours| *hours > 0 && *hours <= 24)
+            .unwrap_or(if identity.service_account { 24 } else { 10 }),
+        timezone_offset: identity_timezone_offset(identity),
         timezone_fixed: true,
-        weekend_active: identity.service_account,
+        weekend_active: identity.weekend_active.unwrap_or(identity.service_account),
+    }
+}
+
+fn service_pattern_for(value: &str) -> Option<ServicePattern> {
+    match value.to_ascii_lowercase().as_str() {
+        "constant" => Some(ServicePattern::Constant),
+        "diurnal" => Some(ServicePattern::Diurnal),
+        "bursty" => Some(ServicePattern::Bursty),
+        _ => None,
     }
 }
 
@@ -367,24 +382,6 @@ fn source_ips_for_identity(
         vec![format!("203.0.113.{}", 60 + (idx % 20))]
     } else {
         vec![format!("198.51.100.{}", 10 + (idx % 80))]
-    }
-}
-
-fn timezone_offset_for_identity(identity: &Identity) -> i8 {
-    if identity
-        .normal_countries_regions
-        .iter()
-        .any(|region| region.contains("Singapore"))
-    {
-        8
-    } else if identity
-        .normal_countries_regions
-        .iter()
-        .any(|region| region.contains("Australia"))
-    {
-        10
-    } else {
-        0
     }
 }
 

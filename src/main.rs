@@ -767,6 +767,11 @@ fn identity_population_row_json(
         "databricks_username": &identity.databricks_username,
         "service_account": identity.service_account,
         "rate_per_hour": identity.rate_per_hour,
+        "active_start_hour": identity.active_start_hour,
+        "active_hours": identity.active_hours,
+        "timezone_offset": identity.timezone_offset,
+        "weekend_active": identity.weekend_active,
+        "service_pattern": &identity.service_pattern,
         "tags_json": serde_json::to_string(&identity.tags)?,
         "aws_principals_json": serde_json::to_string(&identity.aws_principals)?,
         "identity_json": identity_json,
@@ -1322,6 +1327,11 @@ mod tests {
             service_account,
             tags: Vec::new(),
             rate_per_hour: None,
+            active_start_hour: None,
+            active_hours: None,
+            timezone_offset: None,
+            weekend_active: None,
+            service_pattern: None,
         }
     }
 }
