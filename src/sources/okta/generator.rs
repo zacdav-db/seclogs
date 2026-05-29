@@ -3,6 +3,7 @@ use super::model::{
     OktaGeographicalContext, OktaIpChainEntry, OktaLogEvent, OktaOutcome, OktaRequest,
     OktaSecurityContext, OktaTarget, OktaTransaction, OktaUserAgent,
 };
+use crate::core::activity::{first_identity_event_at, next_identity_event_after};
 use crate::core::config::{
     OktaDeviceConfig, OktaOutcomeResult, OktaSecurityContextConfig, OktaSeverity,
     OktaSystemLogEventConfig, OktaSystemLogSourceConfig, OktaTargetConfig, OktaTransactionType,
@@ -10,7 +11,7 @@ use crate::core::config::{
 use crate::core::event::{Actor, Event, EventEnvelope, Geo, Outcome, Target};
 use crate::core::identity::{Identity, IdentityRegistry, IdentityRegistryError};
 use crate::core::traits::EventSource;
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use serde_json::{Map, Number, Value};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, VecDeque};
@@ -144,7 +145,12 @@ impl OktaSystemLogGenerator {
         );
         let event = event_from_row(&self.config, identity, row);
 
-        let next_at = published + interval_for_identity(identity);
+        let next_at = next_identity_event_after(
+            identity,
+            published,
+            self.next_event_idx[actor_idx],
+            "okta_system_log",
+        );
         self.schedule.push(Reverse((next_at, actor_idx)));
         Some(event)
     }
@@ -203,54 +209,10 @@ fn build_identity_schedule(
 ) -> BinaryHeap<Reverse<(DateTime<Utc>, usize)>> {
     let mut schedule = BinaryHeap::with_capacity(identities.len());
     for (idx, identity) in identities.iter().enumerate() {
-        let first_at = start_time + deterministic_phase(identity, interval_for_identity(identity));
+        let first_at = first_identity_event_at(identity, start_time, "okta_system_log");
         schedule.push(Reverse((first_at, idx)));
     }
     schedule
-}
-
-fn interval_for_identity(identity: &Identity) -> Duration {
-    interval_for_rate(identity_rate_per_hour(identity))
-}
-
-fn interval_for_rate(rate_per_hour: f64) -> Duration {
-    let rate = if rate_per_hour.is_finite() && rate_per_hour > 0.0 {
-        rate_per_hour
-    } else {
-        1.0
-    };
-    let millis = ((3600.0 / rate) * 1000.0)
-        .round()
-        .clamp(1.0, i64::MAX as f64) as i64;
-    Duration::milliseconds(millis)
-}
-
-fn deterministic_phase(identity: &Identity, interval: Duration) -> Duration {
-    let millis = interval.num_milliseconds().max(1) as u64;
-    Duration::milliseconds((stable_hash(&identity.actor_id) % millis) as i64)
-}
-
-fn identity_rate_per_hour(identity: &Identity) -> f64 {
-    identity
-        .rate_per_hour
-        .filter(|rate| rate.is_finite() && *rate > 0.0)
-        .unwrap_or_else(|| default_rate_for_identity(identity))
-}
-
-fn default_rate_for_identity(identity: &Identity) -> f64 {
-    if identity.service_account {
-        return 12.0;
-    }
-    let role = identity.role_persona.to_ascii_lowercase();
-    if role.contains("admin") {
-        18.0
-    } else if role.contains("audit") || role.contains("risk") || role.contains("security") {
-        6.0
-    } else if role.contains("read") || role.contains("business") || role.contains("support") {
-        8.0
-    } else {
-        14.0
-    }
 }
 
 fn log_event_for_entry(
@@ -1457,32 +1419,68 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_rows_follow_identity_rate() {
+    fn scheduled_rows_follow_local_active_windows() {
         let mut config = test_config();
         config.events.clear();
         config.baseline_events_per_actor = None;
-        let mut actor = identity(
-            "user-primary",
-            "primary@example.com",
-            "00u-primary",
-            &["Australia"],
+        let mut singapore = identity(
+            "user-singapore",
+            "singapore@example.com",
+            "00u-singapore",
+            &["Singapore"],
             false,
         );
-        actor.rate_per_hour = Some(0.5);
-        let registry = IdentityRegistry::new("test", vec![actor]).unwrap();
+        singapore.rate_per_hour = Some(6.0);
+        singapore.active_start_hour = Some(8);
+        singapore.active_hours = Some(10);
+        singapore.timezone_offset = Some(8);
+        singapore.weekend_active = Some(false);
+        let mut london = identity(
+            "user-london",
+            "london@example.com",
+            "00u-london",
+            &["United Kingdom"],
+            false,
+        );
+        london.rate_per_hour = Some(6.0);
+        london.active_start_hour = Some(8);
+        london.active_hours = Some(10);
+        london.timezone_offset = Some(0);
+        london.weekend_active = Some(false);
+        let registry = IdentityRegistry::new("test", vec![singapore, london]).unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-01-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let mut generator =
-            OktaSystemLogGenerator::from_registry(&config, registry, test_start_time()).unwrap();
+            OktaSystemLogGenerator::from_registry(&config, registry, start).unwrap();
 
-        let first = generator.next_event().unwrap();
-        let second = generator.next_event().unwrap();
-        let first_time = DateTime::parse_from_rfc3339(&first.envelope.timestamp)
-            .unwrap()
-            .with_timezone(&Utc);
-        let second_time = DateTime::parse_from_rfc3339(&second.envelope.timestamp)
-            .unwrap()
-            .with_timezone(&Utc);
+        let mut singapore_workday = 0;
+        let mut singapore_off_hours = 0;
+        let mut london_workday = 0;
+        let mut london_off_hours = 0;
+        for _ in 0..900 {
+            let event = generator.next_event().unwrap();
+            let hour = DateTime::parse_from_rfc3339(&event.envelope.timestamp)
+                .unwrap()
+                .with_timezone(&Utc)
+                .hour();
+            match event.envelope.actor.id.as_str() {
+                "user-singapore" if (0..10).contains(&hour) => singapore_workday += 1,
+                "user-singapore" if !(0..10).contains(&hour) => singapore_off_hours += 1,
+                "user-london" if (8..18).contains(&hour) => london_workday += 1,
+                "user-london" if !(8..18).contains(&hour) => london_off_hours += 1,
+                _ => {}
+            }
+        }
 
-        assert_eq!(second_time - first_time, Duration::hours(2));
+        assert!(
+            singapore_workday > singapore_off_hours * 2,
+            "singapore_workday={singapore_workday} singapore_off_hours={singapore_off_hours}"
+        );
+        assert!(
+            london_workday > london_off_hours * 2,
+            "london_workday={london_workday} london_off_hours={london_off_hours}"
+        );
     }
 
     fn generator(
@@ -1698,6 +1696,11 @@ mod tests {
             service_account,
             tags: Vec::new(),
             rate_per_hour: None,
+            active_start_hour: None,
+            active_hours: None,
+            timezone_offset: None,
+            weekend_active: None,
+            service_pattern: None,
         }
     }
 }

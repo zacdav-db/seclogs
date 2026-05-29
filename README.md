@@ -227,6 +227,11 @@ okta_user_id = "00u-example-user-001"
 databricks_username = "amelia.chen@example.com.au"
 service_account = false
 tags = ["human"]
+rate_per_hour = 12.0
+active_start_hour = 8
+active_hours = 10
+timezone_offset = 10
+weekend_active = false
 
 [[identity.aws_principals]]
 account_id = "123456789012"
@@ -234,6 +239,13 @@ principal_id = "AIDAEXAMPLEUSER001"
 arn = "arn:aws:iam::123456789012:user/amelia.chen"
 access_key_id = "AKIAEXAMPLEUSER01"
 ```
+
+Generated registries also preserve actor scheduling metadata:
+`rate_per_hour`, `active_start_hour`, `active_hours`, `timezone_offset`,
+`weekend_active`, and service-account `service_pattern`. CloudTrail,
+Databricks audit, and Okta System Log use those fields for registry-backed
+baseline scheduling, so global human populations produce local workday curves
+instead of flat per-hour activity.
 
 ## actors.toml reference (population generation)
 `actors.toml` controls how the actor population is built and stored as Parquet.
@@ -644,7 +656,8 @@ route is present and the source configuration uses an `identity_registry_path`,
 identity population to that table before event generation. The actor population
 table uses `time`,
 `registry_name`, `actor_id`, `actor_kind`, identity fields,
-`rate_per_hour`, `normal_countries_regions_json`, `tags_json`, `aws_principals_json`,
+`rate_per_hour`, activity schedule fields,
+`normal_countries_regions_json`, `tags_json`, `aws_principals_json`,
 `identity_json`, `run_id`, and `generated_at`.
 
 ### Databricks volume output

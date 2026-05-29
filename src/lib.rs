@@ -8,6 +8,7 @@ pub mod core;
 pub mod formats;
 pub mod sources;
 
+pub use core::activity;
 pub use core::actors;
 pub use core::config;
 pub use core::event;
