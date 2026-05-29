@@ -1780,13 +1780,7 @@ def _infer_zerobus_endpoint(
 ) -> str:
     workspace_id = _workspace_id(workspace_client)
     workspace_region = region or _infer_workspace_region(workspace_client, workspace_id)
-    host = _workspace_host(workspace_client)
-    if host.endswith(".azuredatabricks.net"):
-        suffix = "azuredatabricks.net"
-    elif host.endswith(".gcp.databricks.com"):
-        suffix = "gcp.databricks.com"
-    else:
-        suffix = "cloud.databricks.com"
+    suffix = _workspace_cloud_suffix(workspace_client)
     return f"https://{workspace_id}.zerobus.{workspace_region}.{suffix}"
 
 
@@ -1795,6 +1789,10 @@ def _infer_workspace_region(workspace_client: Any, workspace_id: str) -> str:
         value = _workspace_config_attr(workspace_client, attr)
         if value:
             return value
+
+    region = _workspace_metastore_region(workspace_client)
+    if region:
+        return region
 
     workspace_config = _workspace_config_details(workspace_client)
     region = _workspace_config_region(workspace_config)
@@ -1829,8 +1827,85 @@ def _infer_workspace_region(workspace_client: Any, workspace_id: str) -> str:
 
     raise ValueError(
         "could not infer Databricks workspace region for Zerobus from "
-        "WorkspaceClient config, /config, or account workspace details; pass region="
+        "WorkspaceClient config, metastore summary, /config, or account workspace "
+        "details; pass region="
     )
+
+
+def _workspace_cloud_suffix(workspace_client: Any) -> str:
+    cloud = _workspace_cloud(workspace_client)
+    if cloud in ("azure", "azure_public", "azure_us_gov"):
+        return "azuredatabricks.net"
+    if cloud in ("gcp", "google"):
+        return "gcp.databricks.com"
+    if cloud == "aws":
+        return "cloud.databricks.com"
+
+    host = _workspace_host(workspace_client)
+    if host.endswith(".azuredatabricks.net"):
+        return "azuredatabricks.net"
+    if host.endswith(".gcp.databricks.com"):
+        return "gcp.databricks.com"
+    return "cloud.databricks.com"
+
+
+def _workspace_cloud(workspace_client: Any) -> Optional[str]:
+    config = getattr(workspace_client, "config", None)
+    environment = getattr(config, "environment", None) if config is not None else None
+    cloud = getattr(environment, "cloud", None) if environment is not None else None
+    value = getattr(cloud, "value", None) if cloud is not None else None
+    cloud_value = value or cloud
+    if not cloud_value:
+        return None
+    return str(cloud_value).lower().rsplit(".", 1)[-1]
+
+
+def _workspace_metastore_region(workspace_client: Any) -> Optional[str]:
+    metastores = getattr(workspace_client, "metastores", None)
+    summary = getattr(metastores, "summary", None) if metastores is not None else None
+    if not callable(summary):
+        return None
+    try:
+        details = summary()
+    except Exception:
+        return None
+
+    region = _object_field(details, "region")
+    if region:
+        return region
+
+    global_metastore_id = _object_field(details, "global_metastore_id")
+    if global_metastore_id:
+        return _region_from_global_metastore_id(global_metastore_id)
+    return None
+
+
+def _object_field(value: Any, name: str) -> Optional[str]:
+    if isinstance(value, Mapping):
+        field = value.get(name)
+        return str(field) if field not in (None, "") else None
+
+    field = getattr(value, name, None)
+    if field not in (None, ""):
+        return str(field)
+
+    as_dict = getattr(value, "as_dict", None)
+    if callable(as_dict):
+        try:
+            fields = as_dict()
+        except Exception:
+            return None
+        if isinstance(fields, Mapping):
+            field = fields.get(name)
+            return str(field) if field not in (None, "") else None
+    return None
+
+
+def _region_from_global_metastore_id(value: str) -> Optional[str]:
+    parts = value.split(":")
+    if len(parts) >= 3 and parts[1]:
+        return parts[1]
+    return None
 
 
 def _workspace_config_details(workspace_client: Any) -> dict[str, Any]:
