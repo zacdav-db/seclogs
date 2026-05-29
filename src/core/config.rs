@@ -60,6 +60,8 @@ impl Config {
 pub struct TrafficConfig {
     /// Optional start time for the simulated clock (RFC3339).
     pub start_time: Option<String>,
+    /// Optional simulated high-water mark where generation stops (RFC3339).
+    pub until_time: Option<String>,
     /// Time scale multiplier (1.0 = real time, 60.0 = 1 minute per second).
     pub time_scale: Option<f64>,
 }
@@ -297,7 +299,7 @@ pub struct DatabricksAuditSourceConfig {
     pub account_id: String,
     /// Workspace ID to place on generated audit rows.
     pub workspace_id: String,
-    /// Optional finite number of normal baseline rows to emit for each identity.
+    /// Backwards-compatible baseline switch: set to 0 to disable continuous baseline rows.
     pub baseline_events_per_actor: Option<usize>,
     /// Optional deterministic source IP pools for baseline rows, keyed by actor ID.
     pub baseline_source_ips: Option<HashMap<String, Vec<String>>>,
@@ -335,7 +337,7 @@ pub struct OktaSystemLogSourceConfig {
     pub identity_registry_path: String,
     /// Optional Okta organization identifier used in the normalized envelope.
     pub org_id: Option<String>,
-    /// Optional finite number of normal baseline rows to emit for each identity.
+    /// Backwards-compatible baseline switch: set to 0 to disable continuous baseline rows.
     pub baseline_events_per_actor: Option<usize>,
     /// Optional deterministic source IP pools for baseline rows, keyed by actor ID.
     pub baseline_source_ips: Option<HashMap<String, Vec<String>>>,

@@ -48,6 +48,8 @@ enum Commands {
         max_events: Option<u64>,
         #[arg(long)]
         max_seconds: Option<u64>,
+        #[arg(long)]
+        until_time: Option<String>,
         #[arg(long, default_value_t = 1000)]
         metrics_interval_ms: u64,
         #[arg(long, default_value_t = 0)]
@@ -80,6 +82,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             dry_run,
             max_events,
             max_seconds,
+            until_time,
             metrics_interval_ms,
             gen_workers,
             writer_shards,
@@ -111,6 +114,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let start_time = Instant::now();
             let max_duration = max_seconds.map(Duration::from_secs);
             let start_sim_time = parse_start_time(loaded.traffic.start_time.as_deref())?;
+            let until_sim_time = parse_optional_time(
+                until_time
+                    .as_deref()
+                    .or(loaded.traffic.until_time.as_deref()),
+            )?;
             let time_scale = loaded.traffic.time_scale.unwrap_or(1.0);
             let time_scale = if time_scale <= 0.0 {
                 None
@@ -127,6 +135,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             loaded.seed,
                             start_sim_time,
                             time_scale,
+                            until_sim_time,
                             max_events,
                             max_duration,
                             writer_shards,
@@ -142,6 +151,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             time_scale,
                             start_sim_time,
                             start_time,
+                            until_sim_time,
                             max_events,
                             max_duration,
                             writer_shards,
@@ -166,6 +176,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         time_scale,
                         start_sim_time,
                         start_time,
+                        until_sim_time,
                         max_events,
                         max_duration,
                         Duration::from_millis(metrics_interval_ms),
@@ -185,6 +196,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         time_scale,
                         start_sim_time,
                         start_time,
+                        until_sim_time,
                         max_events,
                         max_duration,
                         Duration::from_millis(metrics_interval_ms),
@@ -221,6 +233,7 @@ fn run_file_generation(
     time_scale: Option<f64>,
     start_sim_time: DateTime<Utc>,
     start_time: Instant,
+    until_sim_time: Option<DateTime<Utc>>,
     max_events: Option<u64>,
     max_duration: Option<Duration>,
     writer_shards: usize,
@@ -232,7 +245,7 @@ fn run_file_generation(
         spawn_writer_shards(output, writer_shards, queue_depth, &counters);
     let flush_interval = Some(Duration::from_secs(1));
     let mut next_flush = flush_interval.map(|interval| Instant::now() + interval);
-    let mut metrics = Metrics::new(metrics_interval);
+    let mut metrics = Metrics::new(metrics_interval, start_sim_time);
     let mut total_dispatched = 0_u64;
     let mut last_written_events = 0_u64;
     let mut last_written_bytes = 0_u64;
@@ -256,7 +269,12 @@ fn run_file_generation(
             break;
         };
 
-        if let Some(event_time) = parse_event_time(&event) {
+        let event_time = parse_event_time(&event);
+        let metric_event_time = event_time.clone();
+        if should_stop_at_until(event_time, until_sim_time) {
+            break;
+        }
+        if let Some(event_time) = event_time {
             if let Some(scale) = time_scale {
                 throttle_to_sim_time(event_time, last_sim_time, scale, &mut last_wall);
             }
@@ -282,7 +300,13 @@ fn run_file_generation(
             }
         }
 
-        metrics.record(loop_events, loop_bytes, Duration::ZERO, 0);
+        metrics.record(
+            loop_events,
+            loop_bytes,
+            Duration::ZERO,
+            0,
+            metric_event_time,
+        );
     }
 
     for tx in &writer_txs {
@@ -308,6 +332,7 @@ fn run_multi_file_generation(
     seed: Option<u64>,
     start_sim_time: DateTime<Utc>,
     time_scale: Option<f64>,
+    until_sim_time: Option<DateTime<Utc>>,
     max_events: Option<u64>,
     max_duration: Option<Duration>,
     writer_shards: usize,
@@ -323,7 +348,7 @@ fn run_multi_file_generation(
     let mut writers = RoutedWriters::new(config, default_output, writer_shards, queue_depth)?;
     let flush_interval = Some(Duration::from_secs(1));
     let mut next_flush = flush_interval.map(|interval| Instant::now() + interval);
-    let mut metrics = Metrics::new(metrics_interval);
+    let mut metrics = Metrics::new(metrics_interval, start_sim_time);
     let start_time = Instant::now();
     let mut last_sim_time = start_sim_time;
     let mut last_wall = Instant::now();
@@ -348,7 +373,12 @@ fn run_multi_file_generation(
             break;
         };
 
-        if let Some(event_time) = parse_event_time(&event) {
+        let event_time = parse_event_time(&event);
+        let metric_event_time = event_time.clone();
+        if should_stop_at_until(event_time, until_sim_time) {
+            break;
+        }
+        if let Some(event_time) = event_time {
             if let Some(scale) = time_scale {
                 throttle_to_sim_time(event_time, last_sim_time, scale, &mut last_wall);
             }
@@ -372,7 +402,13 @@ fn run_multi_file_generation(
             }
         }
 
-        metrics.record(loop_events, loop_bytes, Duration::ZERO, 0);
+        metrics.record(
+            loop_events,
+            loop_bytes,
+            Duration::ZERO,
+            0,
+            metric_event_time,
+        );
     }
 
     writers.close()?;
@@ -387,6 +423,7 @@ fn run_zerobus_generation(
     time_scale: Option<f64>,
     start_sim_time: DateTime<Utc>,
     start_time: Instant,
+    until_sim_time: Option<DateTime<Utc>>,
     max_events: Option<u64>,
     max_duration: Option<Duration>,
     metrics_interval: Duration,
@@ -395,7 +432,7 @@ fn run_zerobus_generation(
     persist_zerobus_actor_population_if_configured(source_config, output, &mut writer)?;
     let flush_interval = Some(Duration::from_millis(output.flush_interval_ms.max(1)));
     let mut next_flush = flush_interval.map(|interval| Instant::now() + interval);
-    let mut metrics = Metrics::new(metrics_interval);
+    let mut metrics = Metrics::new(metrics_interval, start_sim_time);
     let mut total_dispatched = 0_u64;
     let mut loop_bytes = 0_u64;
     let mut last_sim_time = start_sim_time;
@@ -418,7 +455,12 @@ fn run_zerobus_generation(
             break;
         };
 
-        if let Some(event_time) = parse_event_time(&event) {
+        let event_time = parse_event_time(&event);
+        let metric_event_time = event_time.clone();
+        if should_stop_at_until(event_time, until_sim_time) {
+            break;
+        }
+        if let Some(event_time) = event_time {
             if let Some(scale) = time_scale {
                 throttle_to_sim_time(event_time, last_sim_time, scale, &mut last_wall);
             }
@@ -435,7 +477,7 @@ fn run_zerobus_generation(
             }
         }
 
-        metrics.record(1, loop_bytes, Duration::ZERO, 0);
+        metrics.record(1, loop_bytes, Duration::ZERO, 0, metric_event_time);
         loop_bytes = 0;
     }
 
@@ -450,6 +492,7 @@ fn run_databricks_volume_generation(
     time_scale: Option<f64>,
     start_sim_time: DateTime<Utc>,
     start_time: Instant,
+    until_sim_time: Option<DateTime<Utc>>,
     max_events: Option<u64>,
     max_duration: Option<Duration>,
     metrics_interval: Duration,
@@ -457,7 +500,7 @@ fn run_databricks_volume_generation(
     let mut writer = DatabricksVolumeWriter::new(output)?;
     let flush_interval = Some(Duration::from_millis(output.flush_interval_ms.max(1)));
     let mut next_flush = flush_interval.map(|interval| Instant::now() + interval);
-    let mut metrics = Metrics::new(metrics_interval);
+    let mut metrics = Metrics::new(metrics_interval, start_sim_time);
     let mut total_dispatched = 0_u64;
     let mut loop_bytes = 0_u64;
     let mut last_sim_time = start_sim_time;
@@ -480,7 +523,12 @@ fn run_databricks_volume_generation(
             break;
         };
 
-        if let Some(event_time) = parse_event_time(&event) {
+        let event_time = parse_event_time(&event);
+        let metric_event_time = event_time.clone();
+        if should_stop_at_until(event_time, until_sim_time) {
+            break;
+        }
+        if let Some(event_time) = event_time {
             if let Some(scale) = time_scale {
                 throttle_to_sim_time(event_time, last_sim_time, scale, &mut last_wall);
             }
@@ -497,7 +545,7 @@ fn run_databricks_volume_generation(
             }
         }
 
-        metrics.record(1, loop_bytes, Duration::ZERO, 0);
+        metrics.record(1, loop_bytes, Duration::ZERO, 0, metric_event_time);
         loop_bytes = 0;
     }
 
@@ -718,6 +766,7 @@ fn identity_population_row_json(
         "okta_user_id": &identity.okta_user_id,
         "databricks_username": &identity.databricks_username,
         "service_account": identity.service_account,
+        "rate_per_hour": identity.rate_per_hour,
         "tags_json": serde_json::to_string(&identity.tags)?,
         "aws_principals_json": serde_json::to_string(&identity.aws_principals)?,
         "identity_json": identity_json,
@@ -899,10 +948,26 @@ fn parse_start_time(value: Option<&str>) -> Result<DateTime<Utc>, Box<dyn std::e
     }
 }
 
+fn parse_optional_time(
+    value: Option<&str>,
+) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error>> {
+    value
+        .map(|raw| DateTime::parse_from_rfc3339(raw).map(|parsed| parsed.with_timezone(&Utc)))
+        .transpose()
+        .map_err(Into::into)
+}
+
 fn parse_event_time(event: &Event) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&event.envelope.timestamp)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn should_stop_at_until(
+    event_time: Option<DateTime<Utc>>,
+    until_time: Option<DateTime<Utc>>,
+) -> bool {
+    matches!((event_time, until_time), (Some(event_time), Some(until_time)) if event_time > until_time)
 }
 
 fn throttle_to_sim_time(
@@ -1022,7 +1087,10 @@ fn writer_index_for_event(event: &Event, shards: usize) -> usize {
 
 struct Metrics {
     interval: Duration,
+    started_at: Instant,
     last_report: Instant,
+    start_sim_time: DateTime<Utc>,
+    sim_high_water: DateTime<Utc>,
     events: u64,
     bytes: u64,
     overruns: Duration,
@@ -1030,10 +1098,14 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new(interval: Duration) -> Self {
+    fn new(interval: Duration, start_sim_time: DateTime<Utc>) -> Self {
+        let now = Instant::now();
         Self {
             interval,
-            last_report: Instant::now(),
+            started_at: now,
+            last_report: now,
+            start_sim_time,
+            sim_high_water: start_sim_time,
             events: 0,
             bytes: 0,
             overruns: Duration::ZERO,
@@ -1041,11 +1113,23 @@ impl Metrics {
         }
     }
 
-    fn record(&mut self, events: u64, bytes: u64, overrun: Duration, missed: u64) {
+    fn record(
+        &mut self,
+        events: u64,
+        bytes: u64,
+        overrun: Duration,
+        missed: u64,
+        event_time: Option<DateTime<Utc>>,
+    ) {
         self.events += events;
         self.bytes += bytes;
         self.overruns += overrun;
         self.missed_events += missed;
+        if let Some(event_time) = event_time {
+            if event_time > self.sim_high_water {
+                self.sim_high_water = event_time;
+            }
+        }
 
         let elapsed = self.last_report.elapsed();
         if elapsed >= self.interval {
@@ -1057,12 +1141,18 @@ impl Metrics {
             } else {
                 0.0
             };
+            let sim_elapsed_ms = (self.sim_high_water - self.start_sim_time)
+                .num_milliseconds()
+                .max(0);
 
             println!(
-                "metrics events/s={:.1} bytes/s={:.1} avg_event={}B overruns={}ms missed={}",
+                "metrics events/s={:.1} bytes/s={:.1} avg_event={}B sim_high_water={} sim_elapsed={}s wall_elapsed={:.1}s overruns={}ms missed={}",
                 events_per_sec,
                 bytes_per_sec,
                 avg_event.round() as u64,
+                self.sim_high_water.to_rfc3339_opts(SecondsFormat::Millis, true),
+                sim_elapsed_ms / 1000,
+                self.started_at.elapsed().as_secs_f64(),
                 self.overruns.as_millis(),
                 self.missed_events
             );
@@ -1231,6 +1321,7 @@ mod tests {
             }],
             service_account,
             tags: Vec::new(),
+            rate_per_hour: None,
         }
     }
 }
